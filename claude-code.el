@@ -1417,11 +1417,19 @@ directory (%s):\n\n%s"
                     dir-notes)
             parts))
     (when-let ((dir-todos (claude-code--load-dir-todos)))
-      (push (format "The following TODO list is for the current project \
-directory (%s):\n\n%s"
-                    (abbreviate-file-name claude-code--cwd)
-                    dir-todos)
-            parts))
+      (let ((todos-file (when-let ((node (claude-code--org-roam-find-project-todos-node
+                                         claude-code--cwd)))
+                          (org-roam-node-file node))))
+        (push (format "The following TODO list is for the current project \
+directory (%s).%s\n\n%s"
+                      (abbreviate-file-name claude-code--cwd)
+                      (if todos-file
+                          (format "\nTo add/update TODOs, edit the file: %s\n\
+Use org TODO keywords (TODO, NEXT, DONE, CANCELLED) on headlines."
+                                  todos-file)
+                        "")
+                      dir-todos)
+              parts)))
     (when-let ((skills (claude-code--org-roam-load-skills)))
       (push skills parts))
     (when parts
