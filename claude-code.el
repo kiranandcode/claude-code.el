@@ -1,1968 +1,1160 @@
-;;; claude-code.el --- Claude Code Emacs integration -*- lexical-binding: t; -*-
+;;; claude-code.el --- Claude AI coding assistant for Emacs -*- lexical-binding: t; -*-
 
-;; Author: Stephen Molitor <stevemolitor@gmail.com>
-;; Version: 0.4.5
-;; Package-Requires: ((emacs "30.0") (transient "0.9.3") (inheritenv "0.2"))
-;; Keywords: tools, ai
-;; URL: https://github.com/stevemolitor/claude-code.el
+;; Copyright (C) 2024-2026
+
+;; Author: Kiran G
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "30.0") (magit-section "4.0.0") (transient "0.9.3"))
+;; Keywords: tools ai
+;; URL: https://github.com/kiranandcode/claude-code.el
 
 ;;; Commentary:
-;; An Emacs interface to Claude Code.  This package provides convenient
-;; ways to interact with Claude from within Emacs, including sending
-;; commands, toggling the Claude window, and accessing slash commands.
+
+;; Claude Code integration using the Claude Agent SDK.
+;;
+;; Communicates with a Python backend over JSON-lines stdin/stdout.
+;; The backend uses the Agent SDK to run an AI agent with built-in
+;; tool access (file read/write, bash, grep, web search, etc.).
+;;
+;; The conversation is rendered in a magit-section buffer with collapsible
+;; thinking blocks, tool-use details, and streaming token output.
+;;
+;; Quick start:
+;;   M-x claude-code
+;;   Type your prompt in the input area at the bottom and press RET.
+;;   Press `s' to jump to the input area, `C-j' for a newline in the prompt.
 
 ;;; Code:
-;;;; Require dependencies
+
+(require 'magit-section)
 (require 'transient)
-(require 'project)
 (require 'cl-lib)
-(require 'inheritenv)
+(require 'json)
+(require 'project)
+(require 'seq)
 
-;;;; Customization options
+;;;; Customization
+
 (defgroup claude-code nil
-  "Claude AI interface for Emacs."
-  :group 'tools)
+  "Claude Agent SDK integration."
+  :group 'tools
+  :prefix "claude-code-")
 
-(defgroup claude-code-eat nil
-  "Eat terminal backend specific settings for Claude Code."
-  :group 'claude-code)
-
-(defgroup claude-code-vterm nil
-  "Vterm terminal backend specific settings for Claude Code."
-  :group 'claude-code)
-
-(defgroup claude-code-window nil
-  "Window management settings for Claude Code."
-  :group 'claude-code)
-
-(defface claude-code-repl-face
-  nil
-  "Face for Claude REPL."
-  :group 'claude-code)
-
-(defcustom claude-code-term-name "xterm-256color"
-  "Terminal type to use for Claude REPL."
+(defcustom claude-code-python-command "uv"
+  "Command used to invoke the Python backend.
+The backend is run as: <python-command> run python3 <script>
+from the python/ directory."
   :type 'string
   :group 'claude-code)
 
-(defcustom claude-code-start-hook nil
-  "Hook run after Claude is started."
-  :type 'hook
+(defcustom claude-code-notes-file nil
+  "Path to an org file with persistent notes.
+Contents are included in every system prompt."
+  :type '(choice (const nil) file)
   :group 'claude-code)
 
-(defcustom claude-code-process-environment-functions nil
-  "Abnormal hook for setting up and providing environment variables for Claude.
+(defcustom claude-code-show-thinking nil
+  "Whether thinking blocks are expanded by default."
+  :type 'boolean
+  :group 'claude-code)
 
-Functions in this hook are called before starting Claude and should
-return a list of strings in the format \"VAR=VALUE\" to be added to the
-process environment. All results from all functions will be concatenated
-together.
+(defcustom claude-code-show-tool-details nil
+  "Whether tool-use details are expanded by default."
+  :type 'boolean
+  :group 'claude-code)
 
-Each function receives two arguments: the Claude buffer name, and the
-directory Claude will be started in (typically the project root).
+;;;; Session Configuration
+;;
+;; `claude-code-defaults' provides global fallback values.
+;; `claude-code-project-config' maps directories to per-project overrides.
+;; At query time, the project config is merged on top of the defaults.
 
-Functions may perform setup operations (e.g., starting a websocket server)
-before returning the environment variables needed for Claude to connect.
+(defcustom claude-code-defaults
+  '((model            . nil)
+    (effort           . nil)
+    (permission-mode  . "bypassPermissions")
+    (max-turns        . 50)
+    (max-budget-usd   . nil)
+    (allowed-tools    . ("Read" "Write" "Edit" "Bash" "Glob" "Grep"
+                         "WebSearch" "WebFetch"))
+    (betas            . nil))
+  "Default session configuration used when no project override exists.
+Each entry is (KEY . VALUE).  See `claude-code-project-config' for keys."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'claude-code)
+
+(defcustom claude-code-project-config nil
+  "Per-project session configuration.
+An alist of (DIRECTORY . CONFIG-ALIST).  DIRECTORY is expanded and
+matched as a prefix against the session working directory.  The most
+specific (longest) match wins.
+
+CONFIG-ALIST entries override `claude-code-defaults'.  Valid keys:
+
+  model            - string or nil (e.g. \"claude-opus-4-6\")
+  effort           - nil, \"low\", \"medium\", \"high\", \"max\"
+  permission-mode  - \"default\", \"plan\",
+                     \"acceptEdits\", \"bypassPermissions\"
+  max-turns        - integer
+  max-budget-usd   - float or nil
+  allowed-tools    - list of tool name strings
+  betas            - list of beta feature strings
 
 Example:
-  (add-hook \\='claude-code-process-environment-functions
-            (lambda (claude-buffer-name directory)
-              \\='(\"ANTHROPIC_API_KEY=sk-ant-...\"
-                \"ANTHROPIC_MODEL=claude-opus-4-20250514\")))"
-  :type 'hook)
-
-(defvar claude-code-event-hook nil
-  "Hook run when Claude Code CLI triggers events.
-Functions in this hook are called with one argument: a plist with :type and
-:buffer-name keys.  Use `add-hook' and `remove-hook' to manage this hook.")
-
-(defcustom claude-code-startup-delay 0.1
-  "Delay in seconds after starting Claude before displaying buffer.
-
-This helps fix terminal layout issues that can occur if the buffer
-is displayed before Claude is fully initialized."
-  :type 'number
+  \\='((\"~/work/prod-app\" . ((model . \"claude-opus-4-6\")
+                          (effort . \"high\")
+                          (permission-mode . \"acceptEdits\")))
+    (\"~/scratch\"       . ((model . \"claude-haiku-4-5\")
+                          (effort . \"low\"))))"
+  :type '(alist :key-type string
+                :value-type (alist :key-type symbol
+                                   :value-type sexp))
   :group 'claude-code)
 
-(defcustom claude-code-large-buffer-threshold 100000
-  "Size threshold in characters above which buffers are considered \"large\".
+;;;; Faces
 
-When sending a buffer to Claude with `claude-code-send-region` and no
-region is active, prompt for confirmation if buffer size exceeds this value."
-  :type 'integer
+(defface claude-code-header
+  '((t :inherit magit-section-heading :height 1.3))
+  "Buffer header."
   :group 'claude-code)
 
-(defcustom claude-code-program "claude"
-  "Program to run when starting Claude.
-This is passed as the PROGRAM parameter to `eat-make`."
-  :type 'string
+(defface claude-code-separator
+  '((t :inherit shadow))
+  "Visual separators."
   :group 'claude-code)
 
-(defcustom claude-code-program-switches nil
-  "List of command line switches to pass to the Claude program.
-These are passed as SWITCHES parameters to `eat-make`."
-  :type '(repeat string)
+(defface claude-code-user-prompt
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "User prompt label."
   :group 'claude-code)
 
-(defcustom claude-code-sandbox-program nil
-  "Program to run when starting Claude in sandbox mode.
-This must be set to the path of your Claude sandbox binary before use."
-  :type '(choice (const :tag "Not configured" nil) string)
+(defface claude-code-assistant-label
+  '((t :inherit font-lock-function-name-face :weight bold))
+  "Assistant message label."
   :group 'claude-code)
 
-(defcustom claude-code-newline-keybinding-style 'newline-on-shift-return
-  "Key binding style for entering newlines and sending messages.
-
-This controls how the return key and its modifiers behave in Claude buffers:
-- \\='newline-on-shift-return: S-return enters a line break, RET sends the
-  command (default)
-- \\='newline-on-alt-return: M-return enters a line break, RET sends the command
-- \\='shift-return-to-send: RET enters a line break, S-return sends the command
-- \\='super-return-to-send: RET enters a line break, s-return sends the command
-
-`\"S\"' is the shift key.
-`\"s\"' is the hyper key, which is the COMMAND key on macOS."
-  :type '(choice (const :tag "Newline on shift-return (s-return for newline, RET to send)" newline-on-shift-return)
-                 (const :tag "Newline on alt-return (M-return for newline, RET to send)" newline-on-alt-return)
-                 (const :tag "Shift-return to send (RET for newline, S-return to send)" shift-return-to-send)
-                 (const :tag "Super-return to send (RET for newline, s-return to send)" super-return-to-send))
+(defface claude-code-thinking
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Thinking text."
   :group 'claude-code)
 
-(defcustom claude-code-enable-notifications t
-  "Whether to show notifications when Claude finishes and awaits input."
-  :type 'boolean
+(defface claude-code-tool-name
+  '((t :inherit font-lock-type-face :weight bold))
+  "Tool names in tool-use blocks."
   :group 'claude-code)
 
-(defcustom claude-code-notification-function 'claude-code-default-notification
-  "Function to call for notifications.
-
-The function is called with two arguments:
-- TITLE: Title of the notification
-- MESSAGE: Body of the notification
-
-You can set this to your own custom notification function.
-The default function displays a message and pulses the modeline
-to provide visual feedback when Claude is ready for input."
-  :type 'function
+(defface claude-code-tool-input
+  '((t :inherit font-lock-string-face))
+  "Tool input details."
   :group 'claude-code)
 
-(defcustom claude-code-confirm-kill t
-  "Whether to ask for confirmation before killing Claude instances.
-
-When non-nil, claude-code-kill will prompt for confirmation.
-When nil, Claude instances will be killed without confirmation."
-  :type 'boolean
+(defface claude-code-result
+  '((t :inherit success))
+  "Result indicators."
   :group 'claude-code)
 
-(defcustom claude-code-optimize-window-resize t
-  "Whether to optimize terminal window resizing to prevent unnecessary reflows.
-
-When non-nil, terminal reflows are only triggered when the window width
-changes, not when only the height changes. This prevents unnecessary
-terminal redraws when windows are split or resized vertically, improving
-performance and reducing visual artifacts.
-
-Set to nil if you experience issues with terminal display after window
-resizing."
-  :type 'boolean
+(defface claude-code-error
+  '((t :inherit error))
+  "Error messages."
   :group 'claude-code)
 
-(defcustom claude-code-terminal-backend 'eat
-  "Terminal backend to use for Claude Code.
-Choose between \\='eat (default) and \\='vterm terminal emulators."
-  :type '(radio (const :tag "Eat terminal emulator" eat)
-                (const :tag "Vterm terminal emulator" vterm))
+(defface claude-code-status
+  '((t :inherit shadow :slant italic))
+  "Status messages."
   :group 'claude-code)
 
-(defcustom claude-code-no-delete-other-windows nil
-  "Whether to prevent Claude Code windows from being deleted.
-
-When non-nil, claude-code will have the `no-delete-other-windows'
-parameter.  This parameter prevents the claude-code window from
-closing when calling `delete-other-windows' or any command that would
-launch a new full-screen buffer."
-  :type 'boolean
-  :group 'claude-code-window)
-
-(defcustom claude-code-toggle-auto-select nil
-  "Whether to automatically select the Claude buffer after toggling it open.
-
-When non-nil, `claude-code-toggle' will automatically switch to the
-Claude buffer when toggling it open.  When nil, the buffer will be
-displayed but focus will remain in the current buffer."
-  :type 'boolean
-  :group 'claude-code-window)
-
-;;;;; Eat terminal customizations
-;; Eat-specific terminal faces
-(defface claude-code-eat-prompt-annotation-running-face
-  '((t :inherit eat-shell-prompt-annotation-running))
-  "Face for running prompt annotations in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-prompt-annotation-success-face
-  '((t :inherit eat-shell-prompt-annotation-success))
-  "Face for successful prompt annotations in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-prompt-annotation-failure-face
-  '((t :inherit eat-shell-prompt-annotation-failure))
-  "Face for failed prompt annotations in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-term-bold-face
-  '((t :inherit eat-term-bold))
-  "Face for bold text in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-term-faint-face
-  '((t :inherit eat-term-faint))
-  "Face for faint text in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-term-italic-face
-  '((t :inherit eat-term-italic))
-  "Face for italic text in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-term-slow-blink-face
-  '((t :inherit eat-term-slow-blink))
-  "Face for slow blinking text in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(defface claude-code-eat-term-fast-blink-face
-  '((t :inherit eat-term-fast-blink))
-  "Face for fast blinking text in Claude eat terminal."
-  :group 'claude-code-eat)
-
-(dotimes (i 10)
-  (let ((face-name (intern (format "claude-code-eat-term-font-%d-face" i)))
-        (eat-face (intern (format "eat-term-font-%d" i))))
-    (eval `(defface ,face-name
-             '((t :inherit ,eat-face))
-             ,(format "Face for font %d in Claude eat terminal." i)
-             :group 'claude-code-eat))))
-
-(defcustom claude-code-eat-read-only-mode-cursor-type '(box nil nil)
-  "Type of cursor to use as invisible cursor in Claude Code terminal buffer.
-
-The value is a list of form (CURSOR-ON BLINKING-FREQUENCY CURSOR-OFF).
-
-When the cursor is on, CURSOR-ON is used as `cursor-type', which see.
-BLINKING-FREQUENCY is the blinking frequency of cursor's blinking.
-When the cursor is off, CURSOR-OFF is used as `cursor-type'.  This
-should be nil when cursor is not blinking.
-
-Valid cursor types for CURSOR-ON and CURSOR-OFF:
-- t: Frame default cursor
-- box: Filled box cursor
-- (box . N): Box cursor with specified size N
-- hollow: Hollow cursor
-- bar: Vertical bar cursor
-- (bar . N): Vertical bar with specified height N
-- hbar: Horizontal bar cursor
-- (hbar . N): Horizontal bar with specified width N
-- nil: No cursor
-
-BLINKING-FREQUENCY can be nil (no blinking) or a number."
-  :type '(list
-          (choice
-           (const :tag "Frame default" t)
-           (const :tag "Filled box" box)
-           (cons :tag "Box with specified size" (const box) integer)
-           (const :tag "Hollow cursor" hollow)
-           (const :tag "Vertical bar" bar)
-           (cons :tag "Vertical bar with specified height" (const bar)
-                 integer)
-           (const :tag "Horizontal bar" hbar)
-           (cons :tag "Horizontal bar with specified width"
-                 (const hbar) integer)
-           (const :tag "None" nil))
-          (choice
-           (const :tag "No blinking" nil)
-           (number :tag "Blinking frequency"))
-          (choice
-           (const :tag "Frame default" t)
-           (const :tag "Filled box" box)
-           (cons :tag "Box with specified size" (const box) integer)
-           (const :tag "Hollow cursor" hollow)
-           (const :tag "Vertical bar" bar)
-           (cons :tag "Vertical bar with specified height" (const bar)
-                 integer)
-           (const :tag "Horizontal bar" hbar)
-           (cons :tag "Horizontal bar with specified width"
-                 (const hbar) integer)
-           (const :tag "None" nil)))
-  :group 'claude-code-eat)
-
-(defcustom claude-code-eat-never-truncate-claude-buffer nil
-  "When non-nil, disable truncation of Claude output buffer.
-
-By default, Eat will truncate the terminal scrollback buffer when it
-reaches a certain size.  This can cause Claude's output to be cut off
-when dealing with large responses.  Setting this to non-nil disables
-the scrollback size limit, allowing Claude to output unlimited content
-without truncation.
-
-Note: Disabling truncation may consume more memory for very large
-outputs."
-  :type 'boolean
-  :group 'claude-code-eat)
-
-(make-obsolete-variable 'claude-code-eat-never-truncate-claude-buffer
-                        "Setting it to t can consume more memory for very large outputs and can cause performance issues with long Claude sessions"
-                        "0.4.0")
-
-;;;;; Vterm terminal customizations
-(defcustom claude-code-vterm-buffer-multiline-output t
-  "Whether to buffer vterm output to prevent flickering on multi-line input.
-
-When non-nil, vterm output that appears to be redrawing multi-line
-input boxes will be buffered briefly and processed in a single
-batch. This prevents the flickering that can occur when Claude redraws
-its input box as it expands to multiple lines.
-
-This only affects the vterm backend."
-  :type 'boolean
-  :group 'claude-code-vterm)
-
-(defcustom claude-code-vterm-multiline-delay 0.01
-  "Delay in seconds before processing buffered vterm output.
-
-This controls how long vterm waits to collect output before processing
-it when `claude-code-vterm-buffer-multiline-output' is enabled.
-The delay should be long enough to collect bursts of updates but short
-enough to not be noticeable to the user.
-
-The default value of 0.01 seconds (10ms) provides a good balance
-between reducing flickering and maintaining responsiveness."
-  :type 'number
-  :group 'claude-code-vterm)
-
-;;;; Forward declarations for flycheck
-(declare-function flycheck-overlay-errors-at "flycheck")
-(declare-function flycheck-error-filename "flycheck")
-(declare-function flycheck-error-line "flycheck")
-(declare-function flycheck-error-message "flycheck")
-
-;;;; Forward declarations for server
-(defvar server-eval-args-left)
-
-;;;; Internal state variables
-(defvar claude-code--directory-buffer-map (make-hash-table :test 'equal)
-  "Hash table mapping directories to user-selected Claude buffers.
-Keys are directory paths, values are buffer objects.
-This allows remembering which Claude instance the user selected
-for each directory across multiple invocations.")
-
-(defvar claude-code--window-widths nil
-  "Hash table mapping windows to their last known widths for eat terminals.")
-
-(defvar claude-code-command-history nil
-  "History of commands sent to Claude.
-This is separate from Emacs' main variable `command-history' to prevent
-pollution when using `savehist-mode'.  Users can optionally save
-this history by adding `claude-code-command-history' to
-`savehist-additional-variables'.")
-
-;;;; Key bindings
-;;;###autoload (autoload 'claude-code-command-map "claude-code")
-(defvar claude-code-command-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "/") 'claude-code-slash-commands)
-    (define-key map (kbd "b") 'claude-code-switch-to-buffer)
-    (define-key map (kbd "B") 'claude-code-select-buffer)
-    (define-key map (kbd "c") 'claude-code)
-    (define-key map (kbd "C") 'claude-code-continue)
-    (define-key map (kbd "R") 'claude-code-resume)
-    (define-key map (kbd "i") 'claude-code-new-instance)
-    (define-key map (kbd "d") 'claude-code-start-in-directory)
-    (define-key map (kbd "e") 'claude-code-fix-error-at-point)
-    (define-key map (kbd "k") 'claude-code-kill)
-    (define-key map (kbd "K") 'claude-code-kill-all)
-    (define-key map (kbd "m") 'claude-code-transient)
-    (define-key map (kbd "n") 'claude-code-send-escape)
-    (define-key map (kbd "f") 'claude-code-fork)
-    (define-key map (kbd "r") 'claude-code-send-region)
-    (define-key map (kbd "s") 'claude-code-send-command)
-    (define-key map (kbd "S") 'claude-code-sandbox)
-    (define-key map (kbd "t") 'claude-code-toggle)
-    (define-key map (kbd "x") 'claude-code-send-command-with-context)
-    (define-key map (kbd "y") 'claude-code-send-return)
-    (define-key map (kbd "z") 'claude-code-toggle-read-only-mode)
-    (define-key map (kbd "1") 'claude-code-send-1)
-    (define-key map (kbd "2") 'claude-code-send-2)
-    (define-key map (kbd "3") 'claude-code-send-3)
-    (define-key map (kbd "M") 'claude-code-cycle-mode)
-    (define-key map (kbd "o") 'claude-code-send-buffer-file)
-    map)
-  "Keymap for Claude commands.")
-
-;;;; Transient Menus
-;;;###autoload (autoload 'claude-code-transient "claude-code" nil t)
-(transient-define-prefix claude-code-transient ()
-  "Claude command menu."
-  ["Claude Commands"
-   ["Start/Stop Claude"
-    ("c" "Start Claude" claude-code)
-    ("S" "Start Claude (sandbox)" claude-code-sandbox)
-    ("d" "Start in directory" claude-code-start-in-directory)
-    ("C" "Continue conversation" claude-code-continue)
-    ("R" "Resume session" claude-code-resume)
-    ("i" "New instance" claude-code-new-instance)
-    ("k" "Kill Claude" claude-code-kill)
-    ("K" "Kill all Claude instances" claude-code-kill-all)
-    ]
-   ["Send Commands to Claude"
-    ("s" "Send command" claude-code-send-command)
-    ("x" "Send command with context" claude-code-send-command-with-context)
-    ("r" "Send region or buffer" claude-code-send-region)
-    ("o" "Send buffer file" claude-code-send-buffer-file)
-    ("e" "Fix error at point" claude-code-fix-error-at-point)
-    ("f" "Fork conversation" claude-code-fork)
-    ("/" "Slash Commands" claude-code-slash-commands)]
-   ["Manage Claude"
-    ("t" "Toggle claude window" claude-code-toggle)
-    ("b" "Switch to Claude buffer" claude-code-switch-to-buffer)
-    ("B" "Select from all Claude buffers" claude-code-select-buffer)
-    ("z" "Toggle read-only mode" claude-code-toggle-read-only-mode)
-    ("M" "Cycle Claude mode" claude-code-cycle-mode :transient t)
-    ]
-   ["Quick Responses"
-    ("y" "Send <return>" claude-code-send-return)
-    ("n" "Send <escape>" claude-code-send-escape)
-    ("1" "Send \"1\"" claude-code-send-1)
-    ("2" "Send \"2\"" claude-code-send-2)
-    ("3" "Send \"3\"" claude-code-send-3)
-    ]])
-
-;;;###autoload (autoload 'claude-code-slash-commands "claude-code" nil t)
-(transient-define-prefix claude-code-slash-commands ()
-  "Claude slash commands menu."
-  ["Slash Commands"
-   ["Core Commands"
-    ("h" "Help" (lambda () (interactive) (claude-code--do-send-command "/help")))
-    ("c" "Clear" (lambda () (interactive) (claude-code--do-send-command "/clear")))
-    ("C" "Compact" (lambda () (interactive) (claude-code--do-send-command "/compact")))
-    ("s" "Status" (lambda () (interactive) (claude-code--do-send-command "/status")))
-    ("d" "Doctor" (lambda () (interactive) (claude-code--do-send-command "/doctor")))]
-
-   ["Configuration & Setup"
-    ("f" "Config" (lambda () (interactive) (claude-code--do-send-command "/config")))
-    ("i" "Init" (lambda () (interactive) (claude-code--do-send-command "/init")))
-    ("m" "Memory" (lambda () (interactive) (claude-code--do-send-command "/memory")))
-    ("a" "Add-dir" (lambda () (interactive) (claude-code--do-send-command "/add-dir")))
-    ("t" "Terminal-setup" (lambda () (interactive) (claude-code--do-send-command "/terminal-setup")))]
-
-   ["Account & Model"
-    ("l" "Login" (lambda () (interactive) (claude-code--do-send-command "/login")))
-    ("L" "Logout" (lambda () (interactive) (claude-code--do-send-command "/logout")))
-    ("M" "Model" (lambda () (interactive) (claude-code--do-send-command "/model")))
-    ("p" "Permissions" (lambda () (interactive) (claude-code--do-send-command "/permissions")))
-    ("$" "Cost" (lambda () (interactive) (claude-code--do-send-command "/cost")))]
-
-   ["Development Tools"
-    ("r" "Review" (lambda () (interactive) (claude-code--do-send-command "/review")))
-    ("P" "PR comments" (lambda () (interactive) (claude-code--do-send-command "/pr_comments")))
-    ("A" "Agents" (lambda () (interactive) (claude-code--do-send-command "/agents")))
-    ("v" "Vim" (lambda () (interactive) (claude-code--do-send-command "/vim")))
-    ("S" "MCP" (lambda () (interactive) (claude-code--do-send-command "/mcp")))]
-
-   ["Support"
-    ("b" "Bug" (lambda () (interactive) (claude-code--do-send-command "/bug")))]
-   ])
-
-;;;; Terminal abstraction layer
-;; This layer abstracts terminal operations to support multiple backends (eat, vterm, etc.)
-;;;;; Generic function definitions
-
-(cl-defgeneric claude-code--term-make (backend buffer-name program &optional switches)
-  "Create a terminal using BACKEND in BUFFER-NAME running PROGRAM.
-Optional SWITCHES are command-line arguments to PROGRAM.
-Returns the buffer containing the terminal.")
-
-(cl-defgeneric claude-code--term-send-string (backend terminal string)
-  "Send STRING to TERMINAL using BACKEND.")
-
-(cl-defgeneric claude-code--term-kill-process (backend buffer)
-  "Kill the terminal process in BUFFER using BACKEND.")
-
-(cl-defgeneric claude-code--term-read-only-mode (backend)
-  "Switch current terminal to read-only mode using BACKEND.")
-
-(cl-defgeneric claude-code--term-interactive-mode (backend)
-  "Switch current terminal to interactive mode using BACKEND.")
-
-(cl-defgeneric claude-code--term-in-read-only-p (backend)
-  "Check if current terminal is in read-only mode using BACKEND.")
-
-(cl-defgeneric claude-code--term-configure (backend)
-  "Configure terminal in current buffer with BACKEND specific settings.")
-
-(cl-defgeneric claude-code--term-customize-faces (backend)
-  "Apply face customizations for the terminal using BACKEND.")
-
-(cl-defgeneric claude-code--term-setup-keymap (backend)
-  "Set up the local keymap for Claude Code buffers using BACKEND.")
-
-(cl-defgeneric claude-code--term-get-adjust-process-window-size-fn (backend)
-  "Get the BACKEND specific function that adjusts window size.")
-
-;;;;; eat backend implementations
-
-;; Declare external variables and functions from eat package
-(defvar eat--semi-char-mode)
-(defvar eat--synchronize-scroll-function)
-(defvar eat-invisible-cursor-type)
-(defvar eat-term-name)
-(defvar eat-terminal)
-(declare-function eat--adjust-process-window-size "eat" (&rest args))
-(declare-function eat--set-cursor "eat" (terminal &rest args))
-(declare-function eat-emacs-mode "eat")
-(declare-function eat-kill-process "eat" (&optional buffer))
-(declare-function eat-make "eat" (name program &optional startfile &rest switches))
-(declare-function eat-semi-char-mode "eat")
-(declare-function eat-term-display-beginning "eat" (terminal))
-(declare-function eat-term-display-cursor "eat" (terminal))
-(declare-function eat-term-live-p "eat" (terminal))
-(declare-function eat-term-parameter "eat" (terminal parameter) t)
-(declare-function eat-term-redisplay "eat" (terminal))
-(declare-function eat-term-reset "eat" (terminal))
-(declare-function eat-term-send-string "eat" (terminal string))
-
-;; Helper to ensure eat is loaded
-(defun claude-code--ensure-eat ()
-  "Ensure eat package is loaded."
-  (unless (featurep 'eat)
-    (unless (require 'eat nil t)
-      (error "The eat package is required for eat terminal backend. Please install it"))))
-
-(cl-defmethod claude-code--term-make ((_backend (eql eat)) buffer-name program &optional switches)
-  "Create an eat terminal for BACKEND.
-
-_BACKEND is the terminal backend type (should be \\='eat).
-BUFFER-NAME is the name for the new terminal buffer.
-PROGRAM is the program to run in the terminal.
-SWITCHES are optional command-line arguments for PROGRAM."
-  (claude-code--ensure-eat)
-
-  (let* ((trimmed-buffer-name (string-trim-right (string-trim buffer-name "\\*") "\\*")))
-    (apply #'eat-make trimmed-buffer-name program nil switches)))
-
-(cl-defmethod claude-code--term-send-string ((_backend (eql eat)) string)
-  "Send STRING to eat terminal.
-
-_BACKEND is the terminal backend type (should be \\='eat).
-STRING is the text to send to the terminal."
-  (eat-term-send-string eat-terminal string))
-
-(cl-defmethod claude-code--term-kill-process ((_backend (eql eat)) buffer)
-  "Kill the eat terminal process in BUFFER.
-
-_BACKEND is the terminal backend type (should be \\='eat).
-BUFFER is the terminal buffer containing the process to kill."
-  (with-current-buffer buffer
-    (eat-kill-process)
-    (kill-buffer buffer)))
-
-(cl-defmethod claude-code--term-read-only-mode ((_backend (eql eat)))
-  "Switch eat terminal to read-only mode.
-
-_BACKEND is the terminal backend type (should be \\'eat)."
-  (claude-code--ensure-eat)
-  (eat-emacs-mode)
-  (setq-local eat-invisible-cursor-type claude-code-eat-read-only-mode-cursor-type)
-  (eat--set-cursor nil :invisible))
-
-(cl-defmethod claude-code--term-interactive-mode ((_backend (eql eat)))
-  "Switch eat terminal to interactive mode.
-
-_BACKEND is the terminal backend type (should be \\='eat)."
-  (claude-code--ensure-eat)
-  (eat-semi-char-mode)
-  (setq-local eat-invisible-cursor-type nil)
-  (eat--set-cursor nil :invisible))
-
-(cl-defmethod claude-code--term-in-read-only-p ((_backend (eql eat)))
-  "Check if eat terminal is in read-only mode.
-
-_BACKEND is the terminal backend type (should be \\='eat)."
-  (not eat--semi-char-mode))
-
-(defun claude-code--eat-synchronize-scroll (windows)
-  "Synchronize scrolling and point between terminal and WINDOWS.
-
-WINDOWS is a list of windows.  WINDOWS may also contain the special
-symbol `buffer', in which case the point of current buffer is set.
-
-This custom version keeps the prompt at the bottom of the window when
-possible, preventing the scrolling up issue when editing other buffers."
-  (dolist (window windows)
-    (if (eq window 'buffer)
-        (goto-char (eat-term-display-cursor eat-terminal))
-      ;; Don't move the cursor around when in eat-emacs-mode
-      (when (not buffer-read-only)
-        (let ((cursor-pos (eat-term-display-cursor eat-terminal)))
-          ;; Always set point to cursor position
-          (set-window-point window cursor-pos)
-          ;; Try to keep cursor visible with minimal scrolling
-          (cond
-           ;; If cursor is at/near end, keep at bottom
-           ((>= cursor-pos (- (point-max) 2))
-            (with-selected-window window
-              (goto-char cursor-pos)
-              (recenter -1)))
-           ;; If cursor not visible, scroll minimally to show it
-           ((not (pos-visible-in-window-p cursor-pos window))
-            (with-selected-window window
-              (goto-char cursor-pos)
-              ;; Center cursor in window instead of jumping to term beginning
-              (recenter)))))))))
-
-(cl-defmethod claude-code--term-configure ((_backend (eql eat)))
-  "Configure eat terminal in current buffer.
-
-_BACKEND is the terminal backend type (should be \\='eat)."
-  (claude-code--ensure-eat)
-  ;; Configure eat-specific settings
-  (setq-local eat-term-name claude-code-term-name)
-  (setq-local eat-enable-directory-tracking nil)
-  (setq-local eat-enable-shell-command-history nil)
-  (setq-local eat-enable-shell-prompt-annotation nil)
-  (when claude-code-eat-never-truncate-claude-buffer
-    (setq-local eat-term-scrollback-size nil))
-
-  ;; Set up custom scroll function to stop eat from scrolling to the top
-  (setq-local eat--synchronize-scroll-function #'claude-code--eat-synchronize-scroll)
-
-  ;; Configure bell handler - ensure eat-terminal exists
-  (when (bound-and-true-p eat-terminal)
-    (eval '(setf (eat-term-parameter eat-terminal 'ring-bell-function) #'claude-code--notify)))
-
-  ;; fix wonky initial terminal layout that happens sometimes if we show the buffer before claude is ready
-  (sleep-for claude-code-startup-delay))
-
-(cl-defmethod claude-code--term-customize-faces ((_backend (eql eat)))
-  "Apply face customizations for eat terminal.
-
-_BACKEND is the terminal backend type (should be \\='eat)."
-  ;; Remap eat faces to Claude-specific faces
-  (face-remap-add-relative 'eat-shell-prompt-annotation-running 'claude-code-eat-prompt-annotation-running-face)
-  (face-remap-add-relative 'eat-shell-prompt-annotation-success 'claude-code-eat-prompt-annotation-success-face)
-  (face-remap-add-relative 'eat-shell-prompt-annotation-failure 'claude-code-eat-prompt-annotation-failure-face)
-  (face-remap-add-relative 'eat-term-bold 'claude-code-eat-term-bold-face)
-  (face-remap-add-relative 'eat-term-faint 'claude-code-eat-term-faint-face)
-  (face-remap-add-relative 'eat-term-italic 'claude-code-eat-term-italic-face)
-  (face-remap-add-relative 'eat-term-slow-blink 'claude-code-eat-term-slow-blink-face)
-  (face-remap-add-relative 'eat-term-fast-blink 'claude-code-eat-term-fast-blink-face)
-  (dolist (i (number-sequence 0 9))
-    (let ((eat-face (intern (format "eat-term-font-%d" i)))
-          (claude-face (intern (format "claude-code-eat-term-font-%d-face" i))))
-      (face-remap-add-relative eat-face claude-face))))
-
-(cl-defmethod claude-code--term-setup-keymap ((_backend (eql eat)))
-  "Set up the local keymap for Claude Code buffers.
-
-_BACKEND is the terminal backend type (should be \\='eat)."
-  (let ((map (make-sparse-keymap)))
-    ;; Inherit parent eat keymap
-    (set-keymap-parent map (current-local-map))
-
-    ;; C-g for escape
-    (define-key map (kbd "C-g") #'claude-code-send-escape)
-
-    ;; Configure key bindings based on user preference
-    (pcase claude-code-newline-keybinding-style
-      ('newline-on-shift-return
-       ;; S-return enters a line break, RET sends the command
-       (define-key map (kbd "<S-return>") #'claude-code--eat-send-alt-return)
-       (define-key map (kbd "<return>") #'claude-code--eat-send-return))
-      ('newline-on-alt-return
-       ;; M-return enters a line break, RET sends the command
-       (define-key map (kbd "<M-return>") #'claude-code--eat-send-alt-return)
-       (define-key map (kbd "<return>") #'claude-code--eat-send-return))
-      ('shift-return-to-send
-       ;; RET enters a line break, S-return sends the command
-       (define-key map (kbd "<return>") #'claude-code--eat-send-alt-return)
-       (define-key map (kbd "<S-return>") #'claude-code--eat-send-return))
-      ('super-return-to-send
-       ;; RET enters a line break, s-return sends the command.
-       (define-key map (kbd "<return>") #'claude-code--eat-send-alt-return)
-       (define-key map (kbd "<s-return>") #'claude-code--eat-send-return)))
-    (use-local-map map)))
-
-(defun claude-code--eat-send-alt-return ()
-  "Send <alt>-<return> to eat."
-  (interactive)
-  (eat-term-send-string eat-terminal "\e\C-m"))
-
-(defun claude-code--eat-send-return ()
-  "Send <return> to eat."
-  (interactive)
-  (eat-term-send-string eat-terminal (kbd "RET")))
-
-(cl-defgeneric claude-code--term-get-adjust-process-window-size-fn (backend)
-  "Get the BACKEND specific function that adjusts window size.")
-
-(cl-defmethod claude-code--term-get-adjust-process-window-size-fn ((_backend (eql eat)))
-  "Get the BACKEND specific function that adjusts window size."
-  #'eat--adjust-process-window-size)
-
-;;;;; vterm backend implementations
-
-;; Declare external variables and functions from vterm package
-(defvar vterm-buffer-name)
-(defvar vterm-copy-mode)
-(defvar vterm-environment)
-(defvar vterm-shell)
-(defvar vterm-term-environment-variable)
-(declare-function vterm "vterm" (&optional buffer-name))
-(declare-function vterm--window-adjust-process-window-size "vterm" (process window))
-(declare-function vterm-copy-mode "vterm" (&optional arg))
-(declare-function vterm-mode "vterm")
-(declare-function vterm-send-key "vterm" key &optional shift meta ctrl accept-proc-output)
-(declare-function vterm-send-string "vterm" (string &optional paste-p))
-
-;; Start Claude process in vterm
-(cl-defmethod claude-code--term-make ((_backend (eql vterm)) buffer-name program &optional switches)
-  "Create a vterm terminal.
-
-_BACKEND is the terminal backend type (should be \\='vterm).
-BUFFER-NAME is the name for the new terminal buffer.
-PROGRAM is the program to run in the terminal.
-SWITCHES are optional command-line arguments for PROGRAM."
-  (claude-code--ensure-vterm)
-  (let* ((vterm-shell (if switches
-                          (concat program " " (mapconcat #'identity switches " "))
-                        program))
-         (buffer (get-buffer-create buffer-name)))
-    (inheritenv
-     ;; Use the current environment (even if buffer-local) when starting vterm in the new buffer
-     (with-current-buffer buffer
-        ;; vterm needs to have an open window before starting the claude
-        ;; process; otherwise Claude doesn't seem to know how wide its
-        ;; terminal window is and it draws the input box too wide. But
-        ;; the user may not want to pop to the buffer. For some reason
-        ;; `display-buffer' also leads to wonky results, it has to be
-        ;; `pop-to-buffer'. So, show the buffer, start vterm-mode (which
-        ;; starts the vterm-shell claude process), and then hide the
-        ;; buffer. We'll optionally re-open it later.
-        (pop-to-buffer buffer)
-        (vterm-mode)
-        (delete-window (get-buffer-window buffer))
-        buffer))))
-
-;; Helper to ensure vterm is loaded
-(defun claude-code--ensure-vterm ()
-  "Ensure vterm package is loaded."
-  (unless (and
-           (require 'vterm nil t)
-           (featurep 'vterm))
-    (error "The vterm package is required for vterm terminal backend. Please install it")))
-
-(cl-defmethod claude-code--term-send-string ((_backend (eql vterm)) string)
-  "Send STRING to vterm terminal.
-
-_BACKEND is the terminal backend type (should be \\='vterm).
-_TERMINAL is unused for vterm backend.
-STRING is the text to send to the terminal."
-  (vterm-send-string string))
-
-(cl-defmethod claude-code--term-kill-process ((_backend (eql vterm)) buffer)
-  "Kill the vterm terminal process in BUFFER.
-
-_BACKEND is the terminal backend type (should be \\='vterm).
-BUFFER is the terminal buffer containing the process to kill."
-  (kill-process (get-buffer-process buffer)))
-
-;; Mode operations
-(cl-defmethod claude-code--term-read-only-mode ((_backend (eql vterm)))
-  "Switch vterm terminal to read-only mode.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  (claude-code--ensure-vterm)
-  (vterm-copy-mode 1)
-  (setq-local cursor-type t))
-
-(cl-defmethod claude-code--term-interactive-mode ((_backend (eql vterm)))
-  "Switch vterm terminal to interactive mode.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  (claude-code--ensure-vterm)
-  (vterm-copy-mode -1)
-  (setq-local cursor-type nil)
-  ;; Keymap restoration is handled by vterm-copy-mode-hook
-  )
-
-(cl-defmethod claude-code--term-in-read-only-p ((_backend (eql vterm)))
-  "Check if vterm terminal is in read-only mode.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  vterm-copy-mode)
-
-(cl-defmethod claude-code--term-configure ((_backend (eql vterm)))
-  "Configure vterm terminal in current buffer.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  (claude-code--ensure-vterm)
-  ;; set TERM
-  (setq vterm-term-environment-variable claude-code-term-name)
-  ;; Prevent vterm from automatically renaming the buffer
-  (setq-local vterm-buffer-name-string nil)
-  ;; Disable automatic scrolling to bottom on output to prevent flickering
-  (setq-local vterm-scroll-to-bottom-on-output nil)
-  ;; Disable immediate redraw to batch updates and reduce flickering
-  (setq-local vterm--redraw-immididately nil)
-  ;; Try to prevent cursor flickering by disabling Emacs' own cursor management
-  (setq-local cursor-in-non-selected-windows nil)
-  (setq-local blink-cursor-mode nil)
-  (setq-local cursor-type nil)  ; Let vterm handle the cursor entirely
-  ;; Set timer delay to nil for faster updates (reduces visible flicker duration)
-  ;; (setq-local vterm-timer-delay nil)
-  ;; Increase process read buffering to batch more updates together
-  (when-let ((proc (get-buffer-process (current-buffer))))
-    (set-process-query-on-exit-flag proc nil)
-    ;; Try to make vterm read larger chunks at once
-    (process-put proc 'read-output-max 4096))
-  ;; Set up bell detection advice
-  (advice-add 'vterm--filter :around #'claude-code--vterm-bell-detector)
-  ;; Set up multi-line buffering to prevent flickering
-  (advice-add 'vterm--filter :around #'claude-code--vterm-multiline-buffer-filter)
-  ;; Set up hook to restore keymap when exiting vterm-copy-mode
-  (add-hook 'vterm-copy-mode-hook
-            (lambda ()
-              (unless vterm-copy-mode  ; Only when exiting copy-mode
-                (claude-code--term-setup-keymap 'vterm)))
-            nil t))  ; buffer-local hook
-
-(cl-defmethod claude-code--term-customize-faces ((_backend (eql vterm)))
-  "Apply face customizations for vterm terminal.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  ;; no faces to customize yet (this could change)
-  )
-
-(defun claude-code--vterm-send-escape ()
-  "Send escape key to vterm."
-  (interactive)
-  (vterm-send-key "\C-["))
-
-(defun claude-code--vterm-send-return ()
-  "Send return key to vterm."
-  (interactive)
-  (vterm-send-key "\C-m"))
-
-(defun claude-code--vterm-send-alt-return ()
-  "Send <alt>-<return> to vterm."
-  (interactive)
-  (vterm-send-key "\C-m" nil t))
-
-(defun claude-code--vterm-send-shift-return ()
-  "Send shift return to vterm."
-  (interactive)
-  (vterm-send-key "\C-m" t))
-
-(defun claude-code--vterm-send-super-return ()
-  "Send super-return key to vterm."
-  (interactive)
-  ;; (vterm-send-key "\C-@" t)
-  (vterm-send-key (kbd "s-<return>") t))
-
-;; (defun claude-code--vterm-send-alt-return ()
-;;   "Send alt-return to vterm for newline without submitting."
-;;   (message "claude-code--vterm-send-alt-return invoked")
-;;   (interactive)
-;;   (vterm-send-key "" nil t))
-
-(cl-defmethod claude-code--term-setup-keymap ((_backend (eql vterm)))
-  "Set up the local keymap for Claude Code buffers.
-
-_BACKEND is the terminal backend type (should be \\='vterm)."
-  (let ((map (make-sparse-keymap)))
-    ;; Inherit parent eat keymap
-    (set-keymap-parent map (current-local-map))
-
-    ;; C-g for escape
-    (define-key map (kbd "C-g") #'claude-code--vterm-send-escape)
-
-    (pcase claude-code-newline-keybinding-style
-      ('newline-on-shift-return
-       ;; S-return enters a line break, RET sends the command
-       (define-key map (kbd "<S-return>") #'claude-code--vterm-send-alt-return)
-       (define-key map (kbd "<return>") #'claude-code--vterm-send-return))
-      ('newline-on-alt-return
-       ;; M-return enters a line break, RET sends the command
-       (define-key map (kbd "<M-return>") #'claude-code--vterm-send-alt-return)
-       (define-key map (kbd "<return>") #'claude-code--vterm-send-return))
-      ('shift-return-to-send
-       ;; RET enters a line break, S-return sends the command
-       (define-key map (kbd "<return>") #'claude-code--vterm-send-alt-return)
-       (define-key map (kbd "<S-return>") #'claude-code--vterm-send-return))
-      ('super-return-to-send
-       ;; RET enters a line break, s-return sends the command.
-       (define-key map (kbd "<return>") #'claude-code--vterm-send-alt-return)
-       (define-key map (kbd "<s-return>") #'claude-code--vterm-send-return)))
-
-    (use-local-map map)))
-
-(cl-defmethod claude-code--term-get-adjust-process-window-size-fn ((_backend (eql vterm)))
-  "Get the BACKEND specific function that adjusts window size."
-  #'vterm--window-adjust-process-window-size)
-
-;;;; Private util functions
-(defmacro claude-code--with-buffer (&rest body)
-  "Execute BODY with the Claude buffer, handling buffer selection and display.
-
-Gets or prompts for the Claude buffer, executes BODY within that buffer's
-context, displays the buffer, and shows not-running message if no buffer
-is found."
-  `(if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-       (with-current-buffer claude-code-buffer
-         ,@body
-         (display-buffer claude-code-buffer))
-     (claude-code--show-not-running-message)))
-
-(defun claude-code--buffer-p (buffer)
-  "Return non-nil if BUFFER is a Claude buffer.
-
-BUFFER can be either a buffer object or a buffer name string."
-  (let ((name (if (stringp buffer)
-                  buffer
-                (buffer-name buffer))))
-    (and name (string-match-p "^\\*claude:" name))))
-
-(defun claude-code--directory ()
-  "Get get the root Claude directory for the current buffer.
-
-If not in a project and no buffer file return `default-directory'."
-  (let* ((project (project-current))
-         (current-file (buffer-file-name)))
-    (cond
-     ;; Case 1: In a project
-     (project (project-root project))
-     ;; Case 2: Has buffer file (when not in VC repo)
-     (current-file (file-name-directory current-file))
-     ;; Case 3: No project and no buffer file
-     (t default-directory))))
-
-(defun claude-code--find-all-claude-buffers ()
-  "Find all active Claude buffers across all directories.
-
-Returns a list of buffer objects."
-  (cl-remove-if-not
-   #'claude-code--buffer-p
-   (buffer-list)))
-
-(defun claude-code--find-claude-buffers-for-directory (directory)
-  "Find all active Claude buffers for a specific DIRECTORY.
-
-Returns a list of buffer objects."
-  (cl-remove-if-not
-   (lambda (buf)
-     (let ((buf-dir (claude-code--extract-directory-from-buffer-name (buffer-name buf))))
-       (and buf-dir
-            (string= (file-truename (abbreviate-file-name directory))
-                     (file-truename buf-dir)))))
-   (claude-code--find-all-claude-buffers)))
-
-(defun claude-code--extract-directory-from-buffer-name (buffer-name)
-  "Extract the directory path from a Claude BUFFER-NAME.
-
-For example, *claude:/path/to/project/* returns /path/to/project/.
-For example, *claude:/path/to/project/:tests* returns /path/to/project/."
-  (when (string-match "^\\*claude:\\([^:]+\\)\\(?::\\([^*]+\\)\\)?\\*$" buffer-name)
-    (match-string 1 buffer-name)))
-
-(defun claude-code--extract-instance-name-from-buffer-name (buffer-name)
-  "Extract the instance name from a Claude BUFFER-NAME.
-
-For example, *claude:/path/to/project/:tests* returns \"tests\".
-For example, *claude:/path/to/project/* returns nil."
-  (when (string-match "^\\*claude:\\([^:]+\\)\\(?::\\([^*]+\\)\\)?\\*$" buffer-name)
-    (match-string 2 buffer-name)))
-
-(defun claude-code--buffer-display-name (buffer)
-  "Create a display name for Claude BUFFER.
-
-Returns a formatted string like `project:instance (directory)' or
-`project (directory)'."
-  (let* ((name (buffer-name buffer))
-         (dir (claude-code--extract-directory-from-buffer-name name))
-         (instance-name (claude-code--extract-instance-name-from-buffer-name name)))
-    (if instance-name
-        (format "%s:%s (%s)"
-                (file-name-nondirectory (directory-file-name dir))
-                instance-name
-                dir)
-      (format "%s (%s)"
-              (file-name-nondirectory (directory-file-name dir))
-              dir))))
-
-(defun claude-code--buffers-to-choices (buffers &optional simple-format)
-  "Convert BUFFERS list to an alist of (display-name . buffer) pairs.
-
-If SIMPLE-FORMAT is non-nil, use just the instance name as display name."
-  (mapcar (lambda (buf)
-            (let ((display-name (if simple-format
-                                    (or (claude-code--extract-instance-name-from-buffer-name
-                                         (buffer-name buf))
-                                        "default")
-                                  (claude-code--buffer-display-name buf))))
-              (cons display-name buf)))
-          buffers))
-
-(defun claude-code--select-buffer-from-choices (prompt buffers &optional simple-format)
-  "Prompt user to select a buffer from BUFFERS list using PROMPT.
-
-If SIMPLE-FORMAT is non-nil, use simplified display names.
-Returns the selected buffer or nil."
-  (when buffers
-    (let* ((choices (claude-code--buffers-to-choices buffers simple-format))
-           (selection (completing-read prompt
-                                       (mapcar #'car choices)
-                                       nil t)))
-      (cdr (assoc selection choices)))))
-
-(defun claude-code--prompt-for-claude-buffer ()
-  "Prompt user to select from available Claude buffers.
-
-Returns the selected buffer or nil if canceled. If a buffer is selected,
-it's remembered for the current directory."
-  (let* ((current-dir (claude-code--directory))
-         (claude-buffers (claude-code--find-all-claude-buffers)))
-    (when claude-buffers
-      (let* ((prompt (substitute-command-keys
-                      (format "No Claude instance running in %s. Cancel (\\[keyboard-quit]), or select Claude instance: "
-                              (abbreviate-file-name current-dir))))
-             (selected-buffer (claude-code--select-buffer-from-choices prompt claude-buffers)))
-        ;; Remember the selection for this directory
-        (when selected-buffer
-          (puthash current-dir selected-buffer claude-code--directory-buffer-map))
-        selected-buffer))))
-
-(defun claude-code--get-or-prompt-for-buffer ()
-  "Get Claude buffer for current directory or prompt for selection.
-
-First checks for Claude buffers in the current directory. If there are
-multiple, prompts the user to select one. If there are none, checks if
-there's a remembered selection for this directory. If not, and there are
-other Claude buffers running, prompts the user to select one. Returns
-the buffer or nil."
-  (let* ((current-dir (claude-code--directory))
-         (dir-buffers (claude-code--find-claude-buffers-for-directory current-dir)))
-    (cond
-     ;; Multiple buffers for this directory - prompt for selection
-     ((> (length dir-buffers) 1)
-      (claude-code--select-buffer-from-choices
-       (format "Select Claude instance for %s: "
-               (abbreviate-file-name current-dir))
-       dir-buffers
-       t))  ; Use simple format (just instance names)
-     ;; Single buffer for this directory - use it
-     ((= (length dir-buffers) 1)
-      (car dir-buffers))
-     ;; No buffers for this directory - check remembered or prompt for other directories
-     (t
-      ;; Check for remembered selection for this directory
-      (let ((remembered-buffer (gethash current-dir claude-code--directory-buffer-map)))
-        (if (and remembered-buffer (buffer-live-p remembered-buffer))
-            remembered-buffer
-          ;; No valid remembered buffer, check for other Claude instances
-          (let ((other-buffers (claude-code--find-all-claude-buffers)))
-            (when other-buffers
-              (claude-code--prompt-for-claude-buffer)))))))))
-
-(defun claude-code--switch-to-selected-buffer (selected-buffer)
-  "Switch to SELECTED-BUFFER if it's not the current buffer.
-
-This is used after command functions to ensure we switch to the
-selected Claude buffer when the user chose a different instance."
-  (when (and selected-buffer
-             (not (eq selected-buffer (current-buffer))))
-    (pop-to-buffer selected-buffer)))
-
-(defun claude-code--buffer-name (&optional instance-name)
-  "Generate the Claude buffer name based on project or current buffer file.
-
-If INSTANCE-NAME is provided, include it in the buffer name.
-If not in a project and no buffer file, raise an error."
-  (let ((dir (claude-code--directory)))
-    (if dir
-        (if instance-name
-            (format "*claude:%s:%s*" (abbreviate-file-name (file-truename dir)) instance-name)
-          (format "*claude:%s*" (abbreviate-file-name (file-truename dir))))
-      (error "Cannot determine Claude directory - no `default-directory'!"))))
-
-(defun claude-code--prompt-for-instance-name (dir existing-instance-names &optional force-prompt)
-  "Prompt user for a new instance name for directory DIR.
-
-EXISTING-INSTANCE-NAMES is a list of existing instance names.
-If FORCE-PROMPT is non-nil, always prompt even if no instances exist."
-  (if (or existing-instance-names force-prompt)
-      (let ((proposed-name ""))
-        (while (or (string-empty-p proposed-name)
-                   (member proposed-name existing-instance-names))
-          (setq proposed-name
-                (read-string (if (and existing-instance-names (not force-prompt))
-                                 (format "Instances already running for %s (existing: %s), new instance name: "
-                                         (abbreviate-file-name dir)
-                                         (mapconcat #'identity existing-instance-names ", "))
-                               (format "Instance name for %s: " (abbreviate-file-name dir)))
-                             nil nil proposed-name))
-          (cond
-           ((string-empty-p proposed-name)
-            (message "Instance name cannot be empty. Please enter a name.")
-            (sit-for 1))
-           ((member proposed-name existing-instance-names)
-            (message "Instance name '%s' already exists. Please choose a different name." proposed-name)
-            (sit-for 1))))
-        proposed-name)
-    "default"))
-
-(defun claude-code--show-not-running-message ()
-  "Show a message that Claude is not running in any directory."
-  (message "Claude is not running"))
-
-(defun claude-code--kill-buffer (buffer)
-  "Kill a Claude BUFFER by cleaning up hooks and processes."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      ;; Remove the adjust window size advice if it was added
-      (when claude-code-optimize-window-resize
-        (advice-remove (claude-code--term-get-adjust-process-window-size-fn claude-code-terminal-backend) #'claude-code--adjust-window-size-advice))
-      ;; Remove vterm advice if using vterm backend
-      (when (eq claude-code-terminal-backend 'vterm)
-        (advice-remove 'vterm--filter #'claude-code--vterm-bell-detector)
-        (advice-remove 'vterm--filter #'claude-code--vterm-multiline-buffer-filter))
-      ;; Clean the window widths hash table
-      (when claude-code--window-widths
-        (clrhash claude-code--window-widths))
-      ;; Kill the process
-      (claude-code--term-kill-process claude-code-terminal-backend buffer))))
-
-(defun claude-code--cleanup-directory-mapping ()
-  "Remove entries from directory-buffer map when this buffer is killed.
-
-This function is added to `kill-buffer-hook' in Claude buffers to clean up
-the remembered directory->buffer associations."
-  (let ((dying-buffer (current-buffer)))
-    (maphash (lambda (dir buffer)
-               (when (eq buffer dying-buffer)
-                 (remhash dir claude-code--directory-buffer-map)))
-             claude-code--directory-buffer-map)))
-
-(defun claude-code--get-buffer-file-name ()
-  "Get the file name associated with the current buffer."
-  (when buffer-file-name
-    (file-local-name (file-truename buffer-file-name))))
-
-(defun claude-code--format-file-reference (&optional file-name line-start line-end)
-  "Format a file reference in the @file:line style.
-
-FILE-NAME is the file path.  If nil, get from current buffer.
-LINE-START is the starting line number.  If nil, use current line.
-LINE-END is the ending line number for a range.  If nil, format single line."
-  (let ((file (or file-name (claude-code--get-buffer-file-name)))
-        (start (or line-start (line-number-at-pos nil t)))
-        (end line-end))
-    (when file
-      (if end
-          (format "@%s:%d-%d" file start end)
-        (format "@%s:%d" file start)))))
-
-(defun claude-code--do-send-command (cmd)
-  "Send a command CMD to Claude if Claude buffer exists.
-
-After sending the command, move point to the end of the buffer.
-Returns the selected Claude buffer or nil."
-  (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-      (progn
-        (with-current-buffer claude-code-buffer
-          ;; Send the command string, without return
-          (claude-code--term-send-string claude-code-terminal-backend cmd)
-          ;; Give the terminal time to process the full command
-          (sit-for 0.1)
-          ;; Send Return
-          (claude-code--term-send-string claude-code-terminal-backend (kbd "RET"))
-          (display-buffer claude-code-buffer))
-        claude-code-buffer)
-    (claude-code--show-not-running-message)
-    nil))
-
-
-(defun claude-code-display-buffer-below (buffer)
-  "Displays the claude code BUFFER below the currently selected one."
-  (display-buffer buffer '((display-buffer-below-selected))))
-
-(defcustom claude-code-display-window-fn #'claude-code-display-buffer-below
-  "Function used to display the claude code window.
-
-Must be callable with a buffer as its parameter."
-  :type 'function)
-
-(defun claude-code--start (arg extra-switches &optional force-prompt force-switch-to-buffer)
-  "Start Claude with given command-line EXTRA-SWITCHES.
-
-ARG is the prefix argument controlling directory and buffer switching.
-EXTRA-SWITCHES is a list of additional command-line switches to pass to Claude.
-If FORCE-PROMPT is non-nil, always prompt for instance name.
-If FORCE-SWITCH-TO-BUFFER is non-nil, always switch to the Claude buffer.
-
-With single prefix ARG (\\[universal-argument]), switch to buffer after creating.
-With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt for the project directory."
-  (let* ((dir (if (equal arg '(16))     ; Double prefix
-                  (read-directory-name "Project directory: ")
-                (claude-code--directory)))
-         (switch-after (or (equal arg '(4)) force-switch-to-buffer)) ; Single prefix or force-switch-to-buffer
-         (default-directory dir)
-         ;; Check for existing Claude instances in this directory
-         (existing-buffers (claude-code--find-claude-buffers-for-directory dir))
-         ;; Get existing instance names
-         (existing-instance-names (mapcar (lambda (buf)
-                                            (or (claude-code--extract-instance-name-from-buffer-name
-                                                 (buffer-name buf))
-                                                "default"))
-                                          existing-buffers))
-         ;; Prompt for instance name (only if instances exist, or force-prompt is true)
-         (instance-name (claude-code--prompt-for-instance-name dir existing-instance-names force-prompt))
-         (buffer-name (claude-code--buffer-name instance-name))
-         (program-switches (if extra-switches
-                               (append claude-code-program-switches extra-switches)
-                             claude-code-program-switches))
-
-         ;; Set process-adaptive-read-buffering to nil to avoid flickering while Claude is processing
-         (process-adaptive-read-buffering nil)
-
-         ;; Set environment variables by running all functions in the hook
-         (extra-env-variables (apply #'append
-                                     (mapcar (lambda (func)
-                                               (funcall func buffer-name dir))
-                                             claude-code-process-environment-functions)))
-         (process-environment (append `(,(format "CLAUDE_BUFFER_NAME=%s" buffer-name))
-                                      extra-env-variables
-                                      process-environment))
-         ;; Start the terminal process
-         (buffer (claude-code--term-make claude-code-terminal-backend buffer-name claude-code-program program-switches)))
-
-    ;; Check if the claude program is available
-    (unless (executable-find claude-code-program)
-      (error "Claude Code program '%s' not found in PATH" claude-code-program))
-
-    ;; Check if buffer was successfully created
-    (unless (buffer-live-p buffer)
-      (error "Failed to create Claude Code buffer"))
-
-    ;; setup claude buffer
-    (with-current-buffer buffer
-      ;; Configure terminal with backend-specific settings
-      (claude-code--term-configure claude-code-terminal-backend)
-
-      ;; Initialize the window widths hash table
-      (setq claude-code--window-widths (make-hash-table :test 'eq :weakness 'key))
-
-      ;; Set up window width tracking if optimization is enabled
-      (when claude-code-optimize-window-resize
-        (advice-add (claude-code--term-get-adjust-process-window-size-fn claude-code-terminal-backend) :around #'claude-code--adjust-window-size-advice))
-
-      ;; Setup our custom key bindings
-      (claude-code--term-setup-keymap claude-code-terminal-backend)
-
-      ;; Customize terminal faces
-      (claude-code--term-customize-faces claude-code-terminal-backend)
-
-      ;; remove underlines from _>_
-      (face-remap-add-relative 'nobreak-space :underline nil)
-
-      ;; set buffer face
-      (buffer-face-set :inherit 'claude-code-repl-face)
-
-      ;; disable scroll bar, fringes
-      (setq-local vertical-scroll-bar nil)
-      (setq-local fringe-mode 0)
-
-      ;; Add cleanup hook to remove directory mappings when buffer is killed
-      (add-hook 'kill-buffer-hook #'claude-code--cleanup-directory-mapping nil t)
-
-      ;; run start hooks
-      (run-hooks 'claude-code-start-hook)
-
-      ;; Disable vertical scroll bar in claude buffer
-      (setq-local vertical-scroll-bar nil)
-
-      ;; Display buffer, setting window parameters
-      (let ((window (funcall claude-code-display-window-fn buffer)))
-        (when window
-          ;; turn off fringes and margins in the Claude buffer
-          (set-window-parameter window 'left-margin-width 0)
-          (set-window-parameter window 'right-margin-width 0)
-          (set-window-parameter window 'left-fringe-width 0)
-          (set-window-parameter window 'right-fringe-width 0)
-          ;; set no-delete-other-windows parameter for claude-code window
-          (set-window-parameter window 'no-delete-other-windows claude-code-no-delete-other-windows))))
-
-    ;; switch to the Claude buffer if asked to
-    (when switch-after
-      (pop-to-buffer buffer))))
-
-;;;###autoload
-(defun claude-code (&optional arg)
-  "Start Claude in an eat terminal and enable `claude-code-mode'.
-
-If current buffer belongs to a project start Claude in the project's
-root directory. Otherwise start in the directory of the current buffer
-file, or the current value of `default-directory' if no project and no
-buffer file.
-
-With single prefix ARG (\\[universal-argument]), switch to buffer after creating.
-With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt for the project directory."
-  (interactive "P")
-  (claude-code--start arg nil))
-
-;;;###autoload
-(defun claude-code-start-in-directory (&optional arg)
-  "Prompt for a directory and start Claude there.
-
-This is a convenience command equivalent to using `claude-code` with
-double prefix arg (\\[universal-argument] \\[universal-argument]).
-
-With prefix ARG (\\[universal-argument]), switch to buffer after creating."
-  (interactive "P")
-  ;; Always prompt for directory (like double prefix)
-  ;; If user gave us a prefix arg, also switch to buffer after creating
-  (let ((dir (read-directory-name "Project directory: ")))
-    ;; We need to temporarily override claude-code--directory to return our chosen dir
-    (cl-letf (((symbol-function 'claude-code--directory) (lambda () dir)))
-      (claude-code (when arg '(4))))))
-
-;;;###autoload
-(defun claude-code-continue (&optional arg)
-  "Start Claude and continue the previous conversation.
-
-This command starts Claude with the --continue flag to resume
-where you left off in your last session.
-
-If current buffer belongs to a project start Claude in the project's
-root directory. Otherwise start in the directory of the current buffer
-file, or the current value of `default-directory' if no project and no
-buffer file.
-
-With prefix ARG (\\[universal-argument]), switch to buffer after creating.
-With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt for the project directory."
-  (interactive "P")
-  (claude-code--start arg '("--continue")))
-
-;;;###autoload
-(defun claude-code-resume (arg)
-  "Resume a specific Claude session.
-
-This command starts Claude with the --resume flag to resume a specific
-past session. Claude will present an interactive list of past sessions
-to choose from.
-
-If current buffer belongs to a project start Claude in the project's
-root directory. Otherwise start in the directory of the current buffer
-file, or the current value of `default-directory' if no project and no
- buffer file.
-
-With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt for the project directory."
-  (interactive "P")
-
-  (let ((extra-switches '("--resume")))
-    (claude-code--start arg extra-switches nil t))
-  (claude-code--term-send-string claude-code-terminal-backend "")
-  (goto-char (point-min)))
-
-;;;###autoload
-(defun claude-code-new-instance (&optional arg)
-  "Create a new Claude instance, prompting for instance name.
-
-This command always prompts for an instance name, unlike `claude-code'
-which uses \"default\" when no instances exist.
-
-If current buffer belongs to a project start Claude in the project's
-root directory. Otherwise start in the directory of the current buffer
-file, or the current value of `default-directory' if no project and no
-buffer file.
-
-With single prefix ARG (\\[universal-argument]), switch to buffer after creating.
-With double prefix ARG (\\[universal-argument] \\[universal-argument]), prompt
-for the project directory."
-  (interactive "P")
-
-  ;; Call claude-code--start with force-prompt=t
-  (claude-code--start arg nil t))
-
-;;;###autoload
-(defun claude-code-sandbox (&optional arg)
-  "Start Claude in sandbox mode using the configured sandbox binary.
-
-Uses the program specified in `claude-code-sandbox-program' to run Claude
-in a sandboxed environment.
-
-Prompts whether to add --dangerously-skip-permissions flag for bypassing
-Claude's permission checks.
-
-If current buffer belongs to a project start Claude in the project's root
-directory.  Otherwise start in the directory of the current buffer file,
-or the current value of `default-directory' if no project and no buffer
-file.
-
-With single prefix ARG (\\[universal-argument]), switch to buffer after
-creating.
-
-With double prefix ARG (\\[universal-argument] \\[universal-argument]),
-prompt for the project directory."
-  (interactive "P")
-  (unless claude-code-sandbox-program
-    (error "Claude-code-sandbox-program is not configured.  Please set it to your sandbox binary path"))
-  (let* ((skip-permissions (y-or-n-p "Skip permissions (--dangerously-skip-permissions)? "))
-         (claude-code-program claude-code-sandbox-program)
-         (claude-code-program-switches (if skip-permissions
-                                           (append claude-code-program-switches
-                                                   '("--dangerously-skip-permissions"))
-                                         claude-code-program-switches)))
-    (claude-code arg)))
-
-(defun claude-code--format-errors-at-point ()
-  "Format errors at point as a string with file and line numbers.
-First tries flycheck errors if flycheck is enabled, then falls back
-to help-at-pt (used by flymake and other systems).
-Returns a string with the errors or a message if no errors found."
-  (interactive)
-  (cond
-   ;; Try flycheck first if available and enabled
-   ((and (featurep 'flycheck) (bound-and-true-p flycheck-mode))
-    (let ((errors (flycheck-overlay-errors-at (point)))
-          (result ""))
-      (if (not errors)
-          "No flycheck errors at point"
-        (dolist (err errors)
-          (let ((file (flycheck-error-filename err))
-                (line (flycheck-error-line err))
-                (msg (flycheck-error-message err)))
-            (setq result (concat result
-                                 (format "%s:%d: %s\n"
-                                         file
-                                         line
-                                         msg)))))
-        (string-trim-right result))))
-   ;; Fall back to help-at-pt-kbd-string (works with flymake and other sources)
-   ((help-at-pt-kbd-string)
-    (let ((help-str (help-at-pt-kbd-string)))
-      (if (not (null help-str))
-          (substring-no-properties help-str)
-        "No help string available at point")))
-   ;; No errors found by any method
-   (t "No errors at point")))
-
-(defun claude-code--pulse-modeline ()
-  "Pulse the modeline to provide visual notification."
-  ;; First pulse - invert
-  (invert-face 'mode-line)
-  (run-at-time 0.1 nil
-               (lambda ()
-                 ;; Return to normal
-                 (invert-face 'mode-line)
-                 ;; Second pulse
-                 (run-at-time 0.1 nil
-                              (lambda ()
-                                (invert-face 'mode-line)
-                                ;; Final return to normal
-                                (run-at-time 0.1 nil
-                                             (lambda ()
-                                               (invert-face 'mode-line))))))))
-
-(defun claude-code-default-notification (title message)
-  "Default notification function that displays a message and pulses the modeline.
-
-TITLE is the notification title.
-MESSAGE is the notification body."
-  ;; Display the message
-  (message "%s: %s" title message)
-  ;; Pulse the modeline for visual feedback
-  (claude-code--pulse-modeline)
-  (message "%s: %s" title message))
-
-(defun claude-code-handle-hook (type buffer-name &rest args)
-  "Handle hook of TYPE for BUFFER-NAME with JSON data and additional ARGS.
-This is the unified entry point for all Claude Code CLI hooks.
-ARGS can contain additional arguments passed from the CLI."
-  ;; Must consume ALL arguments from server-eval-args-left to prevent Emacs
-  ;; from trying to evaluate leftover arguments as Lisp expressions
-  (let ((json-data (when server-eval-args-left (pop server-eval-args-left)))
-        (extra-args (prog1 server-eval-args-left (setq server-eval-args-left nil))))
-
-    ;; Run the event hook and potentially get a JSON response
-    (let* ((message (list :type type
-                         :buffer-name buffer-name
-                         :json-data json-data
-                         :args (append args extra-args)))
-           (hook-response (run-hook-with-args-until-success 'claude-code-event-hook message)))
-
-      ;; Return hook response if any, otherwise nil
-      hook-response)))
-
-(defun claude-code--notify (_terminal)
-  "Notify the user that Claude has finished and is awaiting input.
-
-TERMINAL is the eat terminal parameter (not used)."
-  (when claude-code-enable-notifications
-    (funcall claude-code-notification-function
-             "Claude Ready"
-             "Waiting for your response")))
-
-(defun claude-code--vterm-bell-detector (orig-fun process input)
-  "Detect bell characters in vterm output and trigger notifications.
-
-ORIG-FUN is the original vterm--filter function.
-PROCESS is the vterm process.
-INPUT is the terminal output string."
-  (when (and (string-match-p "\007" input)
-             (claude-code--buffer-p (process-buffer process))
-             ;; Ignore bells in OSC sequences (terminal title updates)
-             (not (string-match-p "]0;.*\007" input)))
-    (claude-code--notify nil))
-
-  (funcall orig-fun process input))
-
-(defvar-local claude-code--vterm-multiline-buffer nil
-  "Buffer for accumulating multi-line vterm output.")
-
-(defvar-local claude-code--vterm-multiline-buffer-timer nil
-  "Timer for processing buffered multi-line vterm output.")
-
-(defun claude-code--vterm-multiline-buffer-filter (orig-fun process input)
-  "Buffer vterm output when it appears to be redrawing multi-line input.
-This prevents flickering when Claude redraws its input box as it expands
-to multiple lines. We detect this by looking for escape sequences that
-indicate cursor positioning and line clearing operations.
-
-ORIG-FUN is the original vterm--filter function.
-PROCESS is the vterm process.
-INPUT is the terminal output string."
-  (if (or (not claude-code-vterm-buffer-multiline-output)
-          (not (claude-code--buffer-p (process-buffer process))))
-      ;; Feature disabled or not a Claude buffer, pass through normally
-      (funcall orig-fun process input)
-    (with-current-buffer (process-buffer process)
-      ;; Check if this looks like multi-line input box redraw
-      ;; Common patterns when redrawing multi-line input:
-      ;; - ESC[K (clear to end of line)
-      ;; - ESC[<n>;<m>H (cursor positioning)
-      ;; - ESC[<n>A/B/C/D (cursor movement)
-      ;; - Multiple of these in sequence
-      (let ((has-clear-line (string-match-p "\033\\[K" input))
-            (has-cursor-pos (string-match-p "\033\\[[0-9]+;[0-9]+H" input))
-            (has-cursor-move (string-match-p "\033\\[[0-9]*[ABCD]" input))
-            (escape-count (cl-count ?\033 input)))
-
-        ;; If we see multiple escape sequences that look like redrawing,
-        ;; or we're already buffering, add to buffer
-        (if (or (and (>= escape-count 3)
-                     (or has-clear-line has-cursor-pos has-cursor-move))
-                claude-code--vterm-multiline-buffer)
-            (progn
-              ;; Add to buffer
-              (setq claude-code--vterm-multiline-buffer
-                    (concat claude-code--vterm-multiline-buffer input))
-              ;; Cancel existing timer
-              (when claude-code--vterm-multiline-buffer-timer
-                (cancel-timer claude-code--vterm-multiline-buffer-timer))
-              ;; Set timer with configurable delay
-              ;; This is enough to collect a burst of updates but not noticeable to user
-              (setq claude-code--vterm-multiline-buffer-timer
-                    (run-at-time claude-code-vterm-multiline-delay nil
-                                 (lambda (buf)
-                                   (when (buffer-live-p buf)
-                                     (with-current-buffer buf
-                                       (when claude-code--vterm-multiline-buffer
-                                         (let ((inhibit-redisplay t)
-                                               (data claude-code--vterm-multiline-buffer))
-                                           ;; Clear buffer first to prevent recursion
-                                           (setq claude-code--vterm-multiline-buffer nil
-                                                 claude-code--vterm-multiline-buffer-timer nil)
-                                           ;; Process all buffered data at once
-                                           (funcall orig-fun
-                                                    (get-buffer-process buf)
-                                                    data))))))
-                                 (current-buffer))))
-          ;; Not multi-line redraw, process normally
-          (funcall orig-fun process input))))))
-
-(defun claude-code--adjust-window-size-advice (orig-fun &rest args)
-  "Advice to only signal on width change.
-
-Works with `eat--adjust-process-window-size' or
-`vterm--adjust-process-window-size' to prevent unnecessary reflows.
-
-Returns the size returned by ORIG-FUN only when the width of any Claude
-window has changed, not when only the height has changed. This prevents
-unnecessary terminal reflows when only vertical space changes.
-
-ARGS is passed to ORIG-FUN unchanged."
-  (let ((result (apply orig-fun args)))
-    ;; Check all windows for Claude buffers
-    (let ((width-changed nil))
-      (dolist (window (window-list))
-        (let ((buffer (window-buffer window)))
-          (when (and buffer (claude-code--buffer-p buffer))
-            (let ((current-width (window-width window))
-                  (stored-width (gethash window claude-code--window-widths)))
-              ;; Check if this is a new window or if width changed
-              (when (or (not stored-width) (/= current-width stored-width))
-                (setq width-changed t)
-                ;; Update stored width
-                (puthash window current-width claude-code--window-widths))))))
-      ;; If current buffer is not a Claude buffer, just pass through normally
-      (if (not (claude-code--buffer-p (current-buffer)))
-          result
-        ;; For Claude buffers: Return result only if a Claude window width changed and
-        ;; we're not in read-only mode. otherwise nil. Nil means do
-        ;; not send a window size changed event to the Claude process.
-        (if (and width-changed (not (claude-code--term-in-read-only-p claude-code-terminal-backend)))
-            result
-          nil)))))
+(defface claude-code-file-link
+  '((t :inherit link))
+  "Clickable file paths."
+  :group 'claude-code)
+
+(defface claude-code-input-prompt
+  '((t :inherit minibuffer-prompt :weight bold))
+  "Input prompt at the bottom of the Claude buffer."
+  :group 'claude-code)
+
+;;;; Internal State
+
+(defvar claude-code--package-dir
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "Directory containing the claude-code package.")
+
+(defvar claude-code--buffers (make-hash-table :test 'equal)
+  "Map of directory -> buffer for active sessions.")
+
+(defvar-local claude-code--process nil
+  "Backend Python process.")
+
+(defvar-local claude-code--cwd nil
+  "Working directory for this session.")
+
+(defvar-local claude-code--session-id nil
+  "Session ID from the Agent SDK.")
+
+(defvar-local claude-code--status 'starting
+  "Process status symbol: starting, ready, working, error, stopped.")
+
+(defvar-local claude-code--partial-line ""
+  "Incomplete JSON line from process output.")
+
+(defvar-local claude-code--messages '()
+  "List of conversation messages (newest first).")
+
+(defvar-local claude-code--streaming-text ""
+  "Accumulated streaming text for current assistant response.")
+
+(defvar-local claude-code--streaming-thinking ""
+  "Accumulated streaming thinking for current assistant response.")
+
+(defvar-local claude-code--streaming-active nil
+  "Whether we are currently receiving streaming deltas.")
+
+(defvar-local claude-code--thinking-timer nil
+  "Timer for thinking spinner animation.")
+
+(defvar-local claude-code--thinking-frame 0
+  "Current frame of thinking spinner animation.")
+
+(defvar-local claude-code--thinking-overlay nil
+  "Overlay displaying the thinking spinner.")
+
+(defvar-local claude-code--render-pending nil
+  "Whether a render is scheduled.")
+
+(defvar-local claude-code--session-overrides nil
+  "Buffer-local config overrides set via the transient menu.
+Merged on top of project config + defaults.")
+
+(defvar-local claude-code--input-marker nil
+  "Marker for the start of the user-editable input area at the buffer bottom.")
+
+(defvar claude-code--prompt-history nil
+  "History for Claude prompts.")
+
+(defconst claude-code--thinking-frames
+  ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Frames for the thinking spinner.")
+
+;;;; Process Management
+
+(defun claude-code--backend-script ()
+  "Return the path to the Python backend script."
+  (expand-file-name "python/claude_code_backend.py"
+                    claude-code--package-dir))
+
+(defun claude-code--start-process ()
+  "Start the Python backend process."
+  (when (and claude-code--process
+             (process-live-p claude-code--process))
+    (delete-process claude-code--process))
+  (let* ((default-directory (expand-file-name "python/" claude-code--package-dir))
+         (buf (current-buffer))
+         (proc (make-process
+                :name (format "claude-sdk-%s" (buffer-name buf))
+                :command (list claude-code-python-command
+                               "run" "python3"
+                               (claude-code--backend-script))
+                :filter (lambda (_proc output)
+                          (claude-code--process-filter buf output))
+                :sentinel (lambda (_proc event)
+                            (claude-code--process-sentinel buf event))
+                :coding 'utf-8-unix
+                :connection-type 'pipe
+                :noquery t)))
+    (setq claude-code--process proc)
+    (setq claude-code--status 'starting)))
+
+(defun claude-code--stop-process ()
+  "Stop the backend process."
+  (claude-code--stop-thinking)
+  (when (and claude-code--process
+             (process-live-p claude-code--process))
+    (claude-code--send-json '((type . "quit")))
+    (sit-for 0.1)
+    (when (process-live-p claude-code--process)
+      (delete-process claude-code--process)))
+  (setq claude-code--process nil)
+  (setq claude-code--status 'stopped))
+
+(defun claude-code--send-json (data)
+  "Send DATA (an alist) as a JSON line to the backend."
+  (when (and claude-code--process
+             (process-live-p claude-code--process))
+    (process-send-string
+     claude-code--process
+     (concat (json-encode data) "\n"))))
+
+;;;; Process Filter & Sentinel
+
+(defun claude-code--process-filter (buf output)
+  "Handle OUTPUT from the backend for display buffer BUF."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (setq claude-code--partial-line
+            (concat claude-code--partial-line output))
+      (let ((lines (split-string claude-code--partial-line "\n")))
+        (setq claude-code--partial-line (car (last lines)))
+        (dolist (line (butlast lines))
+          (when (and line (not (string-empty-p line)))
+            (condition-case err
+                (claude-code--handle-event
+                 (json-parse-string line :object-type 'alist))
+              (error
+               (message "Claude SDK: parse error: %s"
+                        (error-message-string err))))))))))
+
+(defun claude-code--process-sentinel (buf event)
+  "Handle process EVENT for display buffer BUF."
+  (when (buffer-live-p buf)
+    (with-current-buffer buf
+      (unless (string-match-p "open" event)
+        (setq claude-code--status 'stopped)
+        (claude-code--stop-thinking)
+        (claude-code--schedule-render)))))
+
+;;;; Event Handling
+
+(defun claude-code--handle-event (event)
+  "Dispatch a protocol EVENT from the backend."
+  (let ((type (alist-get 'type event)))
+    (pcase type
+      ("status"
+       (claude-code--handle-status-event event))
+      ("system"
+       (claude-code--handle-system-event event))
+      ("assistant"
+       (claude-code--handle-assistant-event event))
+      ("result"
+       (claude-code--handle-result-event event))
+      ("error"
+       (claude-code--handle-error-event event))
+      ;; Streaming deltas
+      ("content_block_start"
+       (claude-code--handle-block-start event))
+      ("text_delta"
+       (claude-code--handle-text-delta event))
+      ("thinking_delta"
+       (claude-code--handle-thinking-delta event))
+      ("content_block_stop"
+       (claude-code--handle-block-stop event))
+      ;; Task events
+      ("task_started"
+       (push `((type . "info")
+               (text . ,(format "Subagent started: %s"
+                                (alist-get 'description event))))
+             claude-code--messages)
+       (claude-code--schedule-render))
+      ("task_notification"
+       (push `((type . "info")
+               (text . ,(format "Subagent %s: %s"
+                                (alist-get 'status event)
+                                (alist-get 'summary event))))
+             claude-code--messages)
+       (claude-code--schedule-render))
+      ;; task_progress, input_json_delta, rate_limit — ignored for now
+      )))
+
+(defun claude-code--handle-status-event (event)
+  "Handle a status EVENT."
+  (let ((status (alist-get 'status event)))
+    (pcase status
+      ("ready"
+       (setq claude-code--status 'ready)
+       (claude-code--stop-thinking)
+       (claude-code--flush-streaming))
+      ("working"
+       (setq claude-code--status 'working)
+       (claude-code--start-thinking))
+      ("cancelled"
+       (setq claude-code--status 'ready)
+       (claude-code--stop-thinking)
+       (claude-code--flush-streaming)
+       (push '((type . "info") (text . "Cancelled."))
+             claude-code--messages))
+      ("error"
+       (setq claude-code--status 'error)
+       (claude-code--stop-thinking)))
+    (claude-code--schedule-render)))
+
+(defun claude-code--handle-system-event (event)
+  "Handle a system EVENT."
+  (let ((subtype (alist-get 'subtype event))
+        (data (alist-get 'data event)))
+    (when (equal subtype "init")
+      (setq claude-code--session-id
+            (alist-get 'session_id data)))))
+
+(defun claude-code--handle-assistant-event (event)
+  "Handle a complete assistant EVENT (non-streaming)."
+  (claude-code--flush-streaming)
+  (push event claude-code--messages)
+  (claude-code--schedule-render))
+
+(defun claude-code--handle-result-event (event)
+  "Handle a result EVENT."
+  (claude-code--flush-streaming)
+  (claude-code--stop-thinking)
+  (push event claude-code--messages)
+  (claude-code--schedule-render))
+
+(defun claude-code--handle-error-event (event)
+  "Handle an error EVENT."
+  (claude-code--stop-thinking)
+  (push `((type . "error") (message . ,(alist-get 'message event)))
+        claude-code--messages)
+  (claude-code--schedule-render))
+
+;;;; Streaming Delta Handling
+
+(defun claude-code--handle-block-start (event)
+  "Handle a content_block_start EVENT."
+  (let ((block-type (alist-get 'block_type event)))
+    (pcase block-type
+      ("text"
+       (setq claude-code--streaming-text ""
+             claude-code--streaming-active t))
+      ("thinking"
+       (setq claude-code--streaming-thinking ""
+             claude-code--streaming-active t)))))
+
+(defun claude-code--handle-text-delta (event)
+  "Handle a text_delta EVENT — append streaming text."
+  (let ((text (alist-get 'text event)))
+    (when text
+      (setq claude-code--streaming-text
+            (concat claude-code--streaming-text text))
+      (claude-code--schedule-render))))
+
+(defun claude-code--handle-thinking-delta (event)
+  "Handle a thinking_delta EVENT — append streaming thinking."
+  (let ((thinking (alist-get 'thinking event)))
+    (when thinking
+      (setq claude-code--streaming-thinking
+            (concat claude-code--streaming-thinking thinking))
+      ;; Only re-render occasionally for thinking (it's collapsed by default)
+      (when (= 0 (mod (length claude-code--streaming-thinking) 200))
+        (claude-code--schedule-render)))))
+
+(defun claude-code--handle-block-stop (_event)
+  "Handle a content_block_stop EVENT."
+  ;; The complete assistant message will arrive soon; nothing to do here.
+  nil)
+
+(defun claude-code--flush-streaming ()
+  "Flush any accumulated streaming content into a message."
+  (when claude-code--streaming-active
+    (let ((content '()))
+      (when (not (string-empty-p claude-code--streaming-thinking))
+        (push `((type . "thinking")
+                (thinking . ,claude-code--streaming-thinking))
+              content))
+      (when (not (string-empty-p claude-code--streaming-text))
+        (push `((type . "text")
+                (text . ,claude-code--streaming-text))
+              content))
+      (when content
+        (push `((type . "assistant")
+                (content . ,(vconcat (nreverse content))))
+              claude-code--messages)))
+    (setq claude-code--streaming-text ""
+          claude-code--streaming-thinking ""
+          claude-code--streaming-active nil)))
+
+;;;; Render Scheduling
+
+(defun claude-code--schedule-render ()
+  "Schedule a buffer render with debouncing."
+  (unless claude-code--render-pending
+    (setq claude-code--render-pending t)
+    (run-at-time 0.03 nil
+                 (lambda (buf)
+                   (when (buffer-live-p buf)
+                     (with-current-buffer buf
+                       (setq claude-code--render-pending nil)
+                       (claude-code--render))))
+                 (current-buffer))))
+
+;;;; Buffer Rendering
+
+(defun claude-code--render ()
+  "Render the conversation buffer."
+  ;; Save any text the user has typed in the input area before erasing.
+  (let* ((input-active (and claude-code--input-marker
+                            (marker-buffer claude-code--input-marker)))
+         (saved-input (if input-active
+                          (buffer-substring-no-properties
+                           claude-code--input-marker (point-max))
+                        ""))
+         (was-in-input (and input-active
+                            (>= (point)
+                                (marker-position claude-code--input-marker))))
+         (at-end (or was-in-input (>= (point) (point-max))))
+         (old-point (point)))
+    ;; Remove old thinking overlay
+    (when claude-code--thinking-overlay
+      (delete-overlay claude-code--thinking-overlay)
+      (setq claude-code--thinking-overlay nil))
+    (let ((inhibit-read-only t))
+      (erase-buffer)
+      (magit-insert-section (root)
+        (claude-code--render-header)
+        (insert "\n")
+        ;; Messages are stored newest-first; render oldest-first
+        (dolist (msg (reverse claude-code--messages))
+          (claude-code--render-message msg))
+        ;; Show in-progress streaming content
+        (claude-code--render-streaming))
+      ;; Thinking spinner overlay (cheap to update, sits at end of buffer)
+      (when (eq claude-code--status 'working)
+        (let ((ov (make-overlay (point-max) (point-max))))
+          (overlay-put ov 'after-string
+                       (propertize
+                        (format "\n  %s Thinking...\n"
+                                (aref claude-code--thinking-frames
+                                      (mod claude-code--thinking-frame
+                                           (length claude-code--thinking-frames))))
+                        'face 'claude-code-thinking))
+          (setq claude-code--thinking-overlay ov)))
+      ;; Insert the input area at the bottom
+      (insert "\n")
+      (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
+      (insert "\n")
+      (insert (propertize "> " 'face 'claude-code-input-prompt))
+      ;; Advance the marker to the current point (start of user input).
+      ;; marker-insertion-type nil means new text inserted at the marker
+      ;; position will go AFTER the marker, keeping the marker fixed.
+      (unless (and claude-code--input-marker
+                   (marker-buffer claude-code--input-marker))
+        (setq claude-code--input-marker (make-marker)))
+      (set-marker claude-code--input-marker (point))
+      (set-marker-insertion-type claude-code--input-marker nil)
+      ;; Restore whatever the user had typed before the re-render
+      (insert saved-input)
+      ;; Make everything above the input area read-only via text property.
+      ;; The input area itself stays editable.
+      (let ((boundary (marker-position claude-code--input-marker)))
+        (add-text-properties (point-min) boundary
+                             '(read-only t))
+        ;; Make the boundary rear-nonsticky so typed text after "> "
+        ;; does not inherit read-only.
+        (when (> boundary (point-min))
+          (put-text-property (1- boundary) boundary
+                             'rear-nonsticky '(read-only)))))
+    ;; Restore point
+    (if at-end
+        (goto-char (point-max))
+      (goto-char (min old-point (point-max))))
+    ;; Keep window scrolled to bottom when following
+    (when-let ((win (get-buffer-window (current-buffer))))
+      (when at-end
+        (set-window-point win (point-max))))))
+
+(defun claude-code--render-header ()
+  "Render the buffer header line."
+  (let ((cfg (claude-code--session-config)))
+    (insert (propertize "Claude Code" 'face 'claude-code-header))
+    (insert "  ")
+    (insert (propertize (format "[%s]" claude-code--status)
+                        'face 'claude-code-status))
+    (when claude-code--cwd
+      (insert "  "
+              (propertize (abbreviate-file-name claude-code--cwd)
+                          'face 'shadow)))
+    (insert "\n")
+    ;; Show active config summary
+    (let ((model (alist-get 'model cfg))
+          (effort (alist-get 'effort cfg))
+          (mode (alist-get 'permission-mode cfg)))
+      (insert (propertize
+               (format "  %s%s  %s"
+                       (or model "default model")
+                       (if effort (format " [%s]" effort) "")
+                       (or mode ""))
+               'face 'shadow))
+      (insert "\n"))
+    (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
+    (insert "\n")))
+
+(defun claude-code--render-message (msg)
+  "Render a single conversation MSG."
+  (let ((type (alist-get 'type msg)))
+    (pcase type
+      ("user"      (claude-code--render-user-msg msg))
+      ("assistant" (claude-code--render-assistant-msg msg))
+      ("result"    (claude-code--render-result-msg msg))
+      ("error"     (claude-code--render-error-msg msg))
+      ("info"      (claude-code--render-info-msg msg)))))
+
+(defun claude-code--render-user-msg (msg)
+  "Render a user MSG."
+  (magit-insert-section (claude-user)
+    (magit-insert-heading
+      (propertize "▶ You" 'face 'claude-code-user-prompt))
+    (insert "  " (alist-get 'prompt msg) "\n\n")))
+
+(defun claude-code--render-assistant-msg (msg)
+  "Render an assistant MSG with its content blocks."
+  (magit-insert-section (claude-assistant nil nil)
+    (magit-insert-heading
+      (propertize "◀ Assistant" 'face 'claude-code-assistant-label))
+    (let ((content (alist-get 'content msg)))
+      ;; json-parse-string returns vectors for arrays
+      (when (vectorp content)
+        (setq content (append content nil)))
+      (dolist (block content)
+        (claude-code--render-content-block block)))
+    (insert "\n")))
+
+(defun claude-code--render-content-block (block)
+  "Render a single content BLOCK."
+  (let ((block-type (alist-get 'type block)))
+    (pcase block-type
+      ("text"
+       (claude-code--render-text (alist-get 'text block)))
+      ("thinking"
+       (claude-code--render-thinking (alist-get 'thinking block)))
+      ("tool_use"
+       (claude-code--render-tool-use block))
+      ("tool_result"
+       (claude-code--render-tool-result block)))))
+
+(defun claude-code--render-text (text)
+  "Render a TEXT content block."
+  (when (and text (not (string-empty-p text)))
+    (dolist (line (split-string text "\n"))
+      (insert "  ")
+      (claude-code--insert-linkified line)
+      (insert "\n"))))
+
+(defun claude-code--render-thinking (text)
+  "Render a collapsible thinking TEXT block."
+  (when (and text (not (string-empty-p text)))
+    (magit-insert-section (claude-thinking nil
+                                           (not claude-code-show-thinking))
+      (magit-insert-heading
+        (propertize "  ◆ Thinking" 'face 'claude-code-thinking))
+      (insert (propertize (claude-code--indent text 4)
+                          'face 'claude-code-thinking))
+      (insert "\n"))))
+
+(defun claude-code--render-tool-use (block)
+  "Render a collapsible tool-use BLOCK."
+  (let* ((name (alist-get 'name block))
+         (input (alist-get 'input block))
+         (summary (claude-code--tool-summary name input)))
+    (magit-insert-section (claude-tool-use nil
+                                           (not claude-code-show-tool-details))
+      (magit-insert-heading
+        (concat "  "
+                (propertize (format "⚙ %s" name)
+                            'face 'claude-code-tool-name)
+                (when summary
+                  (concat " " (propertize summary 'face 'shadow)))))
+      (when input
+        (insert (propertize
+                 (claude-code--indent
+                  (if (stringp input)
+                      input
+                    (json-encode input))
+                  6)
+                 'face 'claude-code-tool-input))
+        (insert "\n")))))
+
+(defun claude-code--render-tool-result (block)
+  "Render a tool result BLOCK."
+  (let ((content (alist-get 'content block))
+        (is-error (alist-get 'is_error block)))
+    (when (and content (stringp content) (not (string-empty-p content)))
+      (let ((face (if is-error 'claude-code-error 'shadow)))
+        (magit-insert-section (claude-tool-result nil t)
+          (magit-insert-heading
+            (propertize (if is-error "  ✗ Tool error" "  ↳ Tool result")
+                        'face face))
+          (insert (propertize (claude-code--indent content 6) 'face face))
+          (insert "\n"))))))
+
+(defun claude-code--render-result-msg (msg)
+  "Render a result MSG."
+  (let ((cost (alist-get 'total_cost_usd msg))
+        (turns (alist-get 'num_turns msg))
+        (duration (alist-get 'duration_ms msg)))
+    (insert (propertize
+             (format "  ✓ Done%s\n"
+                     (concat
+                      (when turns (format " | %d turns" turns))
+                      (when cost (format " | $%.4f" cost))
+                      (when duration (format " | %.1fs" (/ duration 1000.0)))))
+             'face 'claude-code-result))
+    (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
+    (insert "\n\n")))
+
+(defun claude-code--render-error-msg (msg)
+  "Render an error MSG."
+  (insert (propertize (format "  ✗ Error: %s\n\n" (alist-get 'message msg))
+                      'face 'claude-code-error)))
+
+(defun claude-code--render-info-msg (msg)
+  "Render an informational MSG."
+  (insert (propertize (format "  ℹ %s\n" (alist-get 'text msg))
+                      'face 'claude-code-status)))
+
+(defun claude-code--render-streaming ()
+  "Render in-progress streaming content inline."
+  (when claude-code--streaming-active
+    (when (not (string-empty-p claude-code--streaming-thinking))
+      (magit-insert-section (claude-thinking nil
+                                             (not claude-code-show-thinking))
+        (magit-insert-heading
+          (propertize "  ◆ Thinking..." 'face 'claude-code-thinking))
+        (insert (propertize (claude-code--indent
+                             claude-code--streaming-thinking 4)
+                            'face 'claude-code-thinking))
+        (insert "\n")))
+    (when (not (string-empty-p claude-code--streaming-text))
+      (claude-code--render-text claude-code--streaming-text))))
+
+;;;; Text Utilities
+
+(defun claude-code--indent (text n)
+  "Indent each line of TEXT by N spaces."
+  (let ((prefix (make-string n ?\s)))
+    (replace-regexp-in-string "^" prefix text)))
+
+(defun claude-code--tool-summary (name input)
+  "Generate a short summary for tool NAME with INPUT."
+  (when (listp input)
+    (pcase name
+      ("Read"  (alist-get 'file_path input))
+      ("Write" (alist-get 'file_path input))
+      ("Edit"  (alist-get 'file_path input))
+      ("Bash"  (when-let ((cmd (alist-get 'command input)))
+                 (truncate-string-to-width cmd 60)))
+      ("Glob"  (alist-get 'pattern input))
+      ("Grep"  (alist-get 'pattern input))
+      (_       nil))))
+
+(defun claude-code--insert-linkified (text)
+  "Insert TEXT with URLs and file paths made clickable."
+  (let ((start (point)))
+    (insert text)
+    ;; Linkify URLs
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward "https?://[^ \t\n\"'>)]+" (line-end-position) t)
+        (let ((url (match-string 0)))
+          (make-text-button (match-beginning 0) (match-end 0)
+                            'action (lambda (_) (browse-url url))
+                            'face 'claude-code-file-link
+                            'help-echo url))))
+    ;; Linkify absolute file paths
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward "/[^ \t\n\"'>:)]+" (line-end-position) t)
+        (let ((path (match-string 0)))
+          (when (file-exists-p path)
+            (make-text-button (match-beginning 0) (match-end 0)
+                              'action (lambda (_) (find-file path))
+                              'face 'claude-code-file-link
+                              'help-echo (format "Open %s" path))))))))
+
+;;;; Thinking Animation
+
+(defun claude-code--start-thinking ()
+  "Start the thinking spinner animation."
+  (unless claude-code--thinking-timer
+    (setq claude-code--thinking-frame 0)
+    (let ((buf (current-buffer)))
+      (setq claude-code--thinking-timer
+            (run-with-timer
+             0.08 0.08
+             (lambda ()
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (cl-incf claude-code--thinking-frame)
+                   (claude-code--update-thinking-overlay)))))))))
+
+(defun claude-code--stop-thinking ()
+  "Stop the thinking spinner animation."
+  (when claude-code--thinking-timer
+    (cancel-timer claude-code--thinking-timer)
+    (setq claude-code--thinking-timer nil))
+  (when claude-code--thinking-overlay
+    (delete-overlay claude-code--thinking-overlay)
+    (setq claude-code--thinking-overlay nil)))
+
+(defun claude-code--update-thinking-overlay ()
+  "Update the thinking spinner overlay text."
+  (when claude-code--thinking-overlay
+    (overlay-put
+     claude-code--thinking-overlay
+     'after-string
+     (propertize
+      (format "\n  %s Thinking...\n"
+              (aref claude-code--thinking-frames
+                    (mod claude-code--thinking-frame
+                         (length claude-code--thinking-frames))))
+      'face 'claude-code-thinking))))
+
+;;;; Session Config Lookup
+
+(defun claude-code--session-config ()
+  "Return the merged config alist for the current session.
+Merge order: defaults < project config < session overrides."
+  (let ((base (copy-alist claude-code-defaults))
+        (dir (and claude-code--cwd (expand-file-name claude-code--cwd)))
+        (best-match nil)
+        (best-len 0))
+    (when dir
+      (dolist (entry claude-code-project-config)
+        (let* ((proj-dir (expand-file-name (car entry)))
+               (len (length proj-dir)))
+          (when (and (string-prefix-p proj-dir dir)
+                     (> len best-len))
+            (setq best-match (cdr entry)
+                  best-len len)))))
+    ;; Layer 2: project overrides
+    (dolist (override best-match)
+      (setf (alist-get (car override) base) (cdr override)))
+    ;; Layer 3: session overrides (set via transient mid-session)
+    (dolist (override claude-code--session-overrides)
+      (setf (alist-get (car override) base) (cdr override)))
+    base))
+
+(defun claude-code--config (key)
+  "Look up config KEY for the current session."
+  (alist-get key (claude-code--session-config)))
+
+;;;; Notes / Org Integration
+
+(defun claude-code--load-notes ()
+  "Load notes from the configured org file, or nil."
+  (when (and claude-code-notes-file
+             (file-exists-p claude-code-notes-file))
+    (with-temp-buffer
+      (insert-file-contents claude-code-notes-file)
+      (buffer-string))))
+
+(defun claude-code--build-system-prompt ()
+  "Build the system prompt, including notes if configured."
+  (when-let ((notes (claude-code--load-notes)))
+    (format "The user has provided the following persistent notes:\n\n%s"
+            notes)))
 
 ;;;; Interactive Commands
-;;;###autoload
-(defun claude-code-send-region (&optional arg)
-  "Send the current region to Claude.
-
-If no region is active, send the entire buffer if it's not too large.
-For large buffers, ask for confirmation first.
-
-With prefix ARG, prompt for instructions to add to the text before
-sending. With two prefix ARGs (C-u C-u), both add instructions and
-switch to Claude buffer."
-  (interactive "P")
-  (let* ((text (if (use-region-p)
-                   (buffer-substring-no-properties (region-beginning) (region-end))
-                 (if (> (buffer-size) claude-code-large-buffer-threshold)
-                     (when (yes-or-no-p "Buffer is large.  Send anyway? ")
-                       (buffer-substring-no-properties (point-min) (point-max)))
-                   (buffer-substring-no-properties (point-min) (point-max)))))
-         (prompt (cond
-                  ((equal arg '(4))     ; C-u
-                   (read-string "Instructions for Claude: "))
-                  ((equal arg '(16))    ; C-u C-u
-                   (read-string "Instructions for Claude: "))
-                  (t nil)))
-         (full-text (if prompt
-                        (format "%s\n\n%s" prompt text)
-                      text)))
-    (when full-text
-      (let ((selected-buffer (claude-code--do-send-command full-text)))
-        (when (and (equal arg '(16)) selected-buffer) ; Only switch buffer with C-u C-u
-          (pop-to-buffer selected-buffer))))))
 
 ;;;###autoload
-(defun claude-code-toggle ()
-  "Show or hide the Claude window.
+(defun claude-code-send (prompt)
+  "Send PROMPT to Claude."
+  (interactive
+   (list (read-string "Claude> " nil 'claude-code--prompt-history)))
+  (when (string-empty-p prompt)
+    (user-error "Empty prompt"))
+  (push `((type . "user") (prompt . ,prompt))
+        claude-code--messages)
+  (let* ((cfg (claude-code--session-config))
+         (cmd `((type . "query")
+                (prompt . ,prompt)
+                (cwd . ,claude-code--cwd)
+                (allowed_tools . ,(vconcat (alist-get 'allowed-tools cfg)))
+                (permission_mode . ,(alist-get 'permission-mode cfg))
+                (max_turns . ,(alist-get 'max-turns cfg)))))
+    (when-let ((v (alist-get 'model cfg)))
+      (push `(model . ,v) cmd))
+    (when-let ((v (alist-get 'effort cfg)))
+      (push `(effort . ,v) cmd))
+    (when-let ((v (alist-get 'max-budget-usd cfg)))
+      (push `(max_budget_usd . ,v) cmd))
+    (when-let ((v (alist-get 'betas cfg)))
+      (push `(betas . ,(vconcat v)) cmd))
+    (when-let ((sys-prompt (claude-code--build-system-prompt)))
+      (push `(system_prompt . ,sys-prompt) cmd))
+    (claude-code--send-json cmd))
+  (claude-code--schedule-render))
 
-If the Claude buffer doesn't exist, create it."
+;;;###autoload
+(defun claude-code-send-region (start end)
+  "Send the region from START to END with a prompt."
+  (interactive "r")
+  (let* ((region-text (buffer-substring-no-properties start end))
+         (file (buffer-file-name))
+         (prompt (read-string "Claude (with region)> "
+                              nil 'claude-code--prompt-history))
+         (full-prompt
+          (format "%s\n\nContext from %s:\n```\n%s\n```"
+                  prompt (or file "buffer") region-text)))
+    (with-current-buffer (claude-code--get-or-create-buffer)
+      (claude-code-send full-prompt))))
+
+;;;###autoload
+(defun claude-code-send-buffer-file ()
+  "Send the current file path as context with a prompt."
   (interactive)
-  (let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-    (if claude-code-buffer
-        (if (get-buffer-window claude-code-buffer)
-            (delete-window (get-buffer-window claude-code-buffer))
-          (let ((window (display-buffer claude-code-buffer '((display-buffer-below-selected)))))
-            ;; set no-delete-other-windows parameter for claude-code window
-            (set-window-parameter window 'no-delete-other-windows claude-code-no-delete-other-windows)
-            ;; Optionally select the window based on user preference
-            (when claude-code-toggle-auto-select
-              (select-window window))))
-      (claude-code--show-not-running-message))))
+  (let* ((file (or (buffer-file-name) (user-error "Buffer has no file")))
+         (prompt (read-string
+                  (format "Claude (re: %s)> "
+                          (file-name-nondirectory file))
+                  nil 'claude-code--prompt-history)))
+    (with-current-buffer (claude-code--get-or-create-buffer)
+      (claude-code-send (format "%s\n\nRegarding file: %s" prompt file)))))
 
-;;;###autoload
-(defun claude-code--switch-to-all-instances-helper ()
-  "Helper function to switch to a Claude buffer from all available instances.
-
-Returns t if a buffer was selected and switched to, nil otherwise."
-  (let ((all-buffers (claude-code--find-all-claude-buffers)))
-    (cond
-     ((null all-buffers)
-      (claude-code--show-not-running-message)
-      nil)
-     ((= (length all-buffers) 1)
-      ;; Only one buffer, just switch to it
-      (pop-to-buffer (car all-buffers))
-      t)
-     (t
-      ;; Multiple buffers, let user choose
-      (let ((selected-buffer (claude-code--select-buffer-from-choices
-                              "Select Claude instance: "
-                              all-buffers)))
-        (when selected-buffer
-          (pop-to-buffer selected-buffer)
-          t))))))
-
-(defun claude-code-switch-to-buffer (&optional arg)
-  "Switch to the Claude buffer if it exists.
-
-With prefix ARG, show all Claude instances across all directories."
-  (interactive "P")
-  (if arg
-      ;; With prefix arg, show all Claude instances
-      (claude-code--switch-to-all-instances-helper)
-    ;; Without prefix arg, use normal behavior
-    (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-        (pop-to-buffer claude-code-buffer)
-      (claude-code--show-not-running-message))))
-
-;;;###autoload
-(defun claude-code-select-buffer ()
-  "Select and switch to a Claude buffer from all running instances.
-
-This command shows all Claude instances across all projects and
-directories, allowing you to choose which one to switch to."
+(defun claude-code-cancel ()
+  "Cancel the current query."
   (interactive)
-  (claude-code--switch-to-all-instances-helper))
+  (claude-code--send-json '((type . "cancel")))
+  (claude-code--stop-thinking)
+  (setq claude-code--status 'ready)
+  (claude-code--schedule-render))
 
-(defun claude-code--kill-all-instances ()
-  "Kill all Claude instances across all directories."
-  (let ((all-buffers (claude-code--find-all-claude-buffers)))
-    (if all-buffers
-        (let* ((buffer-count (length all-buffers))
-               (plural-suffix (if (= buffer-count 1) "" "s")))
-          (if claude-code-confirm-kill
-              (when (yes-or-no-p (format "Kill %d Claude instance%s? " buffer-count plural-suffix))
-                (dolist (buffer all-buffers)
-                  (claude-code--kill-buffer buffer))
-                (message "%d Claude instance%s killed" buffer-count plural-suffix))
-            (dolist (buffer all-buffers)
-              (claude-code--kill-buffer buffer))
-            (message "%d Claude instance%s killed" buffer-count plural-suffix)))
-      (claude-code--show-not-running-message))))
+(defun claude-code-clear ()
+  "Clear the conversation."
+  (interactive)
+  (setq claude-code--messages '()
+        claude-code--session-id nil
+        claude-code--streaming-text ""
+        claude-code--streaming-thinking ""
+        claude-code--streaming-active nil)
+  (claude-code--schedule-render))
 
-;;;###autoload
 (defun claude-code-kill ()
-  "Kill Claude process and close its window."
+  "Kill the Claude session and buffer."
   (interactive)
-  (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-      (if claude-code-confirm-kill
-          (when (yes-or-no-p "Kill Claude instance? ")
-            (claude-code--kill-buffer claude-code-buffer)
-            (message "Claude instance killed"))
-        (claude-code--kill-buffer claude-code-buffer)
-        (message "Claude instance killed"))
-    (claude-code--show-not-running-message)))
+  (claude-code--stop-process)
+  (when claude-code--cwd
+    (remhash claude-code--cwd claude-code--buffers))
+  (kill-buffer))
 
-;;;###autoload
-(defun claude-code-kill-all ()
-  "Kill ALL Claude processes across all directories."
+(defun claude-code-open-notes ()
+  "Open the notes org file."
   (interactive)
-  (claude-code--kill-all-instances))
+  (if claude-code-notes-file
+      (find-file claude-code-notes-file)
+    (user-error "Set `claude-code-notes-file' first")))
 
-;;;###autoload
-(defun claude-code-send-command (&optional arg)
-  "Read a Claude command from the minibuffer and send it.
-
-With prefix ARG, switch to the Claude buffer after sending."
-  (interactive "P")
-  (let* ((cmd (read-string "Claude command: " nil 'claude-code-command-history))
-         (selected-buffer (claude-code--do-send-command cmd)))
-    (when (and arg selected-buffer)
-      (pop-to-buffer selected-buffer))))
-
-;;;###autoload
-(defun claude-code-send-command-with-context (&optional arg)
-  "Read a Claude command and send it with current file and line context.
-
-If region is active, include region line numbers.
-With prefix ARG, switch to the Claude buffer after sending."
-  (interactive "P")
-  (let* ((cmd (read-string "Claude command: " nil 'claude-code-command-history))
-         (file-ref (if (use-region-p)
-                       (claude-code--format-file-reference
-                        nil
-                        (line-number-at-pos (region-beginning) t)
-                        (line-number-at-pos (region-end) t))
-                     (claude-code--format-file-reference)))
-         (cmd-with-context (if file-ref
-                               (format "%s\n%s" cmd file-ref)
-                             cmd)))
-    (let ((selected-buffer (claude-code--do-send-command cmd-with-context)))
-      (when (and arg selected-buffer)
-        (pop-to-buffer selected-buffer)))))
-
-;;;###autoload
-(defun claude-code-send-return ()
-  "Send <return> to the Claude Code REPL.
-
-This is useful for saying Yes when Claude asks for confirmation without
-having to switch to the REPL buffer."
+(defun claude-code-toggle-thinking ()
+  "Toggle whether thinking blocks are expanded by default."
   (interactive)
-  (claude-code--do-send-command ""))
+  (setq claude-code-show-thinking (not claude-code-show-thinking))
+  (message "Thinking: %s" (if claude-code-show-thinking "visible" "hidden"))
+  (claude-code--schedule-render))
 
-;;;###autoload
-(defun claude-code-send-1 ()
-  "Send \"1\" to the Claude Code REPL.
-
-This selects the first option when Claude presents a numbered menu."
+(defun claude-code-toggle-tool-details ()
+  "Toggle whether tool details are expanded by default."
   (interactive)
-  (claude-code--do-send-command "1"))
+  (setq claude-code-show-tool-details
+        (not claude-code-show-tool-details))
+  (message "Tool details: %s"
+           (if claude-code-show-tool-details "visible" "hidden"))
+  (claude-code--schedule-render))
 
-;;;###autoload
-(defun claude-code-send-2 ()
-  "Send \"2\" to the Claude Code REPL.
+;;;; Inline Input Commands
 
-This selects the second option when Claude presents a numbered menu."
+(defun claude-code-submit-input ()
+  "Submit the text currently typed in the input area."
   (interactive)
-  (claude-code--do-send-command "2"))
+  (when claude-code--input-marker
+    (let ((text (string-trim
+                 (buffer-substring-no-properties
+                  claude-code--input-marker (point-max)))))
+      (unless (string-empty-p text)
+        ;; Clear the input area before sending so the render shows it clean
+        (let ((inhibit-read-only t))
+          (delete-region claude-code--input-marker (point-max)))
+        (claude-code-send text)))))
 
-;;;###autoload
-(defun claude-code-send-3 ()
-  "Send \"3\" to the Claude Code REPL.
-
-This selects the third option when Claude presents a numbered menu."
+(defun claude-code-focus-input ()
+  "Move point to the end of the input area, ready to type."
   (interactive)
-  (claude-code--do-send-command "3"))
+  (goto-char (point-max)))
 
-;;;###autoload
-(defun claude-code-send-escape ()
-  "Send <escape> to the Claude Code REPL.
-
-This is useful for saying \"No\" when Claude asks for confirmation without
-having to switch to the REPL buffer."
+(defun claude-code-return ()
+  "Submit the input if point is in the input area; otherwise toggle section."
   (interactive)
-  (claude-code--with-buffer
-   (claude-code--term-send-string claude-code-terminal-backend (kbd "ESC"))))
+  (if (and claude-code--input-marker
+           (>= (point) (marker-position claude-code--input-marker)))
+      (claude-code-submit-input)
+    (call-interactively #'magit-section-toggle)))
+
+;;;; Session Config Commands
+
+(defun claude-code-set-model (model)
+  "Set MODEL for the current session."
+  (interactive
+   (list (completing-read
+          "Model: "
+          '("claude-opus-4-6" "claude-sonnet-4-6" "claude-haiku-4-5")
+          nil nil nil nil
+          (claude-code--config 'model))))
+  (setf (alist-get 'model claude-code--session-overrides)
+        (if (string-empty-p model) nil model))
+  (claude-code--schedule-render))
+
+(defun claude-code-set-effort (effort)
+  "Set EFFORT level for the current session."
+  (interactive
+   (list (completing-read
+          "Effort: "
+          '("low" "medium" "high" "max" "nil")
+          nil t nil nil
+          (or (claude-code--config 'effort) "nil"))))
+  (setf (alist-get 'effort claude-code--session-overrides)
+        (if (equal effort "nil") nil effort))
+  (claude-code--schedule-render))
+
+(defun claude-code-set-permission-mode (mode)
+  "Set permission MODE for the current session."
+  (interactive
+   (list (completing-read
+          "Permission mode: "
+          '("default" "plan" "acceptEdits" "bypassPermissions")
+          nil t nil nil
+          (claude-code--config 'permission-mode))))
+  (setf (alist-get 'permission-mode claude-code--session-overrides)
+        mode)
+  (claude-code--schedule-render))
+
+;;;; Transient Menu
+
+(transient-define-prefix claude-code-menu ()
+  "Claude Code command menu."
+  ["Send"
+   ("s" "Focus input area" claude-code-focus-input)
+   ("r" "Send region" claude-code-send-region)
+   ("f" "Send file context" claude-code-send-buffer-file)]
+  ["Control"
+   ("c" "Cancel" claude-code-cancel)
+   ("C" "Clear conversation" claude-code-clear)
+   ("k" "Kill session" claude-code-kill)]
+  ["Session"
+   ("m" "Set model" claude-code-set-model)
+   ("e" "Set effort" claude-code-set-effort)
+   ("p" "Set permission mode" claude-code-set-permission-mode)]
+  ["View"
+   ("t" "Toggle thinking" claude-code-toggle-thinking)
+   ("T" "Toggle tool details" claude-code-toggle-tool-details)
+   ("n" "Open notes file" claude-code-open-notes)])
+
+;;;; Keymap
+
+(defvar-keymap claude-code-mode-map
+  :doc "Keymap for Claude Code mode."
+  :parent magit-section-mode-map
+  "s"   #'claude-code-focus-input
+  "r"   #'claude-code-send-region
+  "c"   #'claude-code-cancel
+  "C"   #'claude-code-clear
+  "k"   #'claude-code-kill
+  "n"   #'claude-code-open-notes
+  "?"   #'claude-code-menu
+  "q"   #'quit-window
+  "G"   #'claude-code--render
+  "RET" #'claude-code-return
+  "C-j" #'newline)
+
+;;;; Major Mode
+
+(define-derived-mode claude-code-mode magit-section-mode "Claude"
+  "Major mode for Claude Code interaction.
+\\{claude-code-mode-map}"
+  :group 'claude-code
+  (setq-local truncate-lines nil)
+  (setq-local word-wrap t)
+  ;; Allow typing in the input area at the bottom of the buffer.
+  ;; magit-section-mode (via special-mode) sets buffer-read-only t; we
+  ;; override that here and rely on the render function to keep the
+  ;; conversation content visually stable via inhibit-read-only.
+  (setq-local buffer-read-only nil)
+  (visual-line-mode 1)
+  (goto-address-mode 1))
+
+;;;; Entry Points
+
+(defun claude-code--buffer-name (dir)
+  "Generate a buffer name for DIR."
+  (format "*Claude: %s*" (abbreviate-file-name dir)))
+
+(defun claude-code--get-or-create-buffer (&optional dir)
+  "Get or create a Claude buffer for DIR."
+  (let* ((directory (or dir
+                        (when-let ((proj (project-current)))
+                          (project-root proj))
+                        default-directory))
+         (existing (gethash directory claude-code--buffers)))
+    (if (and existing (buffer-live-p existing))
+        existing
+      (let ((buf (get-buffer-create
+                  (claude-code--buffer-name directory))))
+        (puthash directory buf claude-code--buffers)
+        (with-current-buffer buf
+          (claude-code-mode)
+          (setq claude-code--cwd directory)
+          (claude-code--start-process)
+          (claude-code--schedule-render))
+        buf))))
 
 ;;;###autoload
-(defun claude-code-send-file (file-path)
-  "Send the specified FILE-PATH to Claude prefixed with `@'.
-
-FILE-PATH should be an absolute path to the file to send."
-  (interactive "fFile to send to Claude: ")
-  (let ((command (format "@%s" (expand-file-name file-path))))
-    (claude-code--do-send-command command)))
-
-;;;###autoload
-(defun claude-code-send-buffer-file (&optional arg)
-  "Send the file associated with current buffer to Claude prefixed with `@'.
-
-With prefix ARG, prompt for instructions to add to the file before sending.
-With two prefix ARGs, both add instructions and switch to Claude buffer."
-  (interactive "P")
-  (let ((file-path (claude-code--get-buffer-file-name)))
-    (if file-path
-        (let* ((prompt (when arg
-                         (read-string "Instructions for Claude: ")))
-               (command (if prompt
-                            (format "%s\n\n@%s" prompt file-path)
-                          (format "@%s" file-path))))
-          (let ((selected-buffer (claude-code--do-send-command command)))
-            (when (and (equal arg '(16)) selected-buffer) ; Only switch buffer with C-u C-u
-              (pop-to-buffer selected-buffer))))
-      (error "Current buffer is not associated with a file"))))
-
-(defun claude-code--send-meta-return ()
-  "Send Meta-Return key sequence to the terminal."
+(defun claude-code (&optional directory)
+  "Open Claude Code for DIRECTORY (defaults to project root)."
   (interactive)
-  (claude-code--term-send-string claude-code-terminal-backend "\e\C-m"))
+  (pop-to-buffer (claude-code--get-or-create-buffer directory)))
 
-(defun claude-code--send-return ()
-  "Send Return key to the terminal."
+;;;###autoload
+(defun claude-code-quick (prompt)
+  "Send PROMPT to Claude without switching buffers."
+  (interactive "sClaude> ")
+  (let ((buf (claude-code--get-or-create-buffer)))
+    (with-current-buffer buf
+      (claude-code-send prompt))
+    (message "Sent: %s" (truncate-string-to-width prompt 60))))
+
+;;;; Development / Reload
+
+;;;###autoload
+(defun claude-code-reload ()
+  "Reload `claude-code.el' from source, restart backend, keep conversation.
+Designed for dogfooding: edit the source, hit the keybinding, see changes."
   (interactive)
-  (claude-code--term-send-string claude-code-terminal-backend (kbd "RET")))
+  (let ((source-file (expand-file-name "claude-code.el"
+                                       claude-code--package-dir))
+        ;; Save conversation state from every live Claude buffer
+        (saved-states '()))
+    (maphash (lambda (dir buf)
+               (when (buffer-live-p buf)
+                 (with-current-buffer buf
+                   (push (list :dir dir
+                               :messages claude-code--messages
+                               :session-id claude-code--session-id
+                               :session-overrides claude-code--session-overrides
+                               :streaming-text claude-code--streaming-text
+                               :streaming-thinking claude-code--streaming-thinking
+                               :streaming-active claude-code--streaming-active)
+                         saved-states)
+                   ;; Kill the old backend process
+                   (claude-code--stop-process))))
+             claude-code--buffers)
+    ;; Re-evaluate the source file
+    (load source-file nil t)
+    ;; Restore each buffer with saved state
+    (dolist (state saved-states)
+      (let* ((dir (plist-get state :dir))
+             (buf (gethash dir claude-code--buffers)))
+        (when (and buf (buffer-live-p buf))
+          (with-current-buffer buf
+            ;; Re-activate the mode (picks up new keymap, render fns, etc.)
+            (claude-code-mode)
+            (setq claude-code--cwd dir)
+            ;; Restore conversation
+            (setq claude-code--messages (plist-get state :messages)
+                  claude-code--session-id (plist-get state :session-id)
+                  claude-code--session-overrides (plist-get state :session-overrides)
+                  claude-code--streaming-text (plist-get state :streaming-text)
+                  claude-code--streaming-thinking (plist-get state :streaming-thinking)
+                  claude-code--streaming-active (plist-get state :streaming-active))
+            ;; Start a fresh backend
+            (claude-code--start-process)
+            (claude-code--schedule-render)))))
+    (message "claude-code reloaded (%d buffer%s)"
+             (length saved-states)
+             (if (= 1 (length saved-states)) "" "s"))))
 
-;;;###autoload
-(defun claude-code-cycle-mode ()
-  "Send Shift-Tab to Claude to cycle between modes.
-
-Claude uses Shift-Tab to cycle through:
-- Default mode
-- Auto-accept edits mode
-- Plan mode"
-  (interactive)
-  (claude-code--with-buffer
-   (claude-code--term-send-string claude-code-terminal-backend "\e[Z")))
-
-;; (define-key key-translation-map (kbd "ESC") "")
-
-;;;###autoload
-(defun claude-code-fork ()
-  "Jump to a previous conversation by invoking the Claude fork command.
-
-Sends <escape><escape> to the Claude Code REPL."
-  (interactive)
-  (if-let ((claude-code-buffer (claude-code--get-or-prompt-for-buffer)))
-      (with-current-buffer claude-code-buffer
-        (claude-code--term-send-string claude-code-terminal-backend "")
-        ;; (display-buffer claude-code-buffer)
-        (pop-to-buffer claude-code-buffer))
-    (claude-code--show-not-running-message)))
-
-;;;###autoload
-(defun claude-code-fix-error-at-point (&optional arg)
-  "Ask Claude to fix the error at point.
-
-Gets the error message, file name, and line number, and instructs Claude
-to fix the error. Supports both flycheck and flymake error systems, as well
-as any system that implements help-at-pt.
-
-With prefix ARG, switch to the Claude buffer after sending."
-  (interactive "P")
-  (let* ((error-text (claude-code--format-errors-at-point))
-         (file-ref (claude-code--format-file-reference)))
-    (if (string= error-text "No errors at point")
-        (message "No errors found at point")
-      (let ((command (format "Fix this error at %s:\nDo not run any external linter or other program, just fix the error at point using the context provided in the error message: <%s>"
-                             (or file-ref "current position") error-text)))
-        (let ((selected-buffer (claude-code--do-send-command command)))
-          (when (and arg selected-buffer)
-            (pop-to-buffer selected-buffer)))))))
-
-;;;###autoload
-(defun claude-code-read-only-mode ()
-  "Enter read-only mode in Claude buffer with visible cursor.
-
-In this mode, you can interact with the terminal buffer just like a
-regular buffer. This mode is useful for selecting text in the Claude
-buffer. However, you are not allowed to change the buffer contents or
-enter Claude commands.
-
-Use `claude-code-exit-read-only-mode' to switch back to normal mode."
-  (interactive)
-  (claude-code--with-buffer
-   (claude-code--term-read-only-mode claude-code-terminal-backend)
-   (message "Claude read-only mode enabled")))
-
-;;;###autoload
-(defun claude-code-exit-read-only-mode ()
-  "Exit read-only mode and return to normal mode (eat semi-char mode)."
-  (interactive)
-  (claude-code--with-buffer
-   (claude-code--term-interactive-mode claude-code-terminal-backend)
-   (message "Claude read-only disabled")))
-
-;;;###autoload
-(defun claude-code-toggle-read-only-mode ()
-  "Toggle between read-only mode and normal mode.
-
-In read-only mode you can interact with the terminal buffer just like a
-regular buffer. This mode is useful for selecting text in the Claude
-buffer. However, you are not allowed to change the buffer contents or
-enter Claude commands."
-  (interactive)
-  (claude-code--with-buffer
-   (if (not (claude-code--term-in-read-only-p claude-code-terminal-backend))
-       (claude-code-read-only-mode)
-     (claude-code-exit-read-only-mode))))
-
-;;;; Mode definition
-;;;###autoload
-(define-minor-mode claude-code-mode
-  "Minor mode for interacting with Claude AI CLI.
-
-When enabled, provides functionality for starting, sending commands to,
-and managing Claude sessions."
-  :init-value nil
-  :lighter " Claude"
-  :global t
-  :group 'claude-code)
-
-;;;; Provide the feature
 (provide 'claude-code)
-
 ;;; claude-code.el ends here

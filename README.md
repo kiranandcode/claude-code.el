@@ -1,8 +1,231 @@
 # claude-code.el
 
-An Emacs interface for [Claude Code CLI](https://github.com/anthropics/claude-code), providing integration between Emacs and Claude AI for coding assistance.
+An Emacs interface for Claude AI coding assistance.  Two integration modes are available:
 
-## Features
+| | `claude-code.el` (legacy) | `claude-code-sdk.el` (new) |
+|---|---|---|
+| Backend | Claude Code CLI via terminal emulation (eat/vterm) | [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/) via Python subprocess |
+| UI | Terminal buffer | magit-section buffer with collapsible blocks |
+| Streaming | Full terminal rendering | Token-level text deltas |
+| Tool visibility | Hidden inside terminal | Collapsible tool-use / thinking sections |
+
+---
+
+## claude-code-sdk.el — Agent SDK Integration
+
+### Design
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ Emacs                                                   │
+│                                                         │
+│  claude-code-sdk.el                                     │
+│  ├── magit-section buffer (conversation UI)             │
+│  ├── transient menu (keyboard-first commands)           │
+│  ├── process filter (JSON-lines parser)                 │
+│  └── overlay-based thinking spinner                     │
+│           │                                             │
+│           │ stdin: JSON-line commands                    │
+│           │ stdout: JSON-line events                    │
+│           ▼                                             │
+│  python/claude_code_backend.py                          │
+│  ├── asyncio main loop (stdin reader)                   │
+│  ├── typed protocol (dataclasses)                       │
+│  ├── SDK message → protocol event conversion            │
+│  └── query dispatch + cancellation                      │
+│           │                                             │
+│           │ Claude Agent SDK                            │
+│           ▼                                             │
+│  claude-agent-sdk (pip package)                         │
+│  ├── query() async iterator                             │
+│  ├── built-in tools (Read/Write/Edit/Bash/Glob/Grep)   │
+│  └── streaming via StreamEvent (raw SSE deltas)         │
+│           │                                             │
+│           │ HTTPS                                       │
+│           ▼                                             │
+│  Claude API                                             │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Protocol
+
+Emacs and the Python backend communicate over stdin/stdout using one JSON object per line.
+
+#### Commands (Emacs → Python)
+
+| Command | Fields | Description |
+|---------|--------|-------------|
+| `query` | `prompt`, `cwd`, `allowed_tools`, `system_prompt`, `max_turns`, `permission_mode`, `model`, `resume` | Send a prompt to the agent |
+| `cancel` | — | Cancel the running query |
+| `quit` | — | Shut down the backend |
+
+#### Events (Python → Emacs)
+
+| Event | Key fields | Description |
+|-------|------------|-------------|
+| `status` | `status`: ready/working/cancelled/error | Backend lifecycle |
+| `system` | `subtype`, `data` | SDK system messages (e.g. session init with `session_id`) |
+| `assistant` | `content[]`, `model` | Complete assistant turn with content blocks |
+| `result` | `result`, `stop_reason`, `num_turns`, `total_cost_usd`, `duration_ms`, `session_id` | Final query result |
+| `error` | `message`, `detail` | Error with optional traceback |
+| `content_block_start` | `index`, `block_type` | A streaming content block begins |
+| `text_delta` | `index`, `text` | Incremental text token |
+| `thinking_delta` | `index`, `thinking` | Incremental thinking token |
+| `input_json_delta` | `index`, `partial_json` | Incremental tool input JSON |
+| `content_block_stop` | `index` | A streaming content block ends |
+| `task_started` | `task_id`, `description` | Subagent task began |
+| `task_progress` | `task_id`, `description`, `last_tool_name` | Subagent progress |
+| `task_notification` | `task_id`, `status`, `summary` | Subagent completed/failed |
+| `rate_limit` | `message` | Rate limit warning |
+
+Content blocks within `assistant` events:
+
+| Block type | Fields | Description |
+|------------|--------|-------------|
+| `text` | `text` | Assistant text output |
+| `thinking` | `thinking` | Internal reasoning (collapsible in UI) |
+| `tool_use` | `id`, `name`, `input` | Tool invocation (collapsible, shows summary) |
+| `tool_result` | `tool_use_id`, `content`, `is_error` | Tool execution result |
+
+All protocol types are defined as Python dataclasses in `python/claude_code_backend.py` and enforced by `mypy --strict`.
+
+### Buffer Layout
+
+```
+Claude Code  [working]  ~/projects/myapp
+──────────────────────────────────────────────────────────────────────────
+▶ You
+  Explain the auth module
+
+◀ Assistant
+  ◆ Thinking                                              [TAB to expand]
+  ⚙ Read src/auth.py                                      [TAB to expand]
+  ⚙ Grep pattern=verify_token                              [TAB to expand]
+
+  The authentication module handles JWT verification...
+
+  ✓ Done | 3 turns | $0.0142 | 4.2s
+──────────────────────────────────────────────────────────────────────────
+
+  ⠹ Thinking...
+```
+
+- **Thinking blocks** — collapsed by default, toggle with `TAB` or `claude-code-sdk-show-thinking`
+- **Tool-use blocks** — collapsed by default, heading shows tool name + summary (e.g. file path, grep pattern, bash command)
+- **Streaming** — text appears token-by-token as it arrives; thinking spinner animates via overlay (no full re-render)
+- **Links** — URLs open in browser; absolute file paths open in Emacs (if they exist on disk)
+
+### Installation
+
+#### Prerequisites
+
+- Emacs 30.0+
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/) (Python package manager)
+- An `ANTHROPIC_API_KEY` environment variable (or Claude Code CLI configured)
+
+#### Setup
+
+```bash
+# Clone the repo
+git clone https://github.com/stevemolitor/claude-code.el.git
+
+# Install Python dependencies
+cd claude-code.el/python
+uv sync
+```
+
+```elisp
+;; In your init.el
+(use-package claude-code-sdk
+  :load-path "/path/to/claude-code.el"
+  :commands (claude-code-sdk claude-code-sdk-quick)
+  :bind ("C-c a" . claude-code-sdk-menu))
+```
+
+Emacs dependencies (`magit-section`, `transient`) are installed automatically from MELPA.
+
+### Usage
+
+```
+M-x claude-code-sdk       Open the Claude buffer for the current project
+```
+
+#### Keyboard Shortcuts (in Claude buffer)
+
+| Key | Command | Description |
+|-----|---------|-------------|
+| `s` / `RET` | `claude-code-sdk-send` | Send a prompt |
+| `r` | `claude-code-sdk-send-region` | Send region with a prompt |
+| `f` | `claude-code-sdk-send-buffer-file` | Send current file path with a prompt |
+| `c` | `claude-code-sdk-cancel` | Cancel running query |
+| `C` | `claude-code-sdk-clear` | Clear conversation |
+| `k` | `claude-code-sdk-kill` | Kill session and buffer |
+| `t` | `claude-code-sdk-toggle-thinking` | Toggle thinking block visibility |
+| `T` | `claude-code-sdk-toggle-tool-details` | Toggle tool detail visibility |
+| `n` | `claude-code-sdk-open-notes` | Open the notes org file |
+| `TAB` | (magit-section) | Toggle section at point |
+| `?` | `claude-code-sdk-menu` | Transient command menu |
+| `q` | `quit-window` | Bury buffer |
+| `G` | `claude-code-sdk--render` | Force re-render |
+
+#### From Any Buffer
+
+```elisp
+M-x claude-code-sdk-quick   ;; prompt in minibuffer, no buffer switch
+M-x claude-code-sdk-send-region   ;; send selection with a question
+```
+
+### Configuration
+
+```elisp
+;; Python command (default: "uv")
+(setq claude-code-sdk-python-command "uv")
+
+;; Org file with persistent notes included in every system prompt
+(setq claude-code-sdk-notes-file "~/org/claude-notes.org")
+
+;; Tools the agent may use
+(setq claude-code-sdk-allowed-tools
+      '("Read" "Write" "Edit" "Bash" "Glob" "Grep" "WebSearch" "WebFetch"))
+
+;; Model (nil = SDK default)
+(setq claude-code-sdk-model nil)
+
+;; Permission mode: "default", "plan", "acceptEdits", "bypassPermissions"
+(setq claude-code-sdk-permission-mode "bypassPermissions")
+
+;; Max agent turns per query
+(setq claude-code-sdk-max-turns 50)
+
+;; Show thinking/tool blocks expanded by default
+(setq claude-code-sdk-show-thinking nil)
+(setq claude-code-sdk-show-tool-details nil)
+```
+
+### Build
+
+```bash
+make all   # checkdoc + byte-compile + mypy --strict
+```
+
+### Tasks
+
+- [ ] Side-by-side diffs (vdiff) for Edit tool results inline
+- [ ] Image/PDF attachment via C-c C-v (base64 encode and include in prompt)
+- [ ] Code block syntax highlighting (detect ``` fences, apply language modes)
+- [ ] Session resume (pass `resume` session_id to backend)
+- [ ] Prompt prefix system (quick-select common prompt starters from defcustom alist)
+- [ ] Cost/token tracking in mode line
+- [ ] Multiple concurrent sessions per project
+
+---
+
+## claude-code.el — Legacy CLI Integration
+
+> Terminal-based integration that shells out to the Claude Code CLI.  Requires `eat` or `vterm`.
+
+### Features
 
 - **Seamless Emacs Integration** - Start, manage, and interact with Claude without leaving Emacs
 - **Stay in Your Buffer** - Send code, regions, or commands to Claude while keeping your focus

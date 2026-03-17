@@ -1,0 +1,18 @@
+[project]
+name = "claude-code-emacs-backend"
+version = "0.1.0"
+description = "Python backend for claude-code-sdk.el Emacs integration"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk",
+]
+
+[tool.mypy]
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[dependency-groups]
+dev = [
+    "mypy",
+]

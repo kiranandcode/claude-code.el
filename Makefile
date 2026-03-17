@@ -3,7 +3,7 @@ EMACS ?= emacs
 # Run all tests by default.
 MATCH ?=
 
-.PHONY: test clean
+.PHONY: test clean mypy
 
 default: all
 
@@ -20,4 +20,7 @@ checkdoc:
 compile: clean
 	$(EMACS) --batch -L . --eval "(progn (require 'package) (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t) (package-initialize) (setq sentence-end-double-space nil))" -f batch-byte-compile *.el
 
-all: checkdoc compile
+mypy:
+	cd python && uv run mypy --strict claude_code_backend.py
+
+all: checkdoc compile mypy
