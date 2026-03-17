@@ -1,9 +1,10 @@
 EMACS ?= emacs
+BATCH := ./emacs-batch.sh
 
-# Run all tests by default.
+# Run all checks by default.
 MATCH ?=
 
-.PHONY: test clean mypy
+.PHONY: test clean mypy all checkdoc compile
 
 default: all
 
@@ -11,16 +12,23 @@ default: all
 clean:
 	rm -f *.elc
 
-EL_FILES := $(wildcard *.el)
+# Only compile the main source, not the test file
+SRC_FILES := claude-code.el
 
-# Run checkdoc on elisp files. To do this, we run checkdoc-file via -eval on every .el file in EL_FILES
+# Run checkdoc on source files (skip test file — ERT style doesn't pass checkdoc)
 checkdoc:
-	for FILE in ${EL_FILES}; do $(EMACS) --batch -L . -eval "(setq sentence-end-double-space nil)" -eval "(checkdoc-file \"$$FILE\")" ; done
+	for FILE in ${SRC_FILES}; do $(BATCH) -eval "(setq sentence-end-double-space nil)" -eval "(checkdoc-file \"$$FILE\")" ; done
 
+# Byte-compile
 compile: clean
-	$(EMACS) --batch -L . --eval "(progn (require 'package) (add-to-list 'package-archives '(\"melpa\" . \"https://melpa.org/packages/\") t) (package-initialize) (setq sentence-end-double-space nil))" -f batch-byte-compile *.el
+	$(BATCH) -eval "(setq sentence-end-double-space nil)" -f batch-byte-compile ${SRC_FILES}
 
+# Run ERT tests
+test:
+	$(BATCH) -l claude-code-test.el -f ert-run-tests-batch-and-exit
+
+# Type-check Python backend
 mypy:
 	cd python && uv run mypy --strict claude_code_backend.py
 
-all: checkdoc compile mypy
+all: checkdoc compile test mypy

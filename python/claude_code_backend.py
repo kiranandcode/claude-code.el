@@ -490,7 +490,25 @@ async def handle_query(cmd: QueryCommand) -> None:
         emit(StatusEvent(status="cancelled"))
         return
     except Exception as e:
-        emit(ErrorEvent(message=str(e), detail=traceback.format_exc()))
+        # If resume failed, retry without it (stale session ID).
+        if cmd.resume is not None:
+            emit(ErrorEvent(
+                message=f"Resume failed, retrying fresh: {e}",
+            ))
+            cmd.resume = None
+            options = build_options(cmd)
+            try:
+                async for message in query(prompt=cmd.prompt, options=options):
+                    event = convert_message(message)
+                    if event is not None:
+                        emit(event)
+            except asyncio.CancelledError:
+                emit(StatusEvent(status="cancelled"))
+                return
+            except Exception as e2:
+                emit(ErrorEvent(message=str(e2), detail=traceback.format_exc()))
+        else:
+            emit(ErrorEvent(message=str(e), detail=traceback.format_exc()))
 
     emit(StatusEvent(status="ready"))
 
