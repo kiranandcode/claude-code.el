@@ -1,6 +1,15 @@
-# claude-code.el
+<p align="center">
+  <img src="docs/logo.svg" alt="claude-code.el" width="520"/>
+</p>
 
-An Emacs interface for Claude AI using the [Claude Agent SDK](https://pypi.org/project/claude-agent-sdk/).
+<p align="center">
+  An Emacs interface for Claude AI using the
+  <a href="https://pypi.org/project/claude-agent-sdk/">Claude Agent SDK</a>.
+</p>
+
+<p align="center">
+  <img src="docs/screenshot.svg" alt="claude-code.el in action" width="680"/>
+</p>
 
 Features a magit-section conversation buffer with streaming output, collapsible
 thinking/tool blocks, per-project configuration, org-roam context integration,
