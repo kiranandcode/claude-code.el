@@ -790,6 +790,14 @@ input.  Edits to queued slots are saved back before moving on."
       (call-interactively #'self-insert-command)
     (call-interactively #'scroll-up-command)))
 
+(defun claude-code-key-shift-space ()
+  "Self-insert a space in the input area, scroll down in conversation.
+Prevents S-SPC from triggering scroll-down while typing."
+  (interactive)
+  (if (claude-code--input-area-p)
+      (insert " ")
+    (call-interactively #'scroll-down-command)))
+
 ;;;; Keymap
 
 (defvar-keymap claude-code-mode-map
@@ -811,7 +819,8 @@ input.  Edits to queued slots are saved back before moving on."
   "?"   #'claude-code-key-menu
   "q"   #'claude-code-key-quit
   "G"   #'claude-code-key-render
-  "SPC" #'claude-code-key-space
+  "SPC"   #'claude-code-key-space
+  "S-SPC" #'claude-code-key-shift-space
   "RET" #'claude-code-return
   "C-j" #'newline
   "DEL" #'claude-code-key-delete-backward
