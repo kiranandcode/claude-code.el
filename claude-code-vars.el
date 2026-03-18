@@ -201,9 +201,21 @@ Example:
 
 ;;;; Internal State
 
-(defvar claude-code--package-dir
-  (file-name-directory (or load-file-name buffer-file-name default-directory))
-  "Directory containing the claude-code package.")
+(defvar claude-code--package-dir nil
+  "Directory containing the claude-code package source files.")
+;; Always recompute with a bare setq — defvar is a no-op when the variable is
+;; already bound, so it would never update after a first load.  Using setq
+;; here ensures every claude-code-reload recomputes the correct directory.
+;; We resolve through the claude-code.el symlink that straight.el creates back
+;; to the real source tree, so reload always finds every subfile even when
+;; straight has only copied a subset of files into its build cache.
+(setq claude-code--package-dir
+      (let* ((dir (file-name-directory
+                   (or load-file-name buffer-file-name default-directory)))
+             (main (expand-file-name "claude-code.el" dir)))
+        (if (file-symlink-p main)
+            (file-name-directory (file-truename main))
+          dir)))
 
 (defvar claude-code--buffers (make-hash-table :test 'equal)
   "Map of directory -> buffer for active sessions.")

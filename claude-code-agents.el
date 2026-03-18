@@ -173,6 +173,11 @@ Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
                   (claude-code--agents-render-root root-id)))))
           (goto-char (min old-point (point-max))))))))
 
+(defun claude-code--agents-fold-indicator (section)
+  "Return a fold indicator string for SECTION.
+Shows ▾ when expanded (or no children), ▸ when collapsed."
+  (if (and section (oref section hidden)) "▸" "▾"))
+
 (defun claude-code--agents-render-root (agent-id)
   "Render a root session agent AGENT-ID and its children."
   (when-let ((agent (gethash agent-id claude-code--agents)))
@@ -182,23 +187,31 @@ Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
            (buf (plist-get agent :buffer))
            (buf-name (when (and buf (buffer-live-p buf)) (buffer-name buf)))
            (icon (claude-code--agents-status-icon status))
-           (sface (claude-code--agents-status-face status)))
-      (magit-insert-section (claude-agent agent-id nil)
+           (sface (claude-code--agents-status-face status))
+           (has-children (not (null children))))
+      (magit-insert-section section (claude-agent agent-id nil)
         (magit-insert-heading
-          (concat (propertize icon 'face sface)
-                  " "
-                  (propertize (abbreviate-file-name agent-id)
-                              'face 'claude-code-agent-session)
-                  "  "
-                  (propertize (format "[%s]" status) 'face sface)))
+          (propertize
+           (concat (propertize
+                    (if has-children
+                        (concat (claude-code--agents-fold-indicator section) " ")
+                      "  ")
+                    'face 'shadow)
+                   (propertize icon 'face sface)
+                   " "
+                   (propertize (abbreviate-file-name agent-id)
+                               'face 'claude-code-agent-session)
+                   "  "
+                   (propertize (format "[%s]" status) 'face sface))
+           'mouse-face 'highlight))
         (when desc
           (insert (propertize
-                   (format "  %s\n"
+                   (format "   %s\n"
                            (truncate-string-to-width desc 36))
                    'face 'shadow)))
         (when buf-name
           (insert (propertize
-                   (format "  ⎘ %s\n"
+                   (format "   ⎘ %s\n"
                            (truncate-string-to-width buf-name 36))
                    'face 'shadow)))
         (when children
@@ -223,23 +236,25 @@ IS-LAST is non-nil if this is the last sibling."
            (cont   (if is-last " " "│")))
       (magit-insert-section (claude-agent agent-id t)
         (magit-insert-heading
-          (concat (propertize (format "  %s " branch) 'face 'shadow)
-                  (propertize icon 'face sface)
-                  " "
-                  (propertize (or desc "task")
-                              'face 'claude-code-agent-task)
-                  "  "
-                  (propertize (format "[%s]" status) 'face sface)))
+          (propertize
+           (concat (propertize (format "  %s─ " branch) 'face 'shadow)
+                   (propertize icon 'face sface)
+                   " "
+                   (propertize (or desc "task")
+                               'face 'claude-code-agent-task)
+                   "  "
+                   (propertize (format "[%s]" status) 'face sface))
+           'mouse-face 'highlight))
         (when buf-name
-          (insert (propertize (format "  %s   ⎘ %s\n" cont
+          (insert (propertize (format "  %s    ⎘ %s\n" cont
                                       (truncate-string-to-width buf-name 30))
                               'face 'shadow)))
         (when-let ((tool (plist-get agent :last-tool)))
-          (insert (propertize (format "  %s   ⚙ %s\n" cont tool)
+          (insert (propertize (format "  %s    ⚙ %s\n" cont tool)
                               'face 'shadow)))
         (when-let ((summary (plist-get agent :summary)))
           (insert (propertize
-                   (format "  %s   %s\n" cont
+                   (format "  %s    %s\n" cont
                            (truncate-string-to-width summary 32))
                    'face 'shadow)))))))
 
@@ -251,10 +266,13 @@ IS-LAST is non-nil if this is the last sibling."
 ;; re-applied when the file is reloaded, mutating the existing map object
 ;; in-place rather than creating a fresh one.  This ensures any live buffer
 ;; that holds a reference to the same keymap picks up the changes immediately.
-(keymap-set claude-code-agents-mode-map "RET" #'claude-code-agents-goto)
-(keymap-set claude-code-agents-mode-map "k"   #'claude-code-agents-kill-at-point)
-(keymap-set claude-code-agents-mode-map "q"   #'claude-code-agents-quit)
-(keymap-set claude-code-agents-mode-map "g"   #'claude-code-agents-refresh)
+(keymap-set claude-code-agents-mode-map "RET"            #'claude-code-agents-goto)
+(keymap-set claude-code-agents-mode-map "k"              #'claude-code-agents-kill-at-point)
+(keymap-set claude-code-agents-mode-map "q"              #'claude-code-agents-quit)
+(keymap-set claude-code-agents-mode-map "g"              #'claude-code-agents-refresh)
+(keymap-set claude-code-agents-mode-map "<tab>"          #'claude-code-agents-toggle-or-goto)
+(keymap-set claude-code-agents-mode-map "<mouse-1>"      #'claude-code-agents-goto-mouse)
+(keymap-set claude-code-agents-mode-map "<double-mouse-1>" #'claude-code-agents-goto-mouse)
 
 (define-derived-mode claude-code-agents-mode magit-section-mode "Agents"
   "Major mode for the Claude agent sidebar.
@@ -263,6 +281,7 @@ IS-LAST is non-nil if this is the last sibling."
   (setq-local truncate-lines t)
   (setq-local buffer-read-only t)
   (setq-local cursor-type 'bar)
+  (hl-line-mode 1)
   (add-hook 'claude-code-agents-update-hook
             #'claude-code--agents-schedule-render))
 
@@ -303,6 +322,22 @@ falls back to the parent session buffer."
   "Force re-render the agent sidebar."
   (interactive)
   (claude-code--agents-do-render))
+
+(defun claude-code-agents-goto-mouse (event)
+  "Navigate to the agent at the mouse click position."
+  (interactive "e")
+  (mouse-set-point event)
+  (claude-code-agents-goto))
+
+(defun claude-code-agents-toggle-or-goto ()
+  "On a session (root) node collapse/expand it; on a task navigate to it."
+  (interactive)
+  (when-let ((section (magit-current-section)))
+    (if (and (oref section value)
+             (when-let ((agent (gethash (oref section value) claude-code--agents)))
+               (claude-code--agent-root-p agent)))
+        (magit-section-toggle section)
+      (claude-code-agents-goto))))
 
 (defun claude-code-agents-kill-at-point ()
   "Kill the agent at point after confirmation.
