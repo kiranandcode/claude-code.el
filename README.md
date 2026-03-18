@@ -118,6 +118,7 @@ conversation).  Inside the input area, all keys type normally.
 | `s` | `claude-code-focus-input` | Jump to input area |
 | `RET` | `claude-code-return` | Submit prompt (in input area) or toggle section |
 | `C-j` | `newline` | Insert newline in input area |
+| `SPC` | — | Scroll up in conversation (or self-insert in input area) |
 | `DEL` | `claude-code-key-delete-backward` | Delete backward (input area) or scroll down |
 | `r` | `claude-code-send-region` | Send region with a prompt |
 | `c` | `claude-code-cancel` | Cancel running query |
@@ -131,12 +132,14 @@ conversation).  Inside the input area, all keys type normally.
 | `o` | `claude-code-open-dir-todos` | Open/create project TODO list (org-roam) |
 | `M-p` | `claude-code-previous-input` | Recall previous input (older) |
 | `M-n` | `claude-code-next-input` | Recall next input (more recent) |
-| `TAB` | (magit-section) | Toggle section at point |
+| `TAB` | — | Slash-command completion (input area) or toggle section |
 | `?` | `claude-code-menu` | Transient command menu |
 | `q` | `quit-window` | Bury buffer |
 | `G` | `claude-code--render` | Force re-render |
 
-`t` (toggle thinking) and `T` (toggle tool details) are available via the `?` transient menu, not as direct buffer shortcuts.
+`t` (toggle thinking), `T` (toggle tool details), `W` (reset), `N` (new
+session), and `f` (send file context) are available via the `?` transient menu,
+not as direct buffer shortcuts.
 
 ### From Any Buffer
 
@@ -154,6 +157,8 @@ Type `/` in the input area to trigger slash commands with auto-complete (via
 | Command | Action |
 |---------|--------|
 | `/clear` | Clear the conversation history |
+| `/reset` | Hard-reset: clear all messages and restart the backend |
+| `/new` | Open a new independent session for this directory |
 | `/model` | Set the model for this session |
 | `/effort` | Set the thinking effort level |
 | `/notes` | Open the global notes file |
@@ -173,6 +178,35 @@ prompts in the current session (like shell history):
 Cycling past the newest entry restores whatever you had typed before you
 started navigating.  If the agent is working, navigating history also updates
 the queued message.
+
+### Conversation Management
+
+#### Reset and New Sessions
+
+The buffer header displays two clickable action buttons:
+
+```
+  [Reset]  [New Session]
+```
+
+- **`[Reset]`** — hard-resets the current conversation: clears all messages
+  *and* restarts the backend process, giving you a blank slate.  Prompts for
+  confirmation.  Also available as `W` in the `?` menu or the `/reset` slash
+  command.
+- **`[New Session]`** — opens a new, independent Claude buffer for the same
+  directory without touching the current conversation.  Also available as `N` in
+  the `?` menu or the `/new` slash command.  The new session appears in the
+  Agent sidebar alongside the original.
+
+#### Forking a Conversation
+
+Each `▶ You` message heading has a `[fork]` button.  Clicking it (or pressing
+`RET` on it) opens a new buffer pre-loaded with the conversation history *up to
+and including* that message, then starts a fresh backend process.  This lets you
+explore an alternative line of reasoning without losing the original thread.
+
+You can also fork via `M-x claude-code-fork` when point is on a `▶ You`
+heading.  Forked sessions appear in the Agent sidebar labelled `(fork)`.
 
 ### Message Queuing
 
@@ -393,7 +427,8 @@ state — look for `process: nil` or `status: stopped`.
 Claude Code  [working]  ~/projects/myapp
   default model  bypassPermissions
 ──────────────────────────────────────────────────────────────────────────
-▶ You
+  [Reset]  [New Session]
+▶ You  [fork]
   Explain the auth module
 
 ◀ Assistant
@@ -412,6 +447,8 @@ Claude Code  [working]  ~/projects/myapp
 > your prompt here
 ```
 
+- **Header buttons** — `[Reset]` and `[New Session]` are clickable; click or press `RET` to activate
+- **`[fork]` button** — appears on every `▶ You` heading; forks the conversation at that message
 - **Thinking blocks** — collapsed by default, toggle with `TAB`
 - **Tool-use blocks** — collapsed, heading shows tool name + summary (file path, grep pattern, etc.)
 - **Streaming** — text appears token-by-token; thinking spinner animates via overlay

@@ -965,5 +965,242 @@
       (should (equal "query" (alist-get 'type claude-code--last-query-cmd)))
       (should (equal "test-session" (alist-get 'resume claude-code--last-query-cmd))))))
 
+;; ---------------------------------------------------------------------------
+;; Header action buttons (Reset, New Session)
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-header-has-reset-button ()
+  "The buffer header should contain a clickable [Reset] button."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "\\[Reset\\]" text)))))
+
+(ert-deftest claude-code-test-header-has-new-session-button ()
+  "The buffer header should contain a clickable [New Session] button."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "\\[New Session\\]" text)))))
+
+(ert-deftest claude-code-test-header-buttons-are-buttons ()
+  "The [Reset] and [New Session] header items should have button text properties."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    ;; Find [Reset] and verify it is a button
+    (goto-char (point-min))
+    (let ((found-reset nil)
+          (found-new nil))
+      (while (not (eobp))
+        (when (button-at (point))
+          (let ((label (buffer-substring-no-properties
+                        (button-start (button-at (point)))
+                        (button-end (button-at (point))))))
+            (when (string= label "[Reset]")      (setq found-reset t))
+            (when (string= label "[New Session]") (setq found-new t))))
+        (forward-char 1))
+      (should found-reset)
+      (should found-new))))
+
+(ert-deftest claude-code-test-reset-button-calls-reset ()
+  "Activating the [Reset] button should invoke `claude-code-reset'."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (let ((reset-called nil))
+      (cl-letf (((symbol-function 'claude-code-reset)
+                 (lambda () (setq reset-called t))))
+        ;; Find and activate the Reset button
+        (goto-char (point-min))
+        (let ((btn nil))
+          (while (and (not btn) (not (eobp)))
+            (when-let ((b (button-at (point))))
+              (when (string= (buffer-substring-no-properties
+                              (button-start b) (button-end b))
+                             "[Reset]")
+                (setq btn b)))
+            (forward-char 1))
+          (should btn)
+          (button-activate btn)))
+      (should reset-called))))
+
+(ert-deftest claude-code-test-new-session-button-calls-new-session ()
+  "Activating the [New Session] button should invoke `claude-code-new-session'."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (let ((new-called nil))
+      (cl-letf (((symbol-function 'claude-code-new-session)
+                 (lambda () (setq new-called t))))
+        (goto-char (point-min))
+        (let ((btn nil))
+          (while (and (not btn) (not (eobp)))
+            (when-let ((b (button-at (point))))
+              (when (string= (buffer-substring-no-properties
+                              (button-start b) (button-end b))
+                             "[New Session]")
+                (setq btn b)))
+            (forward-char 1))
+          (should btn)
+          (button-activate btn)))
+      (should new-called))))
+
+;; ---------------------------------------------------------------------------
+;; Fork button on user messages
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-user-msg-has-fork-button ()
+  "Each user message heading should contain a [fork] button."
+  (claude-code-test-with-buffer
+    (push '((type . "user") (prompt . "hello there")) claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "\\[fork\\]" text)))))
+
+(ert-deftest claude-code-test-fork-button-is-button ()
+  "The [fork] label next to a user message should be a real button."
+  (claude-code-test-with-buffer
+    (push '((type . "user") (prompt . "hello there")) claude-code--messages)
+    (claude-code--render)
+    (goto-char (point-min))
+    (let ((found nil))
+      (while (not (eobp))
+        (when-let ((b (button-at (point))))
+          (when (string= (buffer-substring-no-properties
+                          (button-start b) (button-end b))
+                         "[fork]")
+            (setq found t)))
+        (forward-char 1))
+      (should found))))
+
+(ert-deftest claude-code-test-fork-button-calls-fork-at-msg ()
+  "Activating a [fork] button should invoke `claude-code--fork-at-msg'
+with the correct message alist."
+  (claude-code-test-with-buffer
+    (let ((msg '((type . "user") (prompt . "hello there"))))
+      (push msg claude-code--messages)
+      (claude-code--render)
+      (let ((forked-msg nil))
+        (cl-letf (((symbol-function 'claude-code--fork-at-msg)
+                   (lambda (m) (setq forked-msg m))))
+          (goto-char (point-min))
+          (let ((btn nil))
+            (while (and (not btn) (not (eobp)))
+              (when-let ((b (button-at (point))))
+                (when (string= (buffer-substring-no-properties
+                                (button-start b) (button-end b))
+                               "[fork]")
+                  (setq btn b)))
+              (forward-char 1))
+            (should btn)
+            (button-activate btn)))
+        (should forked-msg)
+        (should (equal "hello there" (alist-get 'prompt forked-msg)))))))
+
+(ert-deftest claude-code-test-multiple-user-msgs-have-fork-buttons ()
+  "Every user message should get its own [fork] button."
+  (claude-code-test-with-buffer
+    (push '((type . "user") (prompt . "first message")) claude-code--messages)
+    (push '((type . "assistant")
+            (content . [((type . "text") (text . "reply"))]))
+          claude-code--messages)
+    (push '((type . "user") (prompt . "second message")) claude-code--messages)
+    (claude-code--render)
+    (let ((count 0))
+      (goto-char (point-min))
+      (while (not (eobp))
+        (when-let ((b (button-at (point))))
+          (when (string= (buffer-substring-no-properties
+                          (button-start b) (button-end b))
+                         "[fork]")
+            (cl-incf count))
+          (goto-char (button-end b)))
+        (forward-char 1))
+      ;; Two user messages → two fork buttons
+      (should (= 2 count)))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code--fork-at-msg
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-fork-at-msg-creates-new-buffer ()
+  "`claude-code--fork-at-msg' should create a new buffer with forked history."
+  (claude-code-test-with-buffer
+    (claude-code-test-with-clean-agents
+      (let* ((msg1 '((type . "user") (prompt . "first")))
+             (msg2 '((type . "user") (prompt . "second"))))
+        ;; Push oldest first so newest-first order is msg2, msg1
+        (setq claude-code--messages (list msg2 msg1))
+        (let ((created-buf nil))
+          (cl-letf (((symbol-function 'claude-code--start-process) #'ignore)
+                    ((symbol-function 'claude-code--schedule-render) #'ignore)
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (buf) (setq created-buf buf)))
+                    ((symbol-function 'message) #'ignore))
+            ;; Fork at msg1 (the older message)
+            (claude-code--fork-at-msg msg1))
+          (should created-buf)
+          (unwind-protect
+              (with-current-buffer created-buf
+                ;; Forked buffer should have only msg1 in history
+                (should (= 1 (length claude-code--messages)))
+                (should (eq msg1 (car claude-code--messages)))
+                ;; Should have no session-id (fresh backend)
+                (should (null claude-code--session-id)))
+            (when (buffer-live-p created-buf)
+              (kill-buffer created-buf))))))))
+
+(ert-deftest claude-code-test-fork-at-msg-includes-older-messages ()
+  "`claude-code--fork-at-msg' should include the target message and all older ones."
+  (claude-code-test-with-buffer
+    (claude-code-test-with-clean-agents
+      (let* ((old-msg '((type . "user") (prompt . "oldest")))
+             (mid-msg '((type . "user") (prompt . "middle")))
+             (new-msg '((type . "user") (prompt . "newest"))))
+        ;; newest-first
+        (setq claude-code--messages (list new-msg mid-msg old-msg))
+        (let ((created-buf nil))
+          (cl-letf (((symbol-function 'claude-code--start-process) #'ignore)
+                    ((symbol-function 'claude-code--schedule-render) #'ignore)
+                    ((symbol-function 'pop-to-buffer)
+                     (lambda (buf) (setq created-buf buf)))
+                    ((symbol-function 'message) #'ignore))
+            ;; Fork at mid-msg: should get mid-msg + old-msg (newest-first)
+            (claude-code--fork-at-msg mid-msg))
+          (unwind-protect
+              (with-current-buffer created-buf
+                (should (= 2 (length claude-code--messages)))
+                (should (eq mid-msg (nth 0 claude-code--messages)))
+                (should (eq old-msg (nth 1 claude-code--messages))))
+            (when (buffer-live-p created-buf)
+              (kill-buffer created-buf))))))))
+
+;; ---------------------------------------------------------------------------
+;; N / f / W keys should no longer be bound to session commands
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-N-key-not-bound-to-new-session ()
+  "N should no longer jump to new-session; it should self-insert in input area."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    ;; In the input area N should self-insert (not run new-session)
+    (goto-char (marker-position claude-code--input-marker))
+    (let ((last-command-event ?N))
+      (call-interactively (key-binding "N")))
+    (should (string-match-p "N"
+                            (buffer-substring-no-properties
+                             (marker-position claude-code--input-marker)
+                             (point-max))))))
+
+(ert-deftest claude-code-test-W-key-not-bound-to-reset ()
+  "W should no longer jump to reset; it should self-insert in input area."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (goto-char (marker-position claude-code--input-marker))
+    (let ((last-command-event ?W))
+      (call-interactively (key-binding "W")))
+    (should (string-match-p "W"
+                            (buffer-substring-no-properties
+                             (marker-position claude-code--input-marker)
+                             (point-max))))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

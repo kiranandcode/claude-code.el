@@ -213,6 +213,11 @@ Example:
   "Input prompt at the bottom of the Claude buffer."
   :group 'claude-code)
 
+(defface claude-code-action-button
+  '((t :inherit button))
+  "Clickable action buttons (Reset, New Session, Fork) in the Claude buffer."
+  :group 'claude-code)
+
 ;;;; Internal State
 
 (defvar claude-code--package-dir
@@ -956,6 +961,20 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
                'face 'shadow))
       (insert "\n"))
     (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
+    (insert "\n")
+    ;; Action buttons: Reset and New Session
+    (insert "  ")
+    (insert-button "[Reset]"
+                   'action (lambda (_btn) (claude-code-reset))
+                   'help-echo "Hard-reset: clear all messages and restart the backend"
+                   'face 'claude-code-action-button
+                   'follow-link t)
+    (insert "  ")
+    (insert-button "[New Session]"
+                   'action (lambda (_btn) (claude-code-new-session))
+                   'help-echo "Open a new independent session for this directory"
+                   'face 'claude-code-action-button
+                   'follow-link t)
     (insert "\n")))
 
 (defun claude-code--render-message (msg)
@@ -974,6 +993,23 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
   (magit-insert-section (claude-user msg)
     (magit-insert-heading
       (propertize "▶ You" 'face 'claude-code-user-prompt))
+    ;; Append a fork button to the heading line (before its trailing newline).
+    ;; After magit-insert-heading, point is at the start of the section body
+    ;; one line below the heading, so we use save-excursion to reach the
+    ;; heading's end-of-line and splice the button in there.
+    (save-excursion
+      (forward-line -1)
+      (end-of-line)
+      (insert "  ")
+      (let ((btn-start (point)))
+        (insert "[fork]")
+        (make-text-button btn-start (point)
+                          'action (let ((m msg))
+                                    (lambda (_btn)
+                                      (claude-code--fork-at-msg m)))
+                          'help-echo "Fork conversation at this message"
+                          'face 'claude-code-action-button
+                          'follow-link t)))
     (insert "  " (alist-get 'prompt msg) "\n\n")))
 
 (defun claude-code--render-assistant-msg (msg)
@@ -1693,6 +1729,40 @@ Point must be on a ▶ You message heading (not in the input area)."
                (truncate-string-to-width
                 (alist-get 'prompt target-msg) 60)))))
 
+(defun claude-code--fork-at-msg (msg)
+  "Fork the conversation at MSG without requiring point on a section.
+This is the action used by the [fork] button rendered next to each user
+message; it shares the same branching logic as `claude-code-fork' but
+accepts the target message alist directly."
+  (let* ((pos          (cl-position msg claude-code--messages :test #'eq))
+         ;; claude-code--messages is newest-first; nthcdr gives target + older.
+         (forked-msgs  (copy-sequence (nthcdr pos claude-code--messages)))
+         (cwd          (or claude-code--cwd default-directory))
+         (base-name    (claude-code--buffer-name cwd))
+         (buf-name     (generate-new-buffer-name base-name))
+         (agent-key    (format "%s::%s" cwd (format-time-string "%s%N")))
+         (buf          (get-buffer-create buf-name)))
+    (with-current-buffer buf
+      (claude-code-mode)
+      (setq claude-code--cwd        cwd
+            claude-code--session-id nil
+            claude-code--session-key agent-key
+            claude-code--messages   forked-msgs)
+      (claude-code--agent-register
+       agent-key
+       :type 'session
+       :description (format "%s (fork)" (abbreviate-file-name cwd))
+       :status 'starting
+       :buffer buf
+       :cwd cwd
+       :children nil)
+      (claude-code--start-process)
+      (claude-code--schedule-render))
+    (pop-to-buffer buf)
+    (message "Forked at: %s"
+             (truncate-string-to-width
+              (alist-get 'prompt msg) 60))))
+
 (defun claude-code-open-notes ()
   "Open the notes org file."
   (interactive)
@@ -2071,12 +2141,10 @@ unsaved text when cycling past the most recent entry."
    ("c" "Cancel" claude-code-cancel)
    ("C" "Clear conversation" claude-code-clear)
    ("W" "Reset (clear + restart)" claude-code-reset)
+   ("N" "New session (same dir)" claude-code-new-session)
    ("k" "Kill session" claude-code-kill)
    ("R" "Restart backend" claude-code-restart)
    ("S" "Sync Python env" claude-code-sync)]
-  ["Branch"
-   ("N" "New session (same dir)" claude-code-new-session)
-   ("f" "Fork at message at point" claude-code-fork)]
   ["Session"
    ("m" "Set model" claude-code-set-model)
    ("e" "Set effort" claude-code-set-effort)
@@ -2105,9 +2173,6 @@ unsaved text when cycling past the most recent entry."
   "C"   #'claude-code-key-clear
   "k"   #'claude-code-key-kill
   "R"   #'claude-code-key-restart
-  "N"   #'claude-code-key-new-session
-  "f"   #'claude-code-key-fork
-  "W"   #'claude-code-key-reset
   "n"   #'claude-code-key-open-notes
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
@@ -2147,25 +2212,6 @@ Outside the input area, toggle the magit section at point."
     (insert "\t"))
    (t
     (call-interactively #'magit-section-toggle))))
-
-(defun claude-code-key-new-session ()
-  "Open a new independent Claude session for the current directory."
-  (interactive)
-  (call-interactively #'claude-code-new-session))
-
-(defun claude-code-key-fork ()
-  "Fork conversation at the user message at point; self-insert in input area."
-  (interactive)
-  (if (claude-code--input-area-p)
-      (claude-code--self-insert-or-undefined)
-    (call-interactively #'claude-code-fork)))
-
-(defun claude-code-key-reset ()
-  "Hard-reset conversation (clear + restart); self-insert in input area."
-  (interactive)
-  (if (claude-code--input-area-p)
-      (claude-code--self-insert-or-undefined)
-    (call-interactively #'claude-code-reset)))
 
 ;; Override `suppress-keymap' from `special-mode': bind all printable
 ;; ASCII characters so they self-insert in the input area.  We skip
