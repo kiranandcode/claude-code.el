@@ -279,6 +279,23 @@ Useful for debugging — inspect with:
   "Buffer-local config overrides set via the transient menu.
 Merged on top of project config + defaults.")
 
+(defcustom claude-code-inline-image-max-width 480
+  "Maximum pixel width for images displayed inline in the conversation.
+Applies to both pending-image chips in the input area and images in
+past conversation turns.  Set to nil to disable inline display entirely
+even in GUI Emacs (images will show as text chips instead)."
+  :type '(choice integer (const nil))
+  :group 'claude-code)
+
+(defvar-local claude-code--pending-images nil
+  "List of images queued for the next prompt.
+Each element is a plist with keys:
+  :data       - base64-encoded string (used when building JSON for the backend)
+  :raw-data   - unibyte string of raw image bytes (used for inline display)
+  :media-type - MIME type string e.g. \"image/png\"
+  :name       - display name string e.g. \"screenshot.png\"
+Cleared after each send.")
+
 (defvar-local claude-code--session-key nil
   "Key used to register this session in `claude-code--agents'.
 For primary sessions this equals `claude-code--cwd'; for secondary or

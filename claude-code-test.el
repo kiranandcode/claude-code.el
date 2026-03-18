@@ -2356,5 +2356,310 @@ register both in the agents registry, run BODY, then clean up both buffers."
         (should (string-match-p "perms:" text))
         (should (string-match-p "Save as Project Default" text))))))
 
+;; ---------------------------------------------------------------------------
+;; Image attachment — helpers
+;; ---------------------------------------------------------------------------
+
+;; Minimal 1×1 red PNG as base64.  Decoded at use-time to avoid multibyte issues.
+(defconst claude-code-test--tiny-png-b64
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADklEQVQI12P4z8BQDwAEgAF/QualIQAAAABJRU5ErkJggg=="
+  "Base64-encoded minimal 1×1 PNG for testing.")
+
+(defun claude-code-test--tiny-png ()
+  "Return raw unibyte bytes of a minimal 1×1 PNG."
+  (base64-decode-string claude-code-test--tiny-png-b64))
+
+(defmacro claude-code-test-with-png-file (&rest body)
+  "Create a temp PNG file, run BODY with `tmp-png' bound to its path, then delete."
+  (declare (indent 0))
+  `(let ((tmp-png (make-temp-file "claude-test-img" nil ".png")))
+     (unwind-protect
+         (progn
+           (with-temp-file tmp-png
+             (set-buffer-multibyte nil)
+             (insert (claude-code-test--tiny-png)))
+           ,@body)
+       (ignore-errors (delete-file tmp-png)))))
+
+;; ---------------------------------------------------------------------------
+;; Image media-type detection
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-image-media-type-jpeg ()
+  "`claude-code--image-media-type' maps .jpg/.jpeg to image/jpeg."
+  (should (equal "image/jpeg" (claude-code--image-media-type "photo.jpg")))
+  (should (equal "image/jpeg" (claude-code--image-media-type "photo.jpeg")))
+  (should (equal "image/jpeg" (claude-code--image-media-type "PHOTO.JPG"))))
+
+(ert-deftest claude-code-test-image-media-type-other ()
+  "`claude-code--image-media-type' handles png/gif/webp and falls back to png."
+  (should (equal "image/png"  (claude-code--image-media-type "shot.png")))
+  (should (equal "image/gif"  (claude-code--image-media-type "anim.gif")))
+  (should (equal "image/webp" (claude-code--image-media-type "img.webp")))
+  (should (equal "image/png"  (claude-code--image-media-type "unknown.bmp")))
+  (should (equal "image/png"  (claude-code--image-media-type "no-extension"))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-attach-image — file path
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-attach-image-from-file-adds-to-pending ()
+  "`claude-code-attach-image' with a file pushes a plist to pending-images."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (should (= 1 (length claude-code--pending-images)))))))
+
+(ert-deftest claude-code-test-attach-image-stores-raw-data ()
+  "Pending image plist contains :raw-data unibyte string."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (let ((img (car claude-code--pending-images)))
+          (should (stringp (plist-get img :raw-data)))
+          (should (not (multibyte-string-p (plist-get img :raw-data)))))))))
+
+(ert-deftest claude-code-test-attach-image-stores-base64 ()
+  "Pending image plist contains :data as valid base64."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (let* ((img  (car claude-code--pending-images))
+               (b64  (plist-get img :data))
+               (decoded (base64-decode-string b64)))
+          (should (stringp b64))
+          ;; decoded bytes should equal what's on disk
+          (should (equal decoded
+                         (with-temp-buffer
+                           (set-buffer-multibyte nil)
+                           (insert-file-contents-literally tmp-png)
+                           (buffer-string)))))))))
+
+(ert-deftest claude-code-test-attach-image-base64-matches-raw ()
+  "base64-decode(:data) == :raw-data — both representations are consistent."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (let ((img (car claude-code--pending-images)))
+          (should (equal (plist-get img :raw-data)
+                         (base64-decode-string (plist-get img :data)))))))))
+
+(ert-deftest claude-code-test-attach-image-sets-media-type ()
+  "Pending image plist has correct :media-type for .png file."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (should (equal "image/png"
+                       (plist-get (car claude-code--pending-images) :media-type)))))))
+
+(ert-deftest claude-code-test-attach-image-sets-name ()
+  "Pending image plist :name equals the file's base name."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (should (equal (file-name-nondirectory tmp-png)
+                       (plist-get (car claude-code--pending-images) :name)))))))
+
+(ert-deftest claude-code-test-attach-image-multiple ()
+  "Attaching multiple images accumulates them in pending-images."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+      (claude-code-test-with-png-file
+        (claude-code-attach-image tmp-png)
+        (claude-code-attach-image tmp-png)
+        (should (= 2 (length claude-code--pending-images)))))))
+
+(ert-deftest claude-code-test-attach-image-errors-on-missing-file ()
+  "`claude-code-attach-image' signals error for unreadable file."
+  (claude-code-test-with-buffer
+    (should-error
+     (claude-code-attach-image "/nonexistent/path/image.png")
+     :type 'user-error)))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-send — image integration
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-send-includes-images-in-json ()
+  "`claude-code-send' serialises :data/:media-type/:name into the JSON cmd."
+  (claude-code-test-with-buffer
+    (let ((sent-cmds nil))
+      (cl-letf (((symbol-function 'claude-code--send-json)
+                 (lambda (cmd) (push cmd sent-cmds)))
+                ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+                ((symbol-function 'claude-code--schedule-render) #'ignore)
+                ((symbol-function 'claude-code--agent-update) #'ignore))
+        (setq claude-code--pending-images
+              (list (list :raw-data "bytes" :data "abc123"
+                          :media-type "image/png" :name "test.png")))
+        (claude-code-send "describe this image")
+        (let* ((img-vec (alist-get 'images (car sent-cmds)))
+               (img0    (aref img-vec 0)))
+          (should img-vec)
+          (should (= 1 (length img-vec)))
+          (should (equal "abc123"    (alist-get 'data img0)))
+          (should (equal "image/png" (alist-get 'media_type img0)))
+          (should (equal "test.png"  (alist-get 'name img0))))))))
+
+(ert-deftest claude-code-test-send-omits-raw-data-from-json ()
+  "`claude-code-send' must NOT include :raw-data in the JSON (binary data)."
+  (claude-code-test-with-buffer
+    (let ((sent-cmds nil))
+      (cl-letf (((symbol-function 'claude-code--send-json)
+                 (lambda (cmd) (push cmd sent-cmds)))
+                ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+                ((symbol-function 'claude-code--schedule-render) #'ignore)
+                ((symbol-function 'claude-code--agent-update) #'ignore))
+        (setq claude-code--pending-images
+              (list (list :raw-data "bytes" :data "abc123"
+                          :media-type "image/png" :name "test.png")))
+        (claude-code-send "with image")
+        (let* ((img-vec (alist-get 'images (car sent-cmds)))
+               (img0    (aref img-vec 0)))
+          (should (null (alist-get 'raw_data img0))))))))
+
+(ert-deftest claude-code-test-send-clears-pending-images ()
+  "`claude-code-send' clears `claude-code--pending-images' after sending."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--send-json) #'ignore)
+              ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+              ((symbol-function 'claude-code--schedule-render) #'ignore)
+              ((symbol-function 'claude-code--agent-update) #'ignore))
+      (setq claude-code--pending-images
+            (list (list :raw-data "b" :data "x" :media-type "image/png" :name "a.png")))
+      (claude-code-send "go")
+      (should (null claude-code--pending-images)))))
+
+(ert-deftest claude-code-test-send-stores-images-in-message-history ()
+  "`claude-code-send' records images in the pushed message alist."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--send-json) #'ignore)
+              ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+              ((symbol-function 'claude-code--schedule-render) #'ignore)
+              ((symbol-function 'claude-code--agent-update) #'ignore))
+      (let ((img (list :raw-data "b" :data "x" :media-type "image/png" :name "a.png")))
+        (setq claude-code--pending-images (list img))
+        (claude-code-send "describe")
+        (let ((recorded-images (alist-get 'images (car claude-code--messages))))
+          (should recorded-images)
+          (should (equal img (car recorded-images))))))))
+
+(ert-deftest claude-code-test-send-no-images-field-when-none ()
+  "No `images' key in JSON cmd when `claude-code--pending-images' is nil."
+  (claude-code-test-with-buffer
+    (let ((sent-cmds nil))
+      (cl-letf (((symbol-function 'claude-code--send-json)
+                 (lambda (cmd) (push cmd sent-cmds)))
+                ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+                ((symbol-function 'claude-code--schedule-render) #'ignore)
+                ((symbol-function 'claude-code--agent-update) #'ignore))
+        (setq claude-code--pending-images nil)
+        (claude-code-send "hello")
+        (should (null (alist-get 'images (car sent-cmds))))))))
+
+(ert-deftest claude-code-test-send-images-not-stored-in-messages-when-nil ()
+  "No images key in message history when none were attached."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--send-json) #'ignore)
+              ((symbol-function 'claude-code--build-system-prompt) #'ignore)
+              ((symbol-function 'claude-code--schedule-render) #'ignore)
+              ((symbol-function 'claude-code--agent-update) #'ignore))
+      (setq claude-code--pending-images nil)
+      (claude-code-send "plain text")
+      (should (null (alist-get 'images (car claude-code--messages)))))))
+
+;; ---------------------------------------------------------------------------
+;; Image rendering helpers
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-image-type-from-media-type ()
+  "`claude-code--image-type-from-media-type' returns correct Emacs image type."
+  (should (eq 'jpeg (claude-code--image-type-from-media-type "image/jpeg")))
+  (should (eq 'gif  (claude-code--image-type-from-media-type "image/gif")))
+  (should (eq 'webp (claude-code--image-type-from-media-type "image/webp")))
+  (should (eq 'png  (claude-code--image-type-from-media-type "image/png")))
+  (should (eq 'png  (claude-code--image-type-from-media-type "image/unknown"))))
+
+(ert-deftest claude-code-test-insert-image-text-fallback-in-terminal ()
+  "`claude-code--insert-image' inserts text chip when not in GUI frame."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'display-graphic-p) (lambda () nil)))
+      (let ((img (list :raw-data (claude-code-test--tiny-png)
+                       :data     (base64-encode-string (claude-code-test--tiny-png) t)
+                       :media-type "image/png"
+                       :name    "test.png")))
+        (with-temp-buffer
+          (claude-code--insert-image img)
+          (should (string-match-p "📎 test\\.png"
+                                  (buffer-substring-no-properties
+                                   (point-min) (point-max)))))))))
+
+(ert-deftest claude-code-test-insert-image-text-fallback-when-disabled ()
+  "`claude-code--insert-image' uses text chip when max-width is nil."
+  (let ((claude-code-inline-image-max-width nil))
+    (with-temp-buffer
+      (claude-code--insert-image
+       (list :raw-data (claude-code-test--tiny-png)
+             :data (base64-encode-string (claude-code-test--tiny-png) t)
+             :media-type "image/png" :name "shot.png"))
+      (should (string-match-p "📎 shot\\.png"
+                              (buffer-substring-no-properties
+                               (point-min) (point-max)))))))
+
+(ert-deftest claude-code-test-insert-image-gui-shows-display-property ()
+  "`claude-code--insert-image' sets a `display' text property in GUI mode."
+  (skip-unless (and (display-graphic-p) (image-type-available-p 'png)))
+  (with-temp-buffer
+    (claude-code--insert-image
+     (list :raw-data    (claude-code-test--tiny-png)
+           :data        (base64-encode-string (claude-code-test--tiny-png) t)
+           :media-type  "image/png"
+           :name        "test.png"))
+    ;; There should be a display property somewhere in the inserted text.
+    (let ((has-display nil))
+      (let ((pos (point-min)))
+        (while (< pos (point-max))
+          (when (get-text-property pos 'display)
+            (setq has-display t))
+          (setq pos (1+ pos))))
+      (should has-display))))
+
+(ert-deftest claude-code-test-render-user-msg-with-images ()
+  "Rendering a user message with images inserts image content."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--start-thinking) #'ignore)
+              ((symbol-function 'display-graphic-p) (lambda () nil)))
+      ;; Build a message with one image
+      (setq claude-code--messages
+            (list `((type . "user")
+                    (prompt . "look at this")
+                    (images . (,(list :raw-data (claude-code-test--tiny-png)
+                                      :data (base64-encode-string
+                                             (claude-code-test--tiny-png) t)
+                                      :media-type "image/png"
+                                      :name "snap.png"))))))
+      (claude-code--render)
+      (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        ;; Should show both the image chip and the prompt text
+        (should (string-match-p "snap\\.png" text))
+        (should (string-match-p "look at this" text))))))
+
+(ert-deftest claude-code-test-render-user-msg-no-images ()
+  "Rendering a user message without images shows just the prompt."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--start-thinking) #'ignore))
+      (setq claude-code--messages
+            (list '((type . "user") (prompt . "hello"))))
+      (claude-code--render)
+      (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        (should (string-match-p "hello" text))
+        (should (not (string-match-p "📎" text)))))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

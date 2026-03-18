@@ -38,6 +38,15 @@ from claude_agent_sdk import (
 
 
 @dataclass
+class ImageAttachment:
+    """Base64-encoded image attached to a prompt."""
+
+    data: str
+    media_type: str
+    name: str
+
+
+@dataclass
 class QueryCommand:
     """Request to send a prompt to the agent."""
 
@@ -55,6 +64,7 @@ class QueryCommand:
     max_budget_usd: float | None = None
     betas: list[str] | None = None
     resume: str | None = None
+    images: list[ImageAttachment] | None = None
 
 
 @dataclass
@@ -432,6 +442,12 @@ def parse_command(raw: dict[str, Any]) -> Command:
     cmd_type = raw.get("type")
     match cmd_type:
         case "query":
+            raw_images = raw.get("images")
+            images = (
+                [ImageAttachment(**img) for img in raw_images]
+                if raw_images
+                else None
+            )
             return QueryCommand(
                 type="query",
                 prompt=raw["prompt"],
@@ -445,6 +461,7 @@ def parse_command(raw: dict[str, Any]) -> Command:
                 max_budget_usd=raw.get("max_budget_usd"),
                 betas=raw.get("betas"),
                 resume=raw.get("resume"),
+                images=images,
             )
         case "cancel":
             return CancelCommand(type="cancel")
@@ -452,6 +469,39 @@ def parse_command(raw: dict[str, Any]) -> Command:
             return QuitCommand(type="quit")
         case _:
             raise ValueError(f"Unknown command type: {cmd_type}")
+
+
+async def _prompt_with_images(
+    prompt: str, images: list[ImageAttachment]
+) -> Any:
+    """Yield a single user message dict containing image + text content blocks.
+
+    The SDK accepts ``AsyncIterable[dict]`` as an alternative to a plain
+    string prompt.  Each dict must be an Anthropic API-format message.
+    """
+    content: list[dict[str, Any]] = []
+    for img in images:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img.media_type,
+                "data": img.data,
+            },
+        })
+    content.append({"type": "text", "text": prompt})
+    yield {"role": "user", "content": content}
+
+
+def build_prompt(cmd: QueryCommand) -> Any:
+    """Return the prompt value to pass to ``query()``.
+
+    Returns a plain string when there are no image attachments, or an
+    async generator of message dicts when images are present.
+    """
+    if cmd.images:
+        return _prompt_with_images(cmd.prompt, cmd.images)
+    return cmd.prompt
 
 
 def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
@@ -482,7 +532,7 @@ async def handle_query(cmd: QueryCommand) -> None:
     emit(StatusEvent(status="working"))
 
     try:
-        async for message in query(prompt=cmd.prompt, options=options):
+        async for message in query(prompt=build_prompt(cmd), options=options):
             event = convert_message(message)
             if event is not None:
                 emit(event)
@@ -498,7 +548,7 @@ async def handle_query(cmd: QueryCommand) -> None:
             cmd.resume = None
             options = build_options(cmd)
             try:
-                async for message in query(prompt=cmd.prompt, options=options):
+                async for message in query(prompt=build_prompt(cmd), options=options):
                     event = convert_message(message)
                     if event is not None:
                         emit(event)

@@ -59,16 +59,16 @@ this table first to identify which file to read or edit.
 
 | File | Purpose | Depends on |
 |------|---------|-----------|
-| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`), and Emacs-native subagent state vars (`claude-code--subagent-task-id`, `claude-code--subagent-parent-key`, `claude-code--subagent-has-worked`, `claude-code-enable-native-subagents`).  Faces include `claude-code-config-button` (header config value buttons) and `claude-code-action-button` (header action buttons). | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
+| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`), and Emacs-native subagent state vars (`claude-code--subagent-task-id`, `claude-code--subagent-parent-key`, `claude-code--subagent-has-worked`, `claude-code-enable-native-subagents`).  Faces include `claude-code-config-button` (header config value buttons) and `claude-code-action-button` (header action buttons).  Image config: `claude-code-inline-image-max-width`, `claude-code--pending-images`. | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
 | `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister/remove-child functions, parent–child tree helpers, the treemacs-style Agent Sidebar (`claude-code-agents-mode`), and per-task progress buffers (`claude-code-task-mode`).  Killing a subagent removes it from the parent's `:children` list and schedules a re-render of the parent session buffer. | `claude-code-vars`, `magit-section` |
 | `claude-code-process.el` | UV/Python environment setup (`claude-code--ensure-environment`), backend process lifecycle (`claude-code--start-process`, `--stop-process`, `--send-json`), and the process filter/sentinel that parse JSON-lines output | `claude-code-vars` |
 | `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` (always injects the current Emacs buffer name so the agent can self-reference) | `claude-code-vars` |
 | `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, Emacs-native subagent completion notifications (`claude-code--subagent-notify-parent`), and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
-| `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
-| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters (`claude-code-set-model`, `claude-code-set-effort`, `claude-code-set-permission-mode`), project config persistence (`claude-code-save-project-config`), Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`).  `claude-code-reload` skips killing the backend process for sessions with a live process (e.g. the agent calling reload mid-tool-execution), updating only the keymap in-place via `use-local-map`. | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
+| `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), inline image display (`claude-code--insert-image`, `claude-code--image-type-from-media-type`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
+| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters (`claude-code-set-model`, `claude-code-set-effort`, `claude-code-set-permission-mode`), project config persistence (`claude-code-save-project-config`), image attachment (`claude-code-attach-image`, `claude-code--image-media-type`), Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap (`C-c i` for image attach), `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`).  `claude-code-reload` skips killing the backend process for sessions with a live process (e.g. the agent calling reload mid-tool-execution), updating only the keymap in-place via `use-local-map`. | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
 | `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
 | `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
-| `claude-code-test.el` | ERT test suite (156 tests).  Run with `make test`. | `claude-code` |
+| `claude-code-test.el` | ERT test suite (181 tests).  Run with `make test`. | `claude-code` |
 | `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
 
 ### Module dependency graph
@@ -182,6 +182,7 @@ conversation).  Inside the input area, all keys type normally.
 | `o` | `claude-code-open-dir-todos` | Open/create project TODO list (org-roam) |
 | `M-p` | `claude-code-previous-input` | Recall previous input (older) |
 | `M-n` | `claude-code-next-input` | Recall next input (more recent) |
+| `C-c i` | `claude-code-attach-image` | Attach image from clipboard or file |
 | `TAB` | — | Slash-command completion (input area) or toggle section |
 | `?` | `claude-code-menu` | Transient command menu |
 | `q` | `quit-window` | Bury buffer |
@@ -197,6 +198,7 @@ not as direct buffer shortcuts.
 M-x claude-code-quick            ;; prompt in minibuffer, no buffer switch
 M-x claude-code-send-region      ;; send selection with a question
 M-x claude-code-send-buffer-file ;; send file path with a question
+M-x claude-code-attach-image     ;; attach an image to the next prompt
 ```
 
 ### Slash Commands
@@ -228,6 +230,67 @@ prompts in the current session (like shell history):
 Cycling past the newest entry restores whatever you had typed before you
 started navigating.  If the agent is working, navigating history also updates
 the queued message.
+
+### Image Attachment (Vision)
+
+Claude supports vision — you can attach images to any prompt and Claude will
+describe, analyse, or reason about them.
+
+#### Attaching an image
+
+| Method | How |
+|--------|-----|
+| **Clipboard** (default) | Copy or screenshot any image → `C-c i` in the Claude buffer.  Grabs `image/png` from the system clipboard automatically. |
+| **File** | `C-u C-c i` (prefix arg) → file picker.  Supports `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`. |
+| **Transient menu** | `?` → Send → `i` |
+
+Each attached image appears as a chip **above** the `>` prompt:
+
+```
+  📎 screenshot.png  [×]
+> describe what you see
+```
+
+Click `[×]` (or delete the chip region) to remove an attachment before sending.
+Multiple images can be attached; they are all sent with the next prompt and then
+cleared.
+
+#### Inline display (GUI Emacs)
+
+When running in a graphical Emacs frame (`(display-graphic-p)` is non-nil),
+images are rendered **inline** rather than as text chips:
+
+- **Pending chips** (input area): thumbnail scaled to 200 px wide
+- **Conversation history**: full image scaled to `claude-code-inline-image-max-width`
+  pixels wide (default 480)
+
+In a terminal frame the text chip fallback is used instead.  Set
+`claude-code-inline-image-max-width` to `nil` to disable inline display
+everywhere.
+
+```elisp
+;; Wider thumbnails (default 480)
+(setq claude-code-inline-image-max-width 640)
+
+;; Disable inline display entirely (text chips only)
+(setq claude-code-inline-image-max-width nil)
+```
+
+#### Design decisions
+
+- **Both `:raw-data` and `:data` stored**: pending images carry raw unibyte bytes
+  (used by `create-image` for display) *and* a base64 string (used when
+  serialising to JSON for the backend).  Only `:data` is ever sent over the wire.
+- **`gui-get-selection 'CLIPBOARD 'image/png`**: on macOS NS Emacs this returns
+  the raw PNG bytes from the pasteboard directly — no shell-out needed.  On other
+  platforms the same call works for X11/Wayland clipboard images.
+- **AsyncIterable prompt in the backend**: when images are present, the Python
+  backend switches from a plain string prompt to an `AsyncIterable[dict]` that
+  yields a single Anthropic API-format user message with image content blocks
+  followed by the text block.  The SDK transparently handles both forms.
+- **Images stored in message history**: the `images` key is saved in each user
+  message alist so past turns render inline on every re-render (e.g. after
+  `claude-code-reload`).
 
 ### Conversation Management
 
@@ -594,6 +657,7 @@ Claude Code  [working]  ~/projects/myapp
 ──────────────────────────────────────────────────────────────────────────
   [Reset]  [New Session]   (+ [Cancel] while working)
 ▶ You  [fork]
+  [inline image: screenshot.png 480×320]  screenshot.png (480x320)
   Explain the auth module
 
 ◀ Assistant
@@ -609,6 +673,7 @@ Claude Code  [working]  ~/projects/myapp
   ⠹ Thinking...
 
 ──────────────────────────────────────────────────────────────────────────
+  📎 screenshot.png  [×]        ← pending image chip (thumbnail in GUI)
 > your prompt here
 ```
 
@@ -629,7 +694,7 @@ Emacs and the Python backend communicate over stdin/stdout using one JSON object
 
 | Command | Fields | Description |
 |---------|--------|-------------|
-| `query` | `prompt`, `cwd`, `allowed_tools`, `system_prompt`, `max_turns`, `permission_mode`, `model`, `effort`, `max_budget_usd`, `betas`, `resume` | Send a prompt to the agent |
+| `query` | `prompt`, `cwd`, `allowed_tools`, `system_prompt`, `max_turns`, `permission_mode`, `model`, `effort`, `max_budget_usd`, `betas`, `resume`, `images` | Send a prompt to the agent |
 | `cancel` | — | Cancel the running query |
 | `quit` | — | Shut down the backend |
 

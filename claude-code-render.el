@@ -13,6 +13,47 @@
 (require 'claude-code-agents)
 (require 'magit-section)
 
+;;;; Image Rendering Helpers
+
+(defun claude-code--image-type-from-media-type (media-type)
+  "Return the Emacs image type symbol for MEDIA-TYPE string."
+  (pcase media-type
+    ("image/jpeg" 'jpeg)
+    ("image/gif"  'gif)
+    ("image/webp" 'webp)
+    (_            'png)))
+
+(defun claude-code--insert-image (img &optional max-width)
+  "Insert IMG (a pending-image plist) inline if running in a GUI frame.
+MAX-WIDTH caps the display width in pixels (default: `claude-code-inline-image-max-width').
+Falls back to a text chip when not in GUI mode or image display is disabled."
+  (let* ((max-w   (or max-width claude-code-inline-image-max-width))
+         (raw     (plist-get img :raw-data))
+         (name    (plist-get img :name))
+         (mtype   (plist-get img :media-type))
+         (itype   (claude-code--image-type-from-media-type mtype)))
+    (if (and max-w
+             raw
+             (display-graphic-p)
+             (image-type-available-p itype))
+        (condition-case err
+            (let* ((image    (create-image raw itype t :max-width max-w))
+                   (size     (image-size image t))
+                   (display  (propertize " " 'display image
+                                         'help-echo name)))
+              (insert display)
+              (insert (propertize (format " %s (%dx%d)"
+                                          name
+                                          (car size) (cdr size))
+                                  'face 'shadow)))
+          (error
+           (insert (propertize (format "  📎 %s [display error: %s]"
+                                       name (error-message-string err))
+                               'face 'claude-code-result))))
+      ;; Text fallback for terminal / disabled inline display.
+      (insert (propertize (format "  📎 %s" name)
+                          'face 'claude-code-result)))))
+
 ;;;; Buffer Rendering
 
 (defun claude-code--render ()
@@ -61,6 +102,22 @@
       (insert "\n")
       (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
       (insert "\n")
+      ;; Show pending image attachment chips (inline thumbnail in GUI, text in terminal).
+      (when claude-code--pending-images
+        (dolist (img claude-code--pending-images)
+          (insert "  ")
+          (claude-code--insert-image img 200)   ; smaller thumbnail in chip
+          (insert "  ")
+          (insert-button "[×]"
+                         'action (let ((img img))
+                                   (lambda (_btn)
+                                     (setq claude-code--pending-images
+                                           (delete img claude-code--pending-images))
+                                     (claude-code--schedule-render)))
+                         'help-echo "Remove this attachment"
+                         'face 'claude-code-action-button
+                         'follow-link t)
+          (insert "\n")))
       (insert (propertize "> " 'face 'claude-code-input-prompt))
       ;; Advance the marker to the current point (start of user input).
       ;; marker-insertion-type nil means new text inserted at the marker
@@ -199,6 +256,12 @@
                           'help-echo "Fork conversation at this message"
                           'face 'claude-code-action-button
                           'follow-link t)))
+    ;; Render attached images (full-width inline in GUI, text chips in terminal).
+    (when-let ((images (alist-get 'images msg)))
+      (dolist (img images)
+        (insert "  ")
+        (claude-code--insert-image img)
+        (insert "\n")))
     (insert "  " (alist-get 'prompt msg) "\n\n")))
 
 (defun claude-code--render-assistant-msg (msg)

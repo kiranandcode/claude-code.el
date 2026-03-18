@@ -26,20 +26,24 @@
    (list (read-string "Claude> " nil 'claude-code--prompt-history)))
   (when (string-empty-p prompt)
     (user-error "Empty prompt"))
-  (push `((type . "user") (prompt . ,prompt))
-        claude-code--messages)
-  (when claude-code--cwd
-    (claude-code--agent-update
-     claude-code--cwd
-     :description (truncate-string-to-width prompt 60)))
-  (let* ((cwd (or claude-code--cwd default-directory))
-         (cfg (claude-code--session-config))
-         (cmd `((type . "query")
-                (prompt . ,prompt)
-                (cwd . ,cwd)
-                (allowed_tools . ,(vconcat (alist-get 'allowed-tools cfg)))
-                (permission_mode . ,(alist-get 'permission-mode cfg))
-                (max_turns . ,(alist-get 'max-turns cfg)))))
+  (let* ((cwd    (or claude-code--cwd default-directory))
+         (cfg    (claude-code--session-config))
+         ;; Capture and clear pending images atomically before any async work.
+         (images (prog1 claude-code--pending-images
+                   (setq claude-code--pending-images nil)))
+         (cmd    `((type . "query")
+                   (prompt . ,prompt)
+                   (cwd . ,cwd)
+                   (allowed_tools . ,(vconcat (alist-get 'allowed-tools cfg)))
+                   (permission_mode . ,(alist-get 'permission-mode cfg))
+                   (max_turns . ,(alist-get 'max-turns cfg)))))
+    ;; Record in local message history (images stored for inline rendering).
+    (push `((type . "user") (prompt . ,prompt) (images . ,images))
+          claude-code--messages)
+    (when claude-code--cwd
+      (claude-code--agent-update
+       claude-code--cwd
+       :description (truncate-string-to-width prompt 60)))
     (when-let ((v (alist-get 'model cfg)))
       (push `(model . ,v) cmd))
     (when-let ((v (alist-get 'effort cfg)))
@@ -50,12 +54,70 @@
       (push `(betas . ,(vconcat v)) cmd))
     (when-let ((sys-prompt (claude-code--build-system-prompt)))
       (push `(system_prompt . ,sys-prompt) cmd))
+    ;; Attach pending images as base64 content blocks (only :data, not :raw-data).
+    (when images
+      (push `(images . ,(vconcat
+                         (mapcar (lambda (img)
+                                   `((data       . ,(plist-get img :data))
+                                     (media_type . ,(plist-get img :media-type))
+                                     (name       . ,(plist-get img :name))))
+                                 images)))
+            cmd))
     ;; Resume the existing session so Claude retains conversation history.
     (when claude-code--session-id
       (push `(resume . ,claude-code--session-id) cmd))
     (setq claude-code--last-query-cmd cmd)
     (claude-code--send-json cmd))
   (claude-code--schedule-render))
+
+(defun claude-code--image-media-type (filename-or-data)
+  "Guess image media type from FILENAME-OR-DATA (a filename string)."
+  (let ((ext (downcase (or (file-name-extension filename-or-data) ""))))
+    (pcase ext
+      ("jpg"  "image/jpeg")
+      ("jpeg" "image/jpeg")
+      ("png"  "image/png")
+      ("gif"  "image/gif")
+      ("webp" "image/webp")
+      (_      "image/png"))))
+
+(defun claude-code-attach-image (source)
+  "Attach an image to the next prompt.
+With prefix arg (or when clipboard has no image), prompts for a file.
+Otherwise tries the clipboard first.
+
+SOURCE is either a file path string or the symbol `clipboard'."
+  (interactive
+   (list (if (or current-prefix-arg
+                 (null (ignore-errors
+                         (gui-get-selection 'CLIPBOARD 'image/png))))
+             (read-file-name "Attach image: " nil nil t)
+           'clipboard)))
+  (let (raw-data media-type name)
+    (if (eq source 'clipboard)
+        (let ((raw (gui-get-selection 'CLIPBOARD 'image/png)))
+          (unless raw
+            (user-error "No image found on clipboard"))
+          (setq raw-data   raw
+                media-type "image/png"
+                name       "clipboard.png"))
+      ;; File path
+      (unless (file-readable-p source)
+        (user-error "Cannot read file: %s" source))
+      (setq media-type (claude-code--image-media-type source)
+            name       (file-name-nondirectory source)
+            raw-data   (with-temp-buffer
+                         (set-buffer-multibyte nil)
+                         (insert-file-contents-literally source)
+                         (buffer-string))))
+    ;; Store both raw bytes (for inline display) and base64 (for JSON).
+    (push (list :raw-data   raw-data
+                :data       (base64-encode-string raw-data t)
+                :media-type media-type
+                :name       name)
+          claude-code--pending-images)
+    (message "Attached image: %s (%s)" name media-type)
+    (claude-code--schedule-render)))
 
 ;;;###autoload
 (defun claude-code-send-region (start end)
@@ -742,7 +804,8 @@ persists the change via `customize-save-variable'."
   ["Send"
    ("s" "Focus input area" claude-code-focus-input)
    ("r" "Send region" claude-code-send-region)
-   ("f" "Send file context" claude-code-send-buffer-file)]
+   ("f" "Send file context" claude-code-send-buffer-file)
+   ("i" "Attach image (clipboard or file)" claude-code-attach-image)]
   ["Control"
    ("c" "Cancel" claude-code-cancel)
    ("C" "Clear conversation" claude-code-clear)
@@ -844,7 +907,8 @@ Prevents S-SPC from triggering scroll-down while typing."
   "DEL" #'claude-code-key-delete-backward
   "TAB" #'claude-code-key-tab
   "M-p" #'claude-code-previous-input
-  "M-n" #'claude-code-next-input)
+  "M-n" #'claude-code-next-input
+  "C-c i" #'claude-code-attach-image)
 
 (defun claude-code-key-delete-backward ()
   "Delete backward in input area, scroll down elsewhere."
