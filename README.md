@@ -159,7 +159,7 @@ conversation).  Inside the input area, all keys type normally.
 | `s` | `claude-code-focus-input` | Jump to input area |
 | `RET` | `claude-code-return` | Submit prompt (in input area) or toggle section |
 | `C-j` | `newline` | Insert newline in input area |
-| `SPC` | — | Scroll up in conversation (or self-insert in input area) |
+| `SPC` / `S-SPC` | — | Scroll up/down in conversation (or self-insert space in input area) |
 | `DEL` | `claude-code-key-delete-backward` | Delete backward (input area) or scroll down |
 | `r` | `claude-code-send-region` | Send region with a prompt |
 | `c` | `claude-code-cancel` | Cancel running query |
@@ -284,28 +284,30 @@ treemacs-style side panel showing all active sessions and their subagents:
 Claude Agents
 ──────────────────────────────────────
 
-● ~/projects/myapp          [working]
-  Explain the auth module
-  ⎘ *Claude: ~/projects/myapp*
-  ├ ⠹ Search codebase      [working]
-  │   ⎘ *Claude Task: Search codebase*
-  │   ⚙ Grep
-  ├ ✓ Read config files   [completed]
-  │   Found 3 config files
-  └ ⠹ Analyze patterns     [working]
+▾ ⠹ ~/projects/myapp        [working]
+   Explain the auth module
+   ⎘ *Claude: ~/projects/myapp*
+  ├─ ⠹ Search codebase      [working]
+  │    ⎘ *Claude Task: Search codebase*
+  │    ⚙ Grep
+  ├─ ✓ Read config files    [completed]
+  │    Found 3 config files
+  └─ ⠹ Analyze patterns     [working]
 
-● ~/other-project            [ready]
-  ⎘ *Claude: ~/other-project*
+▸ ● ~/other-project          [ready]
+   ⎘ *Claude: ~/other-project*
 ```
 
 - **Root nodes** are sessions (one per project directory)
 - **Child nodes** are subagents spawned by the main agent
+- **▾ / ▸** fold indicator — `TAB` collapses/expands session nodes
 - **`⎘ buffer-name`** shows the Emacs buffer each agent lives in
-- Press `RET` on a session node to jump to its conversation buffer
-- Press `RET` on a task node to jump to its dedicated task progress buffer
-- Press `g` to refresh, `q` to close
+- `RET` / click on a session node → jump to its conversation buffer
+- `RET` / click on a task node → jump to its dedicated task progress buffer
+- `k` kill agent, `g` refresh, `q` close
 
 The sidebar auto-updates as agents start, make progress, and complete.
+Sessions resume their conversation context across `claude-code-reload`.
 
 ### Git Graph
 

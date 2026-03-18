@@ -159,13 +159,16 @@ Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
             (insert (propertize (make-string 38 ?─) 'face 'claude-code-separator))
             (insert "\n\n")
             (let ((live-roots
-                   ;; Omit root agents whose buffers have since been killed
-                   ;; without going through `claude-code-kill'.
+                   ;; Only show sessions that have a live buffer OR have child
+                   ;; tasks registered.  Sessions with a nil or killed buffer
+                   ;; and no children are ghost entries (stale forks, background
+                   ;; sidechains without a buffer) and we suppress them.
                    (seq-filter
                     (lambda (id)
                       (when-let ((a (gethash id claude-code--agents)))
                         (let ((buf (plist-get a :buffer)))
-                          (or (null buf) (buffer-live-p buf)))))
+                          (or (and buf (buffer-live-p buf))
+                              (plist-get a :children)))))
                     (claude-code--agent-root-ids))))
               (if (null live-roots)
                   (insert (propertize "  No active sessions\n" 'face 'shadow))
