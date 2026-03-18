@@ -591,7 +591,7 @@
           claude-code--streaming-char-count 0
           claude-code--thinking-elapsed-sec 0.0
           claude-code--thinking-block-start-time nil
-          claude-code--input-queued "my queued message")
+          claude-code--input-queued (list "my queued message"))
     (let ((s (claude-code--thinking-overlay-string)))
       (should (string-match-p "queued" s))
       (should (string-match-p "my queued message" s)))))
@@ -603,10 +603,24 @@
           claude-code--streaming-char-count 0
           claude-code--thinking-elapsed-sec 0.0
           claude-code--thinking-block-start-time nil
-          claude-code--input-queued (make-string 80 ?x))
+          claude-code--input-queued (list (make-string 80 ?x)))
     (let ((s (claude-code--thinking-overlay-string)))
       (should (string-match-p "queued" s))
       (should (not (string-match-p (make-string 80 ?x) s))))))
+
+(ert-deftest claude-code-test-thinking-overlay-queued-multiple ()
+  "Overlay should show queue count and first message when multiple are queued."
+  (claude-code-test-with-buffer
+    (setq claude-code--query-start-time nil
+          claude-code--streaming-char-count 0
+          claude-code--thinking-elapsed-sec 0.0
+          claude-code--thinking-block-start-time nil
+          claude-code--input-queued (list "first" "second" "third"))
+    (let ((s (claude-code--thinking-overlay-string)))
+      (should (string-match-p "queued" s))
+      (should (string-match-p "3" s))
+      (should (string-match-p "first" s))
+      (should (not (string-match-p "second" s))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Streaming char count
@@ -683,7 +697,7 @@
 ;; ---------------------------------------------------------------------------
 
 (ert-deftest claude-code-test-submit-queues-when-working ()
-  "Submitting while working should queue the text, not send it."
+  "Submitting while working should append to queue and clear the input area."
   (claude-code-test-with-buffer
     (claude-code--render)
     (setq claude-code--status 'working)
@@ -695,13 +709,27 @@
           (goto-char (marker-position claude-code--input-marker))
           (insert "my queued message"))
         (claude-code-submit-input)
-        (should (equal "my queued message" claude-code--input-queued))
+        (should (equal (list "my queued message") claude-code--input-queued))
         (should (null sent-text))
-        ;; Text must remain in input area
-        (should (string-match-p
-                 "my queued message"
-                 (buffer-substring-no-properties
-                  claude-code--input-marker (point-max))))))))
+        ;; Input area should be cleared after queuing.
+        (should (string-empty-p
+                 (string-trim
+                  (buffer-substring-no-properties
+                   claude-code--input-marker (point-max)))))))))
+
+(ert-deftest claude-code-test-submit-multiple-messages-queued-fifo ()
+  "Multiple submissions while working should build a FIFO list."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (setq claude-code--status 'working)
+    (cl-letf (((symbol-function 'claude-code--update-thinking-overlay) #'ignore))
+      (dolist (msg (list "first message" "second message" "third message"))
+        (let ((inhibit-read-only t))
+          (goto-char (marker-position claude-code--input-marker))
+          (insert msg))
+        (claude-code-submit-input))
+      (should (equal (list "first message" "second message" "third message")
+                     claude-code--input-queued)))))
 
 (ert-deftest claude-code-test-submit-sends-when-ready ()
   "Submitting while ready should send immediately and clear the input area."
@@ -723,9 +751,9 @@
                    claude-code--input-marker (point-max)))))))))
 
 (ert-deftest claude-code-test-cancel-clears-queue ()
-  "Cancel should clear `claude-code--input-queued'."
+  "Cancel should clear all queued messages."
   (claude-code-test-with-buffer
-    (setq claude-code--input-queued "pending message")
+    (setq claude-code--input-queued (list "pending message" "another message"))
     (cl-letf (((symbol-function 'claude-code--send-json) #'ignore)
               ((symbol-function 'claude-code--stop-thinking) #'ignore)
               ((symbol-function 'claude-code--schedule-render) #'ignore))
@@ -733,11 +761,11 @@
       (should (null claude-code--input-queued)))))
 
 (ert-deftest claude-code-test-ready-status-auto-sends-queue ()
-  "When status becomes ready, a queued message should be dispatched."
+  "When status becomes ready, the oldest queued message should be dispatched."
   (claude-code-test-with-buffer
     (claude-code-test-with-clean-agents
       (claude-code--render)
-      (setq claude-code--input-queued "auto-send me")
+      (setq claude-code--input-queued (list "auto-send me"))
       (let ((dispatched nil))
         (cl-letf (((symbol-function 'claude-code--stop-thinking) #'ignore)
                   ((symbol-function 'claude-code--flush-streaming) #'ignore)
@@ -747,6 +775,22 @@
           (claude-code--handle-status-event '((status . "ready")))
           (should (equal "auto-send me" dispatched))
           (should (null claude-code--input-queued)))))))
+
+(ert-deftest claude-code-test-ready-status-dispatches-oldest-first ()
+  "When status becomes ready with multiple queued messages, send oldest first."
+  (claude-code-test-with-buffer
+    (claude-code-test-with-clean-agents
+      (claude-code--render)
+      (setq claude-code--input-queued (list "first" "second" "third"))
+      (let ((dispatched nil))
+        (cl-letf (((symbol-function 'claude-code--stop-thinking) #'ignore)
+                  ((symbol-function 'claude-code--flush-streaming) #'ignore)
+                  ((symbol-function 'claude-code--schedule-render) #'ignore)
+                  ((symbol-function 'claude-code--dispatch-input)
+                   (lambda (text) (setq dispatched text))))
+          (claude-code--handle-status-event '((status . "ready")))
+          (should (equal "first" dispatched))
+          (should (equal (list "second" "third") claude-code--input-queued)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Slash command dispatch
@@ -1201,6 +1245,102 @@ with the correct message alist."
                             (buffer-substring-no-properties
                              (marker-position claude-code--input-marker)
                              (point-max))))))
+
+;; ---------------------------------------------------------------------------
+;; Queue navigation (M-p / M-n)
+;; ---------------------------------------------------------------------------
+
+(defmacro claude-code-test-with-working-queue (queue &rest body)
+  "Set up a working buffer with QUEUE and evaluate BODY.
+The input area is rendered and status is `working'."
+  (declare (indent 1))
+  `(claude-code-test-with-buffer
+     (claude-code--render)
+     (setq claude-code--status 'working
+           claude-code--input-queued ,queue
+           claude-code--input-history nil
+           claude-code--input-history-index -1
+           claude-code--input-history-saved nil
+           claude-code--queue-edit-index nil)
+     ,@body))
+
+(defun claude-code-test--input-text ()
+  "Return the current input-area text (trimmed)."
+  (string-trim
+   (buffer-substring-no-properties
+    claude-code--input-marker (point-max))))
+
+(ert-deftest claude-code-test-mprev-enters-queue-newest-first ()
+  "M-p from fresh input should show the newest (last) queued message."
+  (claude-code-test-with-working-queue (list "first" "second" "third")
+    (claude-code-previous-input)
+    (should (= 2 claude-code--queue-edit-index))
+    (should (equal "third" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-mprev-cycles-through-queue ()
+  "Repeated M-p should cycle through all queued messages newest-to-oldest."
+  (claude-code-test-with-working-queue (list "first" "second" "third")
+    (claude-code-previous-input)   ; -> "third" (index 2)
+    (claude-code-previous-input)   ; -> "second" (index 1)
+    (should (= 1 claude-code--queue-edit-index))
+    (should (equal "second" (claude-code-test--input-text)))
+    (claude-code-previous-input)   ; -> "first" (index 0)
+    (should (= 0 claude-code--queue-edit-index))
+    (should (equal "first" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-mprev-past-queue-enters-history ()
+  "M-p past the oldest queued message should enter history navigation."
+  (claude-code-test-with-working-queue (list "queued")
+    (setq claude-code--input-history (list "hist-newest" "hist-older"))
+    (claude-code-previous-input)   ; -> queue "queued"
+    (claude-code-previous-input)   ; -> history "hist-newest"
+    (should (null claude-code--queue-edit-index))
+    (should (= 0 claude-code--input-history-index))
+    (should (equal "hist-newest" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-mnext-from-queue-back-to-fresh ()
+  "M-n past the newest queued message should restore fresh input."
+  (claude-code-test-with-working-queue (list "first" "second")
+    (let ((inhibit-read-only t))
+      (goto-char (marker-position claude-code--input-marker))
+      (insert "draft text"))
+    (claude-code-previous-input)   ; snapshot "draft text", show "second"
+    (claude-code-next-input)       ; back to fresh
+    (should (null claude-code--queue-edit-index))
+    (should (= -1 claude-code--input-history-index))
+    (should (equal "draft text" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-queue-edit-saved-on-mprev ()
+  "Editing a queued message and pressing M-p should save the edit to that slot."
+  (claude-code-test-with-working-queue (list "first" "second" "third")
+    (claude-code-previous-input)   ; show "third" (index 2)
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max))
+      (insert "third EDITED"))
+    (claude-code-previous-input)   ; save edit, show "second" (index 1)
+    (should (equal "third EDITED" (nth 2 claude-code--input-queued)))
+    (should (equal "second" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-queue-edit-saved-on-mnext ()
+  "Editing a queued message and pressing M-n should save the edit to that slot."
+  (claude-code-test-with-working-queue (list "first" "second" "third")
+    (claude-code-previous-input)   ; -> "third" (index 2)
+    (claude-code-previous-input)   ; -> "second" (index 1)
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max))
+      (insert "second EDITED"))
+    (claude-code-next-input)       ; save edit, -> "third" (index 2)
+    (should (equal "second EDITED" (nth 1 claude-code--input-queued)))
+    (should (equal "third" (claude-code-test--input-text)))))
+
+(ert-deftest claude-code-test-mprev-no-queue-goes-to-history ()
+  "M-p with empty queue should go straight into history navigation."
+  (claude-code-test-with-working-queue nil
+    (setq claude-code--input-history (list "hist1"))
+    (claude-code-previous-input)
+    (should (null claude-code--queue-edit-index))
+    (should (= 0 claude-code--input-history-index))
+    (should (equal "hist1" (claude-code-test--input-text)))))
 
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

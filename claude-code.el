@@ -375,7 +375,8 @@ DOC is the docstring."
 ;;;; Queuing & Stats State
 
 (defvar-local claude-code--input-queued nil
-  "Non-nil when the input area has been queued to send on next ready status.")
+  "List of input strings queued to send, oldest first.
+Each entry is dispatched in FIFO order as the agent becomes ready.")
 
 (defvar-local claude-code--pending-input nil
   "Input text to restore into the input area on the next render.
@@ -390,6 +391,11 @@ Used by `claude-code-reload' to survive the mode reinitialization.")
 
 (defvar-local claude-code--input-history-saved nil
   "Text saved before history navigation began; restored when cycling past the end.")
+
+(defvar-local claude-code--queue-edit-index nil
+  "Non-nil while navigating the queue with M-p/M-n.
+An integer index into `claude-code--input-queued'; edits to the input area
+are written back to that slot before moving to the next.")
 
 (defvar-local claude-code--query-start-time nil
   "Float time when the current query started (set when status → working).")
@@ -711,14 +717,11 @@ If the process is dead, restart it automatically before sending."
        (claude-code--flush-streaming)
        (setq claude-code--query-start-time nil)
        (setq claude-code--thinking-block-start-time nil)
-       ;; Auto-send queued input, if any.
+       ;; Auto-send the oldest queued input, if any.
+       (setq claude-code--queue-edit-index nil)
        (when claude-code--input-queued
-         (let ((queued claude-code--input-queued))
-           (setq claude-code--input-queued nil)
-           (when (and claude-code--input-marker
-                      (marker-buffer claude-code--input-marker))
-             (let ((inhibit-read-only t))
-               (delete-region claude-code--input-marker (point-max))))
+         (let ((queued (car claude-code--input-queued)))
+           (setq claude-code--input-queued (cdr claude-code--input-queued))
            (claude-code--dispatch-input queued)))
        (when claude-code--cwd
          (claude-code--agent-update claude-code--cwd :status 'ready)))
@@ -737,7 +740,8 @@ If the process is dead, restart it automatically before sending."
        (claude-code--flush-streaming)
        (setq claude-code--query-start-time nil
              claude-code--thinking-block-start-time nil
-             claude-code--input-queued nil)
+             claude-code--input-queued nil
+             claude-code--queue-edit-index nil)
        (when claude-code--cwd
          (claude-code--agent-update claude-code--cwd :status 'ready))
        (push '((type . "info") (text . "Cancelled."))
@@ -1217,9 +1221,10 @@ are only available in the final result event."
              (format "\n  %s Working…\n" frame))))
       (if claude-code--input-queued
           (concat stats-line
-                  (format "  ⏳ queued: %s\n"
+                  (format "  ⏳ queued (%d): %s\n"
+                          (length claude-code--input-queued)
                           (truncate-string-to-width
-                           claude-code--input-queued 60 nil nil "…")))
+                           (car claude-code--input-queued) 60 nil nil "…")))
         stats-line))))
 
 (defun claude-code--start-thinking ()
@@ -1574,14 +1579,13 @@ Use org TODO keywords (TODO, NEXT, DONE, CANCELLED) on headlines."
       (claude-code-send (format "%s\n\nRegarding file: %s" prompt file)))))
 
 (defun claude-code-cancel ()
-  "Cancel the current query.
-Also clears any queued message — the text remains in the input area
-so it can be edited and re-submitted."
+  "Cancel the current query and clear all queued messages."
   (interactive)
   (claude-code--send-json '((type . "cancel")))
   (claude-code--stop-thinking)
   (setq claude-code--status 'ready
-        claude-code--input-queued nil)
+        claude-code--input-queued nil
+        claude-code--queue-edit-index nil)
   (claude-code--schedule-render))
 
 (defun claude-code-clear ()
@@ -2009,9 +2013,9 @@ Activates when point is in the input area and the input starts with /."
 
 (defun claude-code-submit-input ()
   "Submit the text currently typed in the input area.
-If the agent is working, queue the message to be sent automatically when
-it becomes ready — the text is left in the input area so it can be edited
-or cancelled (press `c' to cancel the queue)."
+If the agent is working, append the message to the FIFO queue and clear
+the input area so a new message can be typed.  Queued messages are sent
+in order as the agent becomes ready.  Press `c' to cancel the queue."
   (interactive)
   (when claude-code--input-marker
     (let ((text (string-trim
@@ -2021,11 +2025,15 @@ or cancelled (press `c' to cancel the queue)."
         ;; Record in per-buffer history and reset navigation state.
         (push text claude-code--input-history)
         (setq claude-code--input-history-index -1
-              claude-code--input-history-saved nil)
+              claude-code--input-history-saved nil
+              claude-code--queue-edit-index nil)
         (if (eq claude-code--status 'working)
-            ;; Queue: keep text in input area, show indicator in spinner.
+            ;; Queue: append to FIFO list and clear input area.
             (progn
-              (setq claude-code--input-queued text)
+              (setq claude-code--input-queued
+                    (nconc claude-code--input-queued (list text)))
+              (let ((inhibit-read-only t))
+                (delete-region claude-code--input-marker (point-max)))
               (claude-code--update-thinking-overlay))
           ;; Ready: clear input area and dispatch.
           (let ((inhibit-read-only t))
@@ -2042,46 +2050,103 @@ or cancelled (press `c' to cancel the queue)."
   (let ((inhibit-read-only t))
     (delete-region claude-code--input-marker (point-max))
     (insert text))
-  (goto-char (point-max))
-  ;; Keep queued text in sync when the agent is working.
-  (when (eq claude-code--status 'working)
-    (setq claude-code--input-queued text)
-    (claude-code--update-thinking-overlay)))
+  (goto-char (point-max)))
+
+(defun claude-code--nav-current-input ()
+  "Return the current text in the input area as a trimmed string."
+  (when claude-code--input-marker
+    (buffer-substring-no-properties claude-code--input-marker (point-max))))
+
+(defun claude-code--nav-save-queue-edit ()
+  "Write the current input text back to the queue slot being navigated."
+  (when (and claude-code--queue-edit-index
+             claude-code--input-queued
+             (< claude-code--queue-edit-index (length claude-code--input-queued)))
+    (setf (nth claude-code--queue-edit-index claude-code--input-queued)
+          (or (claude-code--nav-current-input) ""))))
 
 (defun claude-code-previous-input ()
-  "Replace the input area with the previous (older) submitted input.
-Cycles backward through `claude-code--input-history'.  If there are queued
-messages (agent is working), navigating history changes which text is queued.
-\\[claude-code-next-input] moves forward again."
+  "Replace the input area with the previous (older) input.
+Navigation layers, from newest to oldest:
+  fresh input → queued messages (newest first) → submitted history
+Each queued slot is editable; edits are saved back to the queue slot
+when you navigate away.  \\[claude-code-next-input] reverses direction."
   (interactive)
   (unless (claude-code--input-area-p)
     (goto-char (point-max)))
   (when claude-code--input-marker
-    (let ((history claude-code--input-history)
-          (new-index (1+ claude-code--input-history-index)))
-      (when (< new-index (length history))
-        ;; On first navigation, snapshot whatever is currently in the input.
-        (when (= claude-code--input-history-index -1)
-          (setq claude-code--input-history-saved
-                (buffer-substring-no-properties
-                 claude-code--input-marker (point-max))))
-        (setq claude-code--input-history-index new-index)
-        (claude-code--replace-input (nth new-index history))))))
+    (cond
+     ;; Currently navigating the queue: move to older slot or enter history.
+     (claude-code--queue-edit-index
+      (claude-code--nav-save-queue-edit)
+      (if (> claude-code--queue-edit-index 0)
+          (progn
+            (setq claude-code--queue-edit-index
+                  (1- claude-code--queue-edit-index))
+            (claude-code--replace-input
+             (nth claude-code--queue-edit-index claude-code--input-queued)))
+        ;; Past oldest queued: enter history navigation.
+        (setq claude-code--queue-edit-index nil)
+        (let ((new-index 0))
+          (when (< new-index (length claude-code--input-history))
+            (setq claude-code--input-history-index new-index)
+            (claude-code--replace-input
+             (nth new-index claude-code--input-history))))))
+     ;; In history navigation: move to older entry.
+     ((>= claude-code--input-history-index 0)
+      (let ((new-index (1+ claude-code--input-history-index)))
+        (when (< new-index (length claude-code--input-history))
+          (setq claude-code--input-history-index new-index)
+          (claude-code--replace-input
+           (nth new-index claude-code--input-history)))))
+     ;; At fresh input: snapshot it, then enter queue or history navigation.
+     (t
+      (setq claude-code--input-history-saved
+            (buffer-substring-no-properties
+             claude-code--input-marker (point-max)))
+      (if claude-code--input-queued
+          ;; Enter queue at the newest (last) slot.
+          (let ((last-idx (1- (length claude-code--input-queued))))
+            (setq claude-code--queue-edit-index last-idx)
+            (claude-code--replace-input
+             (nth last-idx claude-code--input-queued)))
+        ;; No queue: go straight into history.
+        (when claude-code--input-history
+          (setq claude-code--input-history-index 0)
+          (claude-code--replace-input
+           (car claude-code--input-history))))))))
 
 (defun claude-code-next-input ()
-  "Replace the input area with the next (more recent) submitted input.
-Cycles forward through `claude-code--input-history', restoring the original
-unsaved text when cycling past the most recent entry."
+  "Replace the input area with the next (more recent) input.
+Reverses \\[claude-code-previous-input]: moves from history → queue → fresh
+input.  Edits to queued slots are saved back before moving on."
   (interactive)
-  (when (and claude-code--input-marker
-             (>= claude-code--input-history-index 0))
-    (let ((new-index (1- claude-code--input-history-index)))
-      (setq claude-code--input-history-index new-index)
-      (if (= new-index -1)
-          ;; Restore the text that was in the input before navigation started.
-          (claude-code--replace-input (or claude-code--input-history-saved ""))
-        (claude-code--replace-input
-         (nth new-index claude-code--input-history))))))
+  (when claude-code--input-marker
+    (cond
+     ;; In queue navigation: move to newer slot or back to fresh input.
+     (claude-code--queue-edit-index
+      (claude-code--nav-save-queue-edit)
+      (let ((last-idx (1- (length claude-code--input-queued))))
+        (if (< claude-code--queue-edit-index last-idx)
+            (progn
+              (setq claude-code--queue-edit-index
+                    (1+ claude-code--queue-edit-index))
+              (claude-code--replace-input
+               (nth claude-code--queue-edit-index claude-code--input-queued)))
+          ;; Past newest queued: back to fresh input.
+          (setq claude-code--queue-edit-index nil
+                claude-code--input-history-index -1)
+          (claude-code--replace-input
+           (or claude-code--input-history-saved "")))))
+     ;; In history navigation: move to newer entry or back to fresh input.
+     ((>= claude-code--input-history-index 0)
+      (let ((new-index (1- claude-code--input-history-index)))
+        (setq claude-code--input-history-index new-index)
+        (if (= new-index -1)
+            (claude-code--replace-input
+             (or claude-code--input-history-saved ""))
+          (claude-code--replace-input
+           (nth new-index claude-code--input-history))))))))
 
 (defun claude-code-return ()
   "Submit the input if point is in the input area; otherwise toggle section."
@@ -2639,6 +2704,310 @@ Intended to be called via `emacsclient -e' from a skill or hook:
            (win (get-buffer-window buf)))
       (delete-window win)
     (claude-code-agents)))
+
+;;;; Git Graph Visualization
+
+(defface claude-code-git-heat-0
+  '((((background dark)) :foreground "#2d333b")
+    (t :foreground "#ebedf0"))
+  "Heatmap cell: no commits."
+  :group 'claude-code)
+
+(defface claude-code-git-heat-1
+  '((((background dark)) :foreground "#0e4429")
+    (t :foreground "#9be9a8"))
+  "Heatmap cell: low activity."
+  :group 'claude-code)
+
+(defface claude-code-git-heat-2
+  '((((background dark)) :foreground "#006d32")
+    (t :foreground "#40c463"))
+  "Heatmap cell: medium activity."
+  :group 'claude-code)
+
+(defface claude-code-git-heat-3
+  '((((background dark)) :foreground "#26a641")
+    (t :foreground "#30a14e"))
+  "Heatmap cell: high activity."
+  :group 'claude-code)
+
+(defface claude-code-git-heat-4
+  '((((background dark)) :foreground "#39d353")
+    (t :foreground "#216e39"))
+  "Heatmap cell: very high activity."
+  :group 'claude-code)
+
+(defface claude-code-git-graph-header
+  '((t :inherit claude-code-header))
+  "Git graph section headers."
+  :group 'claude-code)
+
+(defface claude-code-git-graph-sha
+  '((t :inherit font-lock-constant-face))
+  "Commit SHA in git log."
+  :group 'claude-code)
+
+(defface claude-code-git-graph-author
+  '((t :inherit font-lock-string-face))
+  "Author name in git log."
+  :group 'claude-code)
+
+(defface claude-code-git-graph-date
+  '((t :inherit shadow))
+  "Commit date in git log."
+  :group 'claude-code)
+
+(defface claude-code-git-graph-ref
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "Branch/tag refs in git log."
+  :group 'claude-code)
+
+(defun claude-code-git-graph--run (dir &rest args)
+  "Run git with ARGS in DIR; return trimmed output string or nil on error."
+  (let ((default-directory (file-name-as-directory dir)))
+    (with-temp-buffer
+      (when (= 0 (apply #'call-process "git" nil t nil args))
+        (string-trim (buffer-string))))))
+
+(defun claude-code-git-graph--commit-dates (dir days)
+  "Return hash-table date-string->count for the last DAYS days in DIR."
+  (let ((since (format-time-string
+                "%Y-%m-%d"
+                (time-subtract (current-time) (days-to-time days))))
+        (counts (make-hash-table :test #'equal)))
+    (let ((raw (claude-code-git-graph--run
+                dir "log" "--all" "--format=%ad" "--date=short"
+                (format "--since=%s" since))))
+      (when raw
+        (dolist (line (split-string raw "\n" t))
+          (let ((d (string-trim line)))
+            (when (string-match-p "^[0-9]\\{4\\}-[0-9]\\{2\\}-[0-9]\\{2\\}$" d)
+              (puthash d (1+ (gethash d counts 0)) counts))))))
+    counts))
+
+(defun claude-code-git-graph--author-counts (dir)
+  "Return alist (author . count) sorted descending for DIR."
+  (let ((raw (claude-code-git-graph--run
+              dir "shortlog" "-sn" "--all" "--no-merges")))
+    (when raw
+      (delq nil
+            (mapcar (lambda (line)
+                      (when (string-match "^[[:space:]]*\\([0-9]+\\)[[:space:]]+\\(.+\\)$" line)
+                        (cons (match-string 2 line)
+                              (string-to-number (match-string 1 line)))))
+                    (split-string raw "\n" t))))))
+
+(defun claude-code-git-graph--recent-commits (dir n)
+  "Return list of N recent commit plists from DIR."
+  (let ((raw (claude-code-git-graph--run
+              dir "log" "--all" "-n" (number-to-string n)
+              "--format=%h|%ar|%an|%D|%s")))
+    (when raw
+      (mapcar (lambda (line)
+                (let ((parts (split-string line "|" nil)))
+                  (list :sha    (nth 0 parts)
+                        :date   (nth 1 parts)
+                        :author (nth 2 parts)
+                        :refs   (nth 3 parts)
+                        :msg    (nth 4 parts))))
+              (split-string raw "\n" t)))))
+
+(defun claude-code-git-graph--heat-face (count max-count)
+  "Return face for COUNT commits, scaled to MAX-COUNT."
+  (cond
+   ((= count 0) 'claude-code-git-heat-0)
+   ((< count (max 1 (/ max-count 4))) 'claude-code-git-heat-1)
+   ((< count (max 1 (/ max-count 2))) 'claude-code-git-heat-2)
+   ((< count (max 1 (* 3 (/ max-count 4)))) 'claude-code-git-heat-3)
+   (t 'claude-code-git-heat-4)))
+
+(defun claude-code-git-graph--propertize (text face)
+  "Return TEXT with FACE applied."
+  (propertize text 'face face))
+
+(defconst claude-code-git-graph--months
+  ["Jan" "Feb" "Mar" "Apr" "May" "Jun"
+   "Jul" "Aug" "Sep" "Oct" "Nov" "Dec"])
+
+(defun claude-code-git-graph--render-heatmap (dir)
+  "Render 52-week heatmap for DIR into current buffer."
+  (let* ((weeks 52)
+         (counts (claude-code-git-graph--commit-dates dir (* weeks 7)))
+         (max-count (let ((m 0))
+                      (maphash (lambda (_k v) (setq m (max m v))) counts)
+                      (max m 1)))
+         ;; Align so today lands in the last column on its correct day-of-week.
+         ;; day-of-week in decode-time: 0=Sun 1=Mon … 6=Sat
+         (today-dow (nth 6 (decode-time (current-time))))
+         ;; Shift: we want the last row (index 6 = Sat) to be today or later.
+         ;; Start on a Sunday: go back (weeks*7 + today-dow) days.
+         (start-time (time-subtract (current-time)
+                                    (days-to-time (+ (* weeks 7) today-dow -1))))
+         ;; Build grid[week][day] = "YYYY-MM-DD"
+         (grid (let ((g (make-vector weeks nil)))
+                 (dotimes (w weeks)
+                   (aset g w (make-vector 7 nil))
+                   (dotimes (d 7)
+                     (aset (aref g w) d
+                           (format-time-string
+                            "%Y-%m-%d"
+                            (time-add start-time
+                                      (days-to-time (+ (* w 7) d)))))))
+                 g))
+         (day-labels ["Su" "Mo" "Tu" "We" "Th" "Fr" "Sa"]))
+
+    (insert (claude-code-git-graph--propertize
+             "  Contribution Activity — last 52 weeks\n\n"
+             'claude-code-git-graph-header))
+
+    ;; Month label row: 1 char per week, emit 3-char month name where month changes
+    (let ((month-row (make-string weeks ?\s))
+          (last-month -1))
+      (dotimes (w weeks)
+        (let* ((ds (aref (aref grid w) 0))
+               (m (string-to-number (substring ds 5 7))))
+          (when (/= m last-month)
+            (setq last-month m)
+            (let ((label (aref claude-code-git-graph--months (1- m))))
+              (dotimes (i (min (length label) (- weeks w)))
+                (aset month-row (+ w i) (aref label i)))))))
+      (insert "      ")   ; left margin for day labels
+      (insert (claude-code-git-graph--propertize month-row 'claude-code-git-graph-header))
+      (insert "\n"))
+
+    ;; Day rows (7 rows: Sun–Sat)
+    (dotimes (d 7)
+      (insert (claude-code-git-graph--propertize
+               (format "  %s  " (aref day-labels d))
+               'claude-code-git-graph-date))
+      (dotimes (w weeks)
+        (let* ((ds (aref (aref grid w) d))
+               (cnt (gethash ds counts 0))
+               (face (claude-code-git-graph--heat-face cnt max-count)))
+          (insert (propertize "█"
+                              'face face
+                              'help-echo (format "%s: %d commit%s"
+                                                 ds cnt
+                                                 (if (= cnt 1) "" "s"))))))
+      (insert "\n"))
+
+    ;; Legend
+    (insert "\n  ")
+    (insert (propertize "Less " 'face 'shadow))
+    (dolist (f '(claude-code-git-heat-0 claude-code-git-heat-1
+                 claude-code-git-heat-2 claude-code-git-heat-3
+                 claude-code-git-heat-4))
+      (insert (propertize "█" 'face f)))
+    (insert (propertize " More\n\n" 'face 'shadow))))
+
+(defun claude-code-git-graph--render-authors (dir)
+  "Render top-contributor bar chart for DIR into current buffer."
+  (let* ((authors (seq-take (claude-code-git-graph--author-counts dir) 10))
+         (max-count (if authors (apply #'max (mapcar #'cdr authors)) 1))
+         (bar-width 36))
+    (insert (claude-code-git-graph--propertize
+             "  Top Contributors\n\n" 'claude-code-git-graph-header))
+    (dolist (ac authors)
+      (let* ((name   (car ac))
+             (cnt    (cdr ac))
+             (filled (round (* bar-width (/ (float cnt) max-count))))
+             (empty  (- bar-width filled)))
+        (insert (propertize (format "  %-22s "
+                                    (truncate-string-to-width name 22))
+                            'face 'claude-code-git-graph-author))
+        (insert (propertize (make-string filled ?█) 'face 'claude-code-git-heat-3))
+        (insert (propertize (make-string empty  ?░) 'face 'claude-code-git-heat-0))
+        (insert (propertize (format " %d\n" cnt) 'face 'shadow))))
+    (insert "\n")))
+
+(defun claude-code-git-graph--render-log (dir)
+  "Render recent commits for DIR into current buffer."
+  (let ((commits (claude-code-git-graph--recent-commits dir 20)))
+    (insert (claude-code-git-graph--propertize
+             "  Recent Commits\n\n" 'claude-code-git-graph-header))
+    (dolist (c commits)
+      (let ((sha    (plist-get c :sha))
+            (date   (plist-get c :date))
+            (author (plist-get c :author))
+            (refs   (plist-get c :refs))
+            (msg    (plist-get c :msg)))
+        (insert "  ")
+        (insert (propertize (format "%s " (or sha "???????"))
+                            'face 'claude-code-git-graph-sha))
+        (insert (propertize (format "%-13s " (truncate-string-to-width
+                                               (or date "") 13))
+                            'face 'claude-code-git-graph-date))
+        (when (and refs (not (string-empty-p (string-trim refs))))
+          (dolist (ref (seq-take (split-string (string-trim refs) ", *" t) 2))
+            (unless (string-prefix-p "tag: " ref)
+              (insert (propertize (format "(%s) " ref)
+                                  'face 'claude-code-git-graph-ref)))))
+        (insert (truncate-string-to-width (or msg "") 52))
+        (insert (propertize (format " — %s\n"
+                                    (truncate-string-to-width (or author "") 20))
+                            'face 'claude-code-git-graph-author))))))
+
+(defun claude-code-git-graph--render ()
+  "Render the full git graph for `claude-code-git-graph--dir'."
+  (let* ((dir (buffer-local-value 'claude-code-git-graph--dir (current-buffer)))
+         (inhibit-read-only t))
+    (erase-buffer)
+    (let* ((repo-name (file-name-nondirectory (directory-file-name dir)))
+           (total     (claude-code-git-graph--run dir "rev-list" "--all" "--count"))
+           (branch    (claude-code-git-graph--run dir "rev-parse" "--abbrev-ref" "HEAD")))
+      (insert "\n")
+      (insert (propertize (format "  ██ %s" repo-name)
+                          'face 'claude-code-git-graph-header))
+      (insert (propertize (format "  ·  branch: %s  ·  %s commits total\n\n"
+                                  (or branch "?") (or total "?"))
+                          'face 'shadow)))
+    (claude-code-git-graph--render-heatmap dir)
+    (claude-code-git-graph--render-authors dir)
+    (claude-code-git-graph--render-log dir)
+    (goto-char (point-min))))
+
+(defvar-local claude-code-git-graph--dir nil
+  "Git repo root being visualized in this buffer.")
+
+(defvar-keymap claude-code-git-graph-mode-map
+  :doc "Keymap for `claude-code-git-graph-mode'."
+  "g" #'claude-code-git-graph-refresh
+  "q" #'quit-window
+  "n" #'next-line
+  "p" #'previous-line)
+
+(define-derived-mode claude-code-git-graph-mode special-mode "GitGraph"
+  "Major mode for the Claude Code git contribution graph."
+  :group 'claude-code
+  (setq buffer-read-only t
+        truncate-lines    t))
+
+(defun claude-code-git-graph-refresh ()
+  "Refresh the git graph visualization."
+  (interactive)
+  (message "Refreshing…")
+  (claude-code-git-graph--render)
+  (message "Git graph updated."))
+
+;;;###autoload
+(defun claude-code-git-graph (&optional directory)
+  "Show a git contribution graph for DIRECTORY (default: current repo root)."
+  (interactive
+   (list (read-directory-name
+          "Git repo: "
+          (or (when (fboundp 'magit-toplevel) (ignore-errors (magit-toplevel)))
+              (locate-dominating-file default-directory ".git")
+              default-directory))))
+  (let* ((dir (or (claude-code-git-graph--run directory "rev-parse" "--show-toplevel")
+                  (expand-file-name directory)))
+         (repo-name (file-name-nondirectory (directory-file-name dir)))
+         (buf (get-buffer-create (format "*Claude Git Graph: %s*" repo-name))))
+    (with-current-buffer buf
+      (unless (eq major-mode 'claude-code-git-graph-mode)
+        (claude-code-git-graph-mode))
+      (setq claude-code-git-graph--dir dir)
+      (claude-code-git-graph--render))
+    (pop-to-buffer buf)))
 
 (provide 'claude-code)
 ;;; claude-code.el ends here
