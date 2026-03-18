@@ -259,6 +259,36 @@ Use org TODO keywords (TODO, NEXT, DONE, CANCELLED) on headlines."
               parts)))
     (when-let ((skills (claude-code--org-roam-load-skills)))
       (push skills parts))
+    ;; Emacs-native subagent spawning protocol
+    (when claude-code-enable-native-subagents
+      (push
+       (format
+        "## Emacs-Native Subagents
+
+You can delegate subtasks to parallel subagents that run as full Emacs
+sessions.  Each subagent appears in the *Claude Agents* sidebar with its own
+buffer the user can click into and inspect live.
+
+To spawn a subagent, use the Bash tool:
+
+  emacsclient --eval '(claude-code--spawn-subagent \"%s\" \"DESCRIPTION\" \"PROMPT\")'
+
+- First arg  : your buffer name exactly as shown above (already filled in).
+- DESCRIPTION: 3-5 word label for the sidebar (e.g. \"Search auth module\").
+- PROMPT     : complete task instructions for the subagent.
+
+The call returns a task-id immediately.  The subagent runs concurrently; you
+will receive an info message when it finishes.  Spawn multiple subagents in a
+single turn to parallelise independent work.
+
+Example — spawn two subagents in one turn:
+  emacsclient --eval '(claude-code--spawn-subagent \"%s\" \"Audit error handling\" \"Read every .el file and list all places where errors are silently swallowed.\")'
+  emacsclient --eval '(claude-code--spawn-subagent \"%s\" \"Check test coverage\" \"List all public functions in claude-code-commands.el that have no corresponding ert-deftest.\")'
+
+Do NOT use this for tasks that are faster to do yourself.  Spawn subagents
+only for genuinely parallel, independent subtasks."
+        (buffer-name) (buffer-name) (buffer-name))
+       parts))
     (when parts
       (mapconcat #'identity (nreverse parts) "\n\n"))))
 

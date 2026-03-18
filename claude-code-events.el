@@ -38,14 +38,15 @@
       ;; Task / subagent events
       ("task_started"
        (let ((task-id (alist-get 'task_id event))
-             (desc (alist-get 'description event)))
+             (desc (alist-get 'description event))
+             (parent-key (or claude-code--session-key claude-code--cwd)))
          (when task-id
            (claude-code--agent-register
             task-id
             :type 'task :description desc :status 'working
-            :parent-id claude-code--cwd :cwd claude-code--cwd
+            :parent-id parent-key :cwd claude-code--cwd
             :children nil)
-           (claude-code--agent-add-child claude-code--cwd task-id)
+           (claude-code--agent-add-child parent-key task-id)
            ;; Create a dedicated task buffer and store it on the agent entry
            (let ((task-buf (claude-code--task-buffer-create
                             task-id desc (current-buffer))))
@@ -113,7 +114,10 @@
              claude-code--thinking-block-start-time nil)
        (claude-code--start-thinking)
        (when claude-code--cwd
-         (claude-code--agent-update claude-code--cwd :status 'working)))
+         (claude-code--agent-update claude-code--cwd :status 'working))
+       ;; Mark that this subagent has actually started doing real work
+       (when claude-code--subagent-task-id
+         (setq claude-code--subagent-has-worked t)))
       ("cancelled"
        (setq claude-code--status 'ready)
        (claude-code--stop-thinking)
@@ -160,7 +164,51 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
   (claude-code--flush-streaming)
   (claude-code--stop-thinking)
   (push event claude-code--messages)
+  ;; If this is an Emacs-native subagent that has actually run (not the
+  ;; startup ready→working edge), notify the parent session of completion.
+  (when (and claude-code--subagent-task-id
+             claude-code--subagent-has-worked)
+    (claude-code--subagent-notify-parent))
   (claude-code--schedule-render))
+
+(defun claude-code--subagent-notify-parent ()
+  "Notify the parent session that this subagent has completed.
+Called from `claude-code--handle-result-event' in subagent sessions.
+Updates the agent registry entry and pushes an info message to the parent."
+  (let* ((task-id    claude-code--subagent-task-id)
+         (parent-key claude-code--subagent-parent-key)
+         ;; Extract a one-line summary from the last assistant text block
+         (summary
+          (when-let* ((msg (seq-find
+                            (lambda (m) (equal (alist-get 'type m) "assistant"))
+                            claude-code--messages))
+                      (content (alist-get 'content msg))
+                      (_ (vectorp content))
+                      (tb (seq-find
+                           (lambda (b) (equal (alist-get 'type b) "text"))
+                           content))
+                      (text (alist-get 'text tb)))
+            (car (split-string (string-trim text) "\n"))))
+         (parent-agent (gethash parent-key claude-code--agents))
+         (parent-buf   (when parent-agent (plist-get parent-agent :buffer))))
+    ;; Mark the task completed in the registry
+    (claude-code--agent-update task-id :status 'completed :summary summary)
+    ;; Don't fire again for subsequent turns
+    (setq claude-code--subagent-task-id nil)
+    ;; Push an info message into the parent session
+    (when (and parent-buf (buffer-live-p parent-buf))
+      (with-current-buffer parent-buf
+        (push `((type . "info")
+                (text . ,(format "✓ Subagent completed: %s%s"
+                                 (or (when-let ((a (gethash task-id
+                                                            claude-code--agents)))
+                                       (plist-get a :description))
+                                     task-id)
+                                 (if summary
+                                     (format " — %s" summary)
+                                   ""))))
+              claude-code--messages)
+        (claude-code--schedule-render)))))
 
 (defun claude-code--handle-error-event (event)
   "Handle an error EVENT."

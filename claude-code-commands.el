@@ -899,6 +899,67 @@ Outside the input area, toggle the magit section at point."
   (add-hook 'kill-buffer-hook
             #'claude-code--agent-unregister-self nil t))
 
+;;;; Emacs-Native Subagent Spawning
+
+;;;###autoload
+(defun claude-code--spawn-subagent (parent-buf-name description prompt)
+  "Spawn a new Emacs-native subagent as a child of PARENT-BUF-NAME.
+
+Intended to be called by Claude via the Bash tool:
+  emacsclient --eval \\='(claude-code--spawn-subagent PARENT DESC PROMPT)\\='
+
+Creates a full `claude-code-mode' session buffer for the subagent, registers
+it as a task child of the parent session in `claude-code--agents', pre-queues
+PROMPT so the backend picks it up the moment it is ready, and returns the
+TASK-ID string which emacsclient echoes back as the Bash tool result.
+
+PARENT-BUF-NAME  buffer name of the parent Claude session (this session).
+DESCRIPTION      short (3-5 word) label shown in the *Claude Agents* sidebar.
+PROMPT           full task instructions sent as the subagent's first message."
+  (let* ((parent-buf (or (get-buffer parent-buf-name)
+                         (error "spawn-subagent: parent buffer %S not found"
+                                parent-buf-name)))
+         (parent-key (with-current-buffer parent-buf
+                       (or claude-code--session-key claude-code--cwd)))
+         (cwd        (with-current-buffer parent-buf claude-code--cwd))
+         (task-id    (format "emacs-task-%s" (format-time-string "%s%N")))
+         (buf-name   (generate-new-buffer-name
+                      (format "*Claude: %s*" (abbreviate-file-name cwd))))
+         (agent-buf  (get-buffer-create buf-name)))
+    ;; ── Set up the subagent session buffer ───────────────────────────────
+    (with-current-buffer agent-buf
+      (claude-code-mode)
+      (setq claude-code--cwd                  cwd
+            claude-code--session-key          task-id
+            claude-code--subagent-task-id     task-id
+            claude-code--subagent-parent-key  parent-key
+            ;; Pre-queue the prompt — the ready handler fires it automatically
+            ;; the moment the backend process emits its first "ready" status.
+            claude-code--input-queued         (list prompt))
+      ;; Register as a child task of the parent session
+      (claude-code--agent-register
+       task-id
+       :type        'task
+       :description description
+       :status      'working
+       :parent-id   parent-key
+       :cwd         cwd
+       :buffer      agent-buf
+       :children    nil)
+      (claude-code--agent-add-child parent-key task-id)
+      ;; Start the backend process (prompt will be sent once it's ready)
+      (claude-code--start-process)
+      (claude-code--schedule-render))
+    ;; ── Notify the parent session ─────────────────────────────────────────
+    (with-current-buffer parent-buf
+      (push `((type . "info")
+              (text . ,(format "⚡ Subagent started: %s  [%s]"
+                               description task-id)))
+            claude-code--messages)
+      (claude-code--schedule-render))
+    ;; Return the task-id — emacsclient prints this as the Bash tool result
+    task-id))
+
 ;;;; Entry Points
 
 (defun claude-code--buffer-name (dir)

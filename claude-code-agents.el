@@ -66,11 +66,8 @@ Agent plist keys:
                claude-code--agents))))
 
 (defun claude-code--agent-root-p (agent)
-  "Return non-nil if AGENT plist is a root (top-level) agent.
-Sessions with a :parent-id are children of another session and are
-rendered nested under their parent, not as top-level roots."
-  (and (eq (plist-get agent :type) 'session)
-       (null (plist-get agent :parent-id))))
+  "Return non-nil if AGENT plist is a root (top-level session) agent."
+  (eq (plist-get agent :type) 'session))
 
 (defun claude-code--agent-unregister-self ()
   "Unregister the agent for the current buffer.

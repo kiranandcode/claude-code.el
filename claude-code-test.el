@@ -1858,5 +1858,366 @@ the children keep it relevant.  Pure ghosts (dead + no children) are hidden."
         (when (buffer-live-p session-buf) (kill-buffer session-buf))
         (when (buffer-live-p task-buf)    (kill-buffer task-buf))))))
 
+;; ---------------------------------------------------------------------------
+;; Treemacs-style sidebar — keybindings and mode features
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-agents-mouse-1-bound ()
+  "`<mouse-1>' should be bound to `claude-code-agents-goto-mouse'."
+  (should (eq #'claude-code-agents-goto-mouse
+              (lookup-key claude-code-agents-mode-map [mouse-1]))))
+
+(ert-deftest claude-code-test-agents-double-mouse-1-bound ()
+  "`<double-mouse-1>' should also be bound to `claude-code-agents-goto-mouse'."
+  (should (eq #'claude-code-agents-goto-mouse
+              (lookup-key claude-code-agents-mode-map [double-mouse-1]))))
+
+(ert-deftest claude-code-test-agents-tab-bound ()
+  "`<tab>' should be bound to `claude-code-agents-toggle-or-goto'."
+  ;; keymap-set uses "<tab>" which binds the [tab] function-key event,
+  ;; distinct from the ASCII \t character that (kbd "TAB") produces.
+  (should (eq #'claude-code-agents-toggle-or-goto
+              (lookup-key claude-code-agents-mode-map [tab]))))
+
+(ert-deftest claude-code-test-agents-mode-enables-hl-line ()
+  "`claude-code-agents-mode' should enable `hl-line-mode'."
+  (let ((buf (get-buffer-create " *cc-hl-line-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (claude-code-agents-mode)
+          (should hl-line-mode))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-test-agents-goto-mouse-defined ()
+  "`claude-code-agents-goto-mouse' should be defined as an interactive command."
+  (should (fboundp #'claude-code-agents-goto-mouse))
+  (should (commandp #'claude-code-agents-goto-mouse)))
+
+(ert-deftest claude-code-test-agents-toggle-or-goto-defined ()
+  "`claude-code-agents-toggle-or-goto' should be defined as an interactive command."
+  (should (fboundp #'claude-code-agents-toggle-or-goto))
+  (should (commandp #'claude-code-agents-toggle-or-goto)))
+
+(ert-deftest claude-code-test-sidebar-heading-has-mouse-face ()
+  "Session and task headings should carry `mouse-face' for hover highlighting."
+  (claude-code-test-with-clean-agents
+    (let ((live-buf (generate-new-buffer " *cc-mface-session*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/mface-proj"
+              :type 'session :description "hover test" :status 'ready
+              :buffer live-buf :children nil)
+            (let ((sidebar (get-buffer-create "*Claude Agents*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar (claude-code-agents-mode))
+                    (claude-code--agents-do-render)
+                    (with-current-buffer sidebar
+                      ;; Find the heading line and check it has mouse-face
+                      (goto-char (point-min))
+                      (re-search-forward "hover test\\|mface-proj")
+                      (let ((mf (get-text-property (point) 'mouse-face)))
+                        (should mf))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p live-buf) (kill-buffer live-buf))))))
+
+(ert-deftest claude-code-test-sidebar-nil-buffer-ghost-hidden ()
+  "A session with nil :buffer and no children should be filtered from the sidebar."
+  (claude-code-test-with-clean-agents
+    (let ((live-buf (generate-new-buffer " *cc-ghost-live*")))
+      (unwind-protect
+          (progn
+            ;; Ghost: nil buffer, no children
+            (claude-code--agent-register "/tmp/ghost-proj"
+              :type 'session :description "ghost entry" :status 'starting
+              :buffer nil :children nil)
+            ;; Live session
+            (claude-code--agent-register "/tmp/real-proj"
+              :type 'session :description "real session" :status 'ready
+              :buffer live-buf :children nil)
+            (let ((sidebar (get-buffer-create "*Claude Agents*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar (claude-code-agents-mode))
+                    (claude-code--agents-do-render)
+                    (with-current-buffer sidebar
+                      (let ((text (buffer-substring-no-properties
+                                   (point-min) (point-max))))
+                        (should-not (string-match-p "ghost entry" text))
+                        (should     (string-match-p "real session" text)))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p live-buf) (kill-buffer live-buf))))))
+
+;; ---------------------------------------------------------------------------
+;; Emacs-native subagent vars and defcustom
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-subagent-vars-exist ()
+  "Buffer-local subagent state variables must be defined and default to nil."
+  (claude-code-test-with-buffer
+    (should (boundp 'claude-code--subagent-task-id))
+    (should (null claude-code--subagent-task-id))
+    (should (boundp 'claude-code--subagent-parent-key))
+    (should (null claude-code--subagent-parent-key))
+    (should (boundp 'claude-code--subagent-has-worked))
+    (should (null claude-code--subagent-has-worked))))
+
+(ert-deftest claude-code-test-native-subagents-defcustom-exists ()
+  "`claude-code-enable-native-subagents' should be defined and default to t."
+  (should (boundp 'claude-code-enable-native-subagents))
+  (should (eq t claude-code-enable-native-subagents)))
+
+;; ---------------------------------------------------------------------------
+;; claude-code--spawn-subagent
+;; ---------------------------------------------------------------------------
+
+(defmacro claude-code-test-with-spawned-subagent (parent-buf-var
+                                                   task-id-var
+                                                   desc prompt &rest body)
+  "Set up PARENT-BUF-VAR with a registered session, call spawn-subagent with
+DESC and PROMPT, bind TASK-ID-VAR to the returned id, run BODY, then clean
+up the spawned agent buffer.  start-process and schedule-render are mocked."
+  (declare (indent 3))
+  `(claude-code-test-with-clean-agents
+     (claude-code-test-with-buffer
+       (cl-letf (((symbol-function 'claude-code--start-process) #'ignore)
+                 ((symbol-function 'claude-code--schedule-render) #'ignore))
+         (let ((,parent-buf-var (current-buffer)))
+           (claude-code--agent-register claude-code--cwd
+             :type 'session :status 'ready
+             :buffer ,parent-buf-var :children nil)
+           (let ((,task-id-var
+                  (claude-code--spawn-subagent
+                   (buffer-name) ,desc ,prompt)))
+             (unwind-protect
+                 (progn ,@body)
+               (when-let* ((agent (gethash ,task-id-var claude-code--agents))
+                           (buf   (plist-get agent :buffer)))
+                 (when (buffer-live-p buf) (kill-buffer buf))))))))))
+
+(ert-deftest claude-code-test-spawn-subagent-returns-task-id ()
+  "`claude-code--spawn-subagent' should return an \"emacs-task-\" prefixed string."
+  (claude-code-test-with-spawned-subagent _parent task-id "count words" "Count words."
+    (should (stringp task-id))
+    (should (string-prefix-p "emacs-task-" task-id))))
+
+(ert-deftest claude-code-test-spawn-subagent-registers-child ()
+  "`claude-code--spawn-subagent' should register a task child under the parent."
+  (claude-code-test-with-spawned-subagent parent task-id "search auth" "Find auth."
+    (let ((child  (gethash task-id claude-code--agents))
+          (parent-agent (gethash claude-code--cwd claude-code--agents)))
+      (should child)
+      (should (eq 'task (plist-get child :type)))
+      (should (equal "search auth" (plist-get child :description)))
+      (should (eq 'working (plist-get child :status)))
+      (should (equal claude-code--cwd (plist-get child :parent-id)))
+      (should (member task-id (plist-get parent-agent :children))))))
+
+(ert-deftest claude-code-test-spawn-subagent-sets-subagent-vars ()
+  "The spawned session buffer should have subagent vars pointing back to parent."
+  (claude-code-test-with-spawned-subagent parent task-id "check coverage" "List gaps."
+    (let* ((child (gethash task-id claude-code--agents))
+           (agent-buf (plist-get child :buffer)))
+      (should (buffer-live-p agent-buf))
+      (with-current-buffer agent-buf
+        (should (equal task-id claude-code--subagent-task-id))
+        (should (equal claude-code--cwd  ; parent-key = parent cwd
+                       claude-code--subagent-parent-key))))))
+
+(ert-deftest claude-code-test-spawn-subagent-queues-prompt ()
+  "The spawned buffer should pre-queue the prompt for auto-send on ready."
+  (claude-code-test-with-spawned-subagent _p task-id "analyse logs" "Look at logs."
+    (let* ((child (gethash task-id claude-code--agents))
+           (agent-buf (plist-get child :buffer)))
+      (with-current-buffer agent-buf
+        (should (equal '("Look at logs.") claude-code--input-queued))))))
+
+(ert-deftest claude-code-test-spawn-subagent-notifies-parent ()
+  "`claude-code--spawn-subagent' should push an info message to the parent."
+  (claude-code-test-with-spawned-subagent parent task-id "lint code" "Run lint."
+    (should (seq-find
+             (lambda (m)
+               (and (equal "info" (alist-get 'type m))
+                    (string-match-p "lint code" (alist-get 'text m ""))))
+             (with-current-buffer parent claude-code--messages)))))
+
+(ert-deftest claude-code-test-spawn-subagent-errors-on-missing-parent ()
+  "`claude-code--spawn-subagent' should signal an error for unknown parent buffers."
+  (should-error
+   (claude-code--spawn-subagent "*nonexistent-buffer-xyzzy*" "task" "prompt")
+   :type 'error))
+
+;; ---------------------------------------------------------------------------
+;; claude-code--subagent-notify-parent
+;; ---------------------------------------------------------------------------
+
+(defmacro claude-code-test-with-subagent-pair (parent-var agent-var &rest body)
+  "Set up a parent session PARENT-VAR and a child subagent session AGENT-VAR,
+register both in the agents registry, run BODY, then clean up both buffers."
+  (declare (indent 2))
+  `(claude-code-test-with-clean-agents
+     (let ((,parent-var (generate-new-buffer " *cc-notify-parent*"))
+           (,agent-var  (generate-new-buffer " *cc-notify-agent*")))
+       (unwind-protect
+           (progn
+             (with-current-buffer ,parent-var
+               (claude-code-mode)
+               (setq claude-code--cwd "/tmp/cc-notify-parent"))
+             (claude-code--agent-register "/tmp/cc-notify-parent"
+               :type 'session :status 'working
+               :buffer ,parent-var :children '("cc-sub-task-99"))
+             (with-current-buffer ,agent-var
+               (claude-code-mode)
+               (setq claude-code--cwd              "/tmp/cc-notify-parent"
+                     claude-code--session-key       "cc-sub-task-99"
+                     claude-code--subagent-task-id  "cc-sub-task-99"
+                     claude-code--subagent-parent-key "/tmp/cc-notify-parent"
+                     claude-code--subagent-has-worked t
+                     claude-code--messages
+                     (list '((type . "assistant")
+                             (content . [((type . "text")
+                                          (text . "Done: found 5 issues."))])))))
+             (claude-code--agent-register "cc-sub-task-99"
+               :type 'task :status 'working :description "Lint check"
+               :parent-id "/tmp/cc-notify-parent"
+               :buffer ,agent-var :children nil)
+             (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+               ,@body))
+         (when (buffer-live-p ,parent-var) (kill-buffer ,parent-var))
+         (when (buffer-live-p ,agent-var)  (kill-buffer ,agent-var))))))
+
+(ert-deftest claude-code-test-subagent-notify-marks-completed ()
+  "`claude-code--subagent-notify-parent' should set task status to completed."
+  (claude-code-test-with-subagent-pair parent-buf agent-buf
+    (with-current-buffer agent-buf
+      (claude-code--subagent-notify-parent))
+    (let ((task (gethash "cc-sub-task-99" claude-code--agents)))
+      (should (eq 'completed (plist-get task :status))))))
+
+(ert-deftest claude-code-test-subagent-notify-sets-summary ()
+  "`claude-code--subagent-notify-parent' should extract and store first-line summary."
+  (claude-code-test-with-subagent-pair _p agent-buf
+    (with-current-buffer agent-buf
+      (claude-code--subagent-notify-parent))
+    (let ((task (gethash "cc-sub-task-99" claude-code--agents)))
+      (should (equal "Done: found 5 issues." (plist-get task :summary))))))
+
+(ert-deftest claude-code-test-subagent-notify-pushes-parent-message ()
+  "`claude-code--subagent-notify-parent' should push a completion info message to parent."
+  (claude-code-test-with-subagent-pair parent-buf agent-buf
+    (with-current-buffer agent-buf
+      (claude-code--subagent-notify-parent))
+    (with-current-buffer parent-buf
+      (should (seq-find
+               (lambda (m)
+                 (and (equal "info" (alist-get 'type m))
+                      (string-match-p "completed" (alist-get 'text m ""))))
+               claude-code--messages)))))
+
+(ert-deftest claude-code-test-subagent-notify-clears-task-id ()
+  "`claude-code--subagent-notify-parent' should nil out `claude-code--subagent-task-id'."
+  (claude-code-test-with-subagent-pair _p agent-buf
+    (with-current-buffer agent-buf
+      (claude-code--subagent-notify-parent)
+      (should (null claude-code--subagent-task-id)))))
+
+;; ---------------------------------------------------------------------------
+;; Result event → subagent notify integration
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-result-event-fires-notify-when-worked ()
+  "A result event in a worked subagent session should call notify-parent."
+  (claude-code-test-with-subagent-pair _parent agent-buf
+    (let ((notify-called nil))
+      (cl-letf (((symbol-function 'claude-code--subagent-notify-parent)
+                 (lambda () (setq notify-called t)))
+                ((symbol-function 'claude-code--flush-streaming) #'ignore)
+                ((symbol-function 'claude-code--stop-thinking)   #'ignore)
+                ((symbol-function 'claude-code--schedule-render) #'ignore))
+        (with-current-buffer agent-buf
+          ;; subagent-has-worked is already t (set by the macro)
+          (claude-code--handle-result-event '((type . "result"))))
+        (should notify-called)))))
+
+(ert-deftest claude-code-test-result-event-no-notify-when-not-worked ()
+  "A result event before the subagent has worked should NOT call notify-parent."
+  (claude-code-test-with-subagent-pair _parent agent-buf
+    (let ((notify-called nil))
+      (cl-letf (((symbol-function 'claude-code--subagent-notify-parent)
+                 (lambda () (setq notify-called t)))
+                ((symbol-function 'claude-code--flush-streaming) #'ignore)
+                ((symbol-function 'claude-code--stop-thinking)   #'ignore)
+                ((symbol-function 'claude-code--schedule-render) #'ignore))
+        (with-current-buffer agent-buf
+          ;; Override: hasn't worked yet
+          (setq claude-code--subagent-has-worked nil)
+          (claude-code--handle-result-event '((type . "result"))))
+        (should-not notify-called)))))
+
+(ert-deftest claude-code-test-working-event-sets-has-worked ()
+  "A `working' status event should set `claude-code--subagent-has-worked' to t."
+  (claude-code-test-with-subagent-pair _parent agent-buf
+    (cl-letf (((symbol-function 'claude-code--start-thinking)    #'ignore)
+              ((symbol-function 'claude-code--schedule-render)   #'ignore)
+              ((symbol-function 'claude-code--agent-update)      #'ignore))
+      (with-current-buffer agent-buf
+        (setq claude-code--subagent-has-worked nil)
+        (claude-code--handle-event '((type . "status") (status . "working")))
+        (should claude-code--subagent-has-worked)))))
+
+;; ---------------------------------------------------------------------------
+;; System prompt — native subagent protocol inclusion
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-system-prompt-includes-subagent-protocol ()
+  "System prompt should include the spawn protocol when native subagents enabled."
+  (claude-code-test-with-buffer
+    (let ((claude-code-enable-native-subagents t))
+      (let ((sp (claude-code--build-system-prompt)))
+        (should sp)
+        (should (string-match-p "Emacs-Native Subagents" sp))
+        (should (string-match-p "claude-code--spawn-subagent" sp))
+        (should (string-match-p "emacsclient" sp))))))
+
+(ert-deftest claude-code-test-system-prompt-excludes-protocol-when-disabled ()
+  "System prompt should NOT include the spawn protocol when disabled."
+  (claude-code-test-with-buffer
+    (let ((claude-code-enable-native-subagents nil))
+      (let ((sp (claude-code--build-system-prompt)))
+        ;; Protocol section must be absent
+        (should-not (and sp (string-match-p "Emacs-Native Subagents" sp)))))))
+
+(ert-deftest claude-code-test-system-prompt-embeds-buffer-name ()
+  "The spawn protocol in the system prompt should include the current buffer name."
+  (claude-code-test-with-buffer
+    (let ((claude-code-enable-native-subagents t))
+      (let ((sp (claude-code--build-system-prompt))
+            (buf-name (buffer-name)))
+        (should sp)
+        (should (string-match-p (regexp-quote buf-name) sp))))))
+
+;; ---------------------------------------------------------------------------
+;; task_started uses session-key as parent-id when set
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-task-started-uses-session-key-as-parent ()
+  "`task_started' should use `claude-code--session-key' as parent-id, not just cwd."
+  (claude-code-test-with-buffer
+    (claude-code-test-with-clean-agents
+      (cl-letf (((symbol-function 'claude-code--schedule-render) #'ignore))
+        ;; Simulate a fork session: session-key differs from cwd
+        (setq claude-code--session-key "/tmp/test-project::fork-99")
+        (claude-code--agent-register "/tmp/test-project::fork-99"
+          :type 'session :children nil)
+        (claude-code--handle-event
+         '((type . "task_started")
+           (task_id . "fork-task-1")
+           (description . "parallel search")))
+        (let ((task (gethash "fork-task-1" claude-code--agents)))
+          (should task)
+          ;; parent-id must be the session-key, not the raw cwd
+          (should (equal "/tmp/test-project::fork-99"
+                         (plist-get task :parent-id))))))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

@@ -367,5 +367,29 @@ are written back to that slot before moving to the next.")
   "Total characters received from text/thinking deltas this query.
 Used as a rough token-count approximation in the thinking spinner.")
 
+;;;; Emacs-Native Subagent State
+
+(defcustom claude-code-enable-native-subagents t
+  "When non-nil, include the Emacs-native subagent spawning protocol in the
+system prompt.  Claude can then delegate subtasks via `emacsclient' calls
+that create full session buffers visible in the *Claude Agents* sidebar,
+instead of relying on the opaque CLI sidechain mechanism."
+  :type 'boolean
+  :group 'claude-code)
+
+(defvar-local claude-code--subagent-task-id nil
+  "Task ID if this session was spawned via `claude-code--spawn-subagent'.
+Nil for normal (non-subagent) sessions.")
+
+(defvar-local claude-code--subagent-parent-key nil
+  "Parent session key when this session is an Emacs-native subagent.
+Used by the result-event handler to fire completion notifications back to
+the parent session.")
+
+(defvar-local claude-code--subagent-has-worked nil
+  "Non-nil once this subagent session has transitioned through `working'.
+Guards the completion notification so it only fires after the first real
+turn, not on the initial startup `ready' event.")
+
 (provide 'claude-code-vars)
 ;;; claude-code-vars.el ends here

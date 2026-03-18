@@ -294,11 +294,7 @@
 Shows one clickable link per subagent task, with its status and summary."
   (when-let* ((session-key (or claude-code--session-key claude-code--cwd))
               (parent (gethash session-key claude-code--agents))
-              ;; Also try cwd as fallback (tasks register parent-id as cwd)
-              (children (or (plist-get parent :children)
-                            (when-let ((cwd-agent (gethash claude-code--cwd
-                                                           claude-code--agents)))
-                              (plist-get cwd-agent :children)))))
+              (children (plist-get parent :children)))
     (when children
       (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
       (insert "\n")

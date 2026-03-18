@@ -50,16 +50,16 @@ this table first to identify which file to read or edit.
 
 | File | Purpose | Depends on |
 |------|---------|-----------|
-| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, and shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`) | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
+| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`), and Emacs-native subagent state vars (`claude-code--subagent-task-id`, `claude-code--subagent-parent-key`, `claude-code--subagent-has-worked`, `claude-code-enable-native-subagents`) | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
 | `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister functions, parent–child tree helpers, the treemacs-style Agent Sidebar (`claude-code-agents-mode`), and per-task progress buffers (`claude-code-task-mode`) | `claude-code-vars`, `magit-section` |
 | `claude-code-process.el` | UV/Python environment setup (`claude-code--ensure-environment`), backend process lifecycle (`claude-code--start-process`, `--stop-process`, `--send-json`), and the process filter/sentinel that parse JSON-lines output | `claude-code-vars` |
 | `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` (always injects the current Emacs buffer name so the agent can self-reference) | `claude-code-vars` |
-| `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
+| `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, Emacs-native subagent completion notifications (`claude-code--subagent-notify-parent`), and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
 | `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
-| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`) | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
+| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`) | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
 | `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
 | `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
-| `claude-code-test.el` | ERT test suite (114 tests).  Run with `make test`. | `claude-code` |
+| `claude-code-test.el` | ERT test suite (149 tests).  Run with `make test`. | `claude-code` |
 | `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
 
 ### Module dependency graph
@@ -309,6 +309,30 @@ Claude Agents
 The sidebar auto-updates as agents start, make progress, and complete.
 Sessions resume their conversation context across `claude-code-reload`.
 
+#### Emacs-Native Subagents
+
+When `claude-code-enable-native-subagents` is non-nil (the default), the
+system prompt teaches Claude how to spawn **Emacs-native subagents** — full
+`claude-code-mode` session buffers that run concurrently and are visible in
+the `*Claude Agents*` sidebar.
+
+Claude spawns them via `emacsclient` in the Bash tool:
+
+```sh
+emacsclient --eval '(claude-code--spawn-subagent "PARENT-BUF" "Description" "Prompt")'
+```
+
+The call:
+1. Creates a new `claude-code-mode` buffer for the subagent.
+2. Registers it as a task child of the parent session in the agent registry.
+3. Pre-queues the prompt so the backend sends it the moment it is ready.
+4. Pushes an info message into the parent session when the subagent completes.
+5. Returns a `"emacs-task-…"` task ID that emacsclient echoes back.
+
+This differs from the SDK's built-in sidechain subagents: each Emacs-native
+subagent is a **first-class, inspectable Emacs buffer** — you can click into
+it in the sidebar, read its conversation, and even interact with it directly.
+
 ### Git Graph
 
 `M-x claude-code-git-graph` opens a read-only buffer showing a visual summary
@@ -395,6 +419,12 @@ M-x claude-code-git-graph      ;; prompts for repo directory
 
 ;; Agent sidebar width (default: 40)
 (setq claude-code-agents-sidebar-width 40)
+
+;; Emacs-native subagent spawning (default: t)
+;; When non-nil, Claude is instructed on how to spawn subagents as full
+;; Emacs session buffers (visible in the *Claude Agents* sidebar) instead
+;; of relying on the opaque CLI sidechain mechanism.
+(setq claude-code-enable-native-subagents t)
 ```
 
 ### Session Overrides
@@ -676,7 +706,7 @@ dependencies resolved from the `Cask` file via `dev/resolve-deps.el`:
 ./emacs-batch.sh --eval '(progn (require (quote claude-code)) (message "ok"))'
 
 # Run all checks (uses emacs-batch.sh internally)
-make all                   # checkdoc + byte-compile + 70 ERT tests + mypy --strict
+make all                   # checkdoc + byte-compile + ERT tests + mypy --strict
 make test                  # just the ERT tests
 ```
 
