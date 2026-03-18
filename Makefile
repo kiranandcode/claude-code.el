@@ -12,8 +12,16 @@ default: all
 clean:
 	rm -f *.elc
 
-# Only compile the main source, not the test file
-SRC_FILES := claude-code.el
+# All source modules in load order (test file excluded — ERT style doesn't compile cleanly)
+SRC_FILES := claude-code-vars.el \
+             claude-code-agents.el \
+             claude-code-process.el \
+             claude-code-config.el \
+             claude-code-events.el \
+             claude-code-render.el \
+             claude-code-commands.el \
+             claude-code-git-graph.el \
+             claude-code.el
 
 # Run checkdoc on source files (skip test file — ERT style doesn't pass checkdoc)
 checkdoc:

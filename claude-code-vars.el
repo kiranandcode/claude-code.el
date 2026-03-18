@@ -1,0 +1,359 @@
+;;; claude-code-vars.el --- Internal variables for claude-code.el -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2024-2026
+
+;;; Commentary:
+;; Internal variables, faces, and customizations for claude-code.
+
+;;; Code:
+
+(require 'magit-section)
+(require 'transient)
+(require 'cl-lib)
+(require 'json)
+(require 'project)
+(require 'seq)
+
+;;;; Customization
+
+(defgroup claude-code nil
+  "Claude Agent SDK integration."
+  :group 'tools
+  :prefix "claude-code-")
+
+(defcustom claude-code-python-command "uv"
+  "Command used to invoke the Python backend.
+The backend is run as: <python-command> run python3 <script>
+from the python/ directory."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-notes-file nil
+  "Path to an org file with persistent notes.
+Contents are included in every system prompt."
+  :type '(choice (const nil) file)
+  :group 'claude-code)
+
+(defcustom claude-code-org-roam-project-dir-property "CLAUDE_PROJECT_DIR"
+  "Org property used to identify per-project context notes in org-roam.
+An org-roam note with this property set to the expanded path of a project
+directory is included in the system prompt whenever Claude runs in that
+directory.  Create and edit such a note with `claude-code-open-dir-notes'."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-org-roam-project-todos-property "CLAUDE_PROJECT_TODOS"
+  "Org property used to identify per-project TODO notes in org-roam.
+An org-roam note with this property set to the expanded path of a project
+directory is included in the system prompt whenever Claude runs in that
+directory.  Create and edit such a note with `claude-code-open-dir-todos'."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-org-roam-skills-hub-title "Claude Code Skills"
+  "Title of the org-roam hub note that indexes all Claude Code skills.
+This note is created automatically by `claude-code-org-roam-visit-skills-hub'
+if it does not yet exist."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-org-roam-skill-tag "claude_skill"
+  "Filetag added to every org-roam skill note created by claude-code.
+Set to nil to omit the filetag."
+  :type '(choice (const nil) string)
+  :group 'claude-code)
+
+(defcustom claude-code-org-roam-skill-property "CLAUDE_SKILL"
+  "Org property set to \"t\" in the PROPERTIES drawer of every skill note.
+Used to identify skill nodes when building the system prompt."
+  :type 'string
+  :group 'claude-code)
+
+(defcustom claude-code-show-thinking nil
+  "Whether thinking blocks are expanded by default."
+  :type 'boolean
+  :group 'claude-code)
+
+(defcustom claude-code-show-tool-details nil
+  "Whether tool-use details are expanded by default."
+  :type 'boolean
+  :group 'claude-code)
+
+(defcustom claude-code-agents-sidebar-width 40
+  "Width of the agent sidebar window."
+  :type 'integer
+  :group 'claude-code)
+
+;;;; Session Configuration
+;;
+;; `claude-code-defaults' provides global fallback values.
+;; `claude-code-project-config' maps directories to per-project overrides.
+;; At query time, the project config is merged on top of the defaults.
+
+(defcustom claude-code-defaults
+  '((model            . nil)
+    (effort           . nil)
+    (permission-mode  . "bypassPermissions")
+    (max-turns        . 50)
+    (max-budget-usd   . nil)
+    (allowed-tools    . ("Read" "Write" "Edit" "Bash" "Glob" "Grep"
+                         "WebSearch" "WebFetch"))
+    (betas            . nil))
+  "Default session configuration used when no project override exists.
+Each entry is (KEY . VALUE).  See `claude-code-project-config' for keys."
+  :type '(alist :key-type symbol :value-type sexp)
+  :group 'claude-code)
+
+(defcustom claude-code-project-config nil
+  "Per-project session configuration.
+An alist of (DIRECTORY . CONFIG-ALIST).  DIRECTORY is expanded and
+matched as a prefix against the session working directory.  The most
+specific (longest) match wins.
+
+CONFIG-ALIST entries override `claude-code-defaults'.  Valid keys:
+
+  model            - string or nil (e.g. \"claude-opus-4-6\")
+  effort           - nil, \"low\", \"medium\", \"high\", \"max\"
+  permission-mode  - \"default\", \"plan\",
+                     \"acceptEdits\", \"bypassPermissions\"
+  max-turns        - integer
+  max-budget-usd   - float or nil
+  allowed-tools    - list of tool name strings
+  betas            - list of beta feature strings
+
+Example:
+  \\='((\"~/work/prod-app\" . ((model . \"claude-opus-4-6\")
+                          (effort . \"high\")
+                          (permission-mode . \"acceptEdits\")))
+    (\"~/scratch\"       . ((model . \"claude-haiku-4-5\")
+                          (effort . \"low\"))))"
+  :type '(alist :key-type string
+                :value-type (alist :key-type symbol
+                                   :value-type sexp))
+  :group 'claude-code)
+
+;;;; Faces
+
+(defface claude-code-header
+  '((t :inherit magit-section-heading :height 1.3))
+  "Buffer header."
+  :group 'claude-code)
+
+(defface claude-code-separator
+  '((t :inherit shadow))
+  "Visual separators."
+  :group 'claude-code)
+
+(defface claude-code-user-prompt
+  '((t :inherit font-lock-keyword-face :weight bold))
+  "User prompt label."
+  :group 'claude-code)
+
+(defface claude-code-assistant-label
+  '((t :inherit font-lock-function-name-face :weight bold))
+  "Assistant message label."
+  :group 'claude-code)
+
+(defface claude-code-thinking
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Thinking text."
+  :group 'claude-code)
+
+(defface claude-code-tool-name
+  '((t :inherit font-lock-type-face :weight bold))
+  "Tool names in tool-use blocks."
+  :group 'claude-code)
+
+(defface claude-code-tool-input
+  '((t :inherit font-lock-string-face))
+  "Tool input details."
+  :group 'claude-code)
+
+(defface claude-code-result
+  '((t :inherit success))
+  "Result indicators."
+  :group 'claude-code)
+
+(defface claude-code-error
+  '((t :inherit error))
+  "Error messages."
+  :group 'claude-code)
+
+(defface claude-code-status
+  '((t :inherit shadow :slant italic))
+  "Status messages."
+  :group 'claude-code)
+
+(defface claude-code-file-link
+  '((t :inherit link))
+  "Clickable file paths."
+  :group 'claude-code)
+
+(defface claude-code-input-prompt
+  '((t :inherit minibuffer-prompt :weight bold))
+  "Input prompt at the bottom of the Claude buffer."
+  :group 'claude-code)
+
+(defface claude-code-action-button
+  '((t :inherit button))
+  "Clickable action buttons (Reset, New Session, Fork) in the Claude buffer."
+  :group 'claude-code)
+
+;;;; Internal State
+
+(defvar claude-code--package-dir
+  (file-name-directory (or load-file-name buffer-file-name default-directory))
+  "Directory containing the claude-code package.")
+
+(defvar claude-code--buffers (make-hash-table :test 'equal)
+  "Map of directory -> buffer for active sessions.")
+
+(defvar-local claude-code--process nil
+  "Backend Python process.")
+
+(defvar-local claude-code--cwd nil
+  "Working directory for this session.")
+
+(defvar-local claude-code--session-id nil
+  "Session ID from the Agent SDK.")
+
+(defvar-local claude-code--status 'starting
+  "Process status symbol: starting, ready, working, error, stopped.")
+
+(defvar-local claude-code--partial-line ""
+  "Incomplete JSON line from process output.")
+
+(defvar-local claude-code--messages '()
+  "List of conversation messages (newest first).
+Each element is an alist with at least a `type' key.  Types include:
+  \"user\"      — user prompt (has `prompt' key)
+  \"assistant\" — assistant turn (has `content' vector of blocks)
+  \"result\"    — query result (has `total_cost_usd', `num_turns', etc.)
+  \"error\"     — error (has `message' key)
+  \"info\"      — informational (has `text' key)")
+
+(defvar-local claude-code--last-query-cmd nil
+  "The last JSON command alist sent to the backend.
+Useful for debugging — inspect with:
+  (with-current-buffer \"*Claude: ...*\" claude-code--last-query-cmd)")
+
+(defvar-local claude-code--streaming-text ""
+  "Accumulated streaming text for current assistant response.")
+
+(defvar-local claude-code--streaming-thinking ""
+  "Accumulated streaming thinking for current assistant response.")
+
+(defvar-local claude-code--streaming-active nil
+  "Whether we are currently receiving streaming deltas.")
+
+(defvar-local claude-code--thinking-timer nil
+  "Timer for thinking spinner animation.")
+
+(defvar-local claude-code--thinking-frame 0
+  "Current frame of thinking spinner animation.")
+
+(defvar-local claude-code--thinking-overlay nil
+  "Overlay displaying the thinking spinner.")
+
+(defvar-local claude-code--render-pending nil
+  "Whether a render is scheduled.")
+
+(defvar-local claude-code--session-overrides nil
+  "Buffer-local config overrides set via the transient menu.
+Merged on top of project config + defaults.")
+
+(defvar-local claude-code--session-key nil
+  "Key used to register this session in `claude-code--agents'.
+For primary sessions this equals `claude-code--cwd'; for secondary or
+forked sessions it is a unique string so the primary entry is not clobbered.")
+
+(defvar-local claude-code--input-marker nil
+  "Marker for the start of the user-editable input area at the buffer bottom.")
+
+(defun claude-code--input-area-p ()
+  "Return non-nil if point is in the input area."
+  (and claude-code--input-marker
+       (marker-buffer claude-code--input-marker)
+       (>= (point) (marker-position claude-code--input-marker))))
+
+(defun claude-code--self-insert-or-undefined ()
+  "Self-insert in the input area, signal undefined otherwise.
+Overrides `suppress-keymap' from `special-mode' so that printable
+characters work in the input area."
+  (interactive)
+  (if (claude-code--input-area-p)
+      (call-interactively #'self-insert-command)
+    (user-error "%s is undefined" (key-description (this-command-keys)))))
+
+(defmacro claude-code--def-key-command (name cmd doc)
+  "Define NAME as a command that self-inserts in input, else run CMD.
+DOC is the docstring."
+  `(defun ,name ()
+     ,doc
+     (interactive)
+     (if (claude-code--input-area-p)
+         (call-interactively #'self-insert-command)
+       (call-interactively ,cmd))))
+
+(defvar claude-code--prompt-history nil
+  "History for Claude prompts.")
+
+(defconst claude-code--thinking-frames
+  ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"]
+  "Frames for the thinking spinner.")
+
+;;;; Slash Commands
+
+(defconst claude-code--slash-commands
+  '(("/clear"         . "Clear the conversation history")
+    ("/reset"         . "Hard-reset: clear messages and restart the backend")
+    ("/new"           . "Open a new independent session for this directory")
+    ("/model"         . "Set the model for this session")
+    ("/effort"        . "Set the thinking effort level")
+    ("/notes"         . "Open the global notes file")
+    ("/project-notes" . "Open or create project context notes")
+    ("/todos"         . "Open or create project TODO list")
+    ("/inspect"       . "Show session state")
+    ("/help"          . "Show the command menu"))
+  "Slash commands available in the Claude input area.")
+
+;;;; Queuing & Stats State
+
+(defvar-local claude-code--input-queued nil
+  "List of input strings queued to send, oldest first.
+Each entry is dispatched in FIFO order as the agent becomes ready.")
+
+(defvar-local claude-code--pending-input nil
+  "Input text to restore into the input area on the next render.
+Used by `claude-code-reload' to survive the mode reinitialization.")
+
+(defvar-local claude-code--input-history nil
+  "List of previously submitted inputs in this session, most recent first.")
+
+(defvar-local claude-code--input-history-index -1
+  "Index into `claude-code--input-history' during history navigation.
+-1 means not currently navigating (fresh input).")
+
+(defvar-local claude-code--input-history-saved nil
+  "Text saved before history navigation began; restored when cycling past the end.")
+
+(defvar-local claude-code--queue-edit-index nil
+  "Non-nil while navigating the queue with M-p/M-n.
+An integer index into `claude-code--input-queued'; edits to the input area
+are written back to that slot before moving to the next.")
+
+(defvar-local claude-code--query-start-time nil
+  "Float time when the current query started (set when status → working).")
+
+(defvar-local claude-code--thinking-block-start-time nil
+  "Float time when the current thinking block started streaming, or nil.")
+
+(defvar-local claude-code--thinking-elapsed-sec 0.0
+  "Accumulated completed-thinking-block time in seconds for the current query.")
+
+(defvar-local claude-code--streaming-char-count 0
+  "Total characters received from text/thinking deltas this query.
+Used as a rough token-count approximation in the thinking spinner.")
+
+(provide 'claude-code-vars)
+;;; claude-code-vars.el ends here

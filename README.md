@@ -42,6 +42,46 @@ monitoring sessions and subagents.
 └─────────────────────────────────────────────────────────┘
 ```
 
+## Source Files
+
+The package is split into focused modules that load in dependency order via
+`claude-code.el` (the main entry point).  When working on the codebase, check
+this table first to identify which file to read or edit.
+
+| File | Purpose | Depends on |
+|------|---------|-----------|
+| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, and shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`) | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
+| `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister functions, parent–child tree helpers, and the treemacs-style Agent Sidebar (`claude-code-agents-mode`) | `claude-code-vars`, `magit-section` |
+| `claude-code-process.el` | UV/Python environment setup (`claude-code--ensure-environment`), backend process lifecycle (`claude-code--start-process`, `--stop-process`, `--send-json`), and the process filter/sentinel that parse JSON-lines output | `claude-code-vars` |
+| `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` | `claude-code-vars` |
+| `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
+| `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
+| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`) | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
+| `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
+| `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
+| `claude-code-test.el` | ERT test suite (114 tests).  Run with `make test`. | `claude-code` |
+| `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
+
+### Module dependency graph
+
+```
+claude-code-vars
+    ├── claude-code-agents
+    │       └── (used by events, commands, process)
+    ├── claude-code-process
+    ├── claude-code-config
+    │       └── claude-code-render
+    ├── claude-code-events
+    │       └── (uses render, commands — forward refs, resolved at runtime)
+    ├── claude-code-commands   ← aggregates everything
+    └── claude-code-git-graph
+```
+
+Forward references (functions called across module boundaries at runtime, not
+load time) are annotated with comments in the source.  They are safe because
+`claude-code.el` loads all modules before any interactive command can be
+invoked.
+
 ## Installation
 
 ### Prerequisites
@@ -75,7 +115,7 @@ installation instructions instead of producing cryptic JSON parse failures.
    :type git
    :host github
    :repo "kiranandcode/claude-code.el"
-   :files ("claude-code.el" "python"))
+   :files ("*.el" "python"))
   :commands (claude-code claude-code-quick claude-code-menu
              claude-code-send-region claude-code-reload
              claude-code-git-graph)
