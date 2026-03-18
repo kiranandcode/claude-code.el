@@ -731,8 +731,14 @@ If the process is dead, restart it automatically before sending."
             (alist-get 'session_id data)))))
 
 (defun claude-code--handle-assistant-event (event)
-  "Handle a complete assistant EVENT (non-streaming)."
-  (claude-code--flush-streaming)
+  "Handle a complete assistant EVENT (non-streaming).
+The complete event already contains all content blocks (thinking, text,
+tool_use), so we discard the streaming buffers rather than flushing them
+to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
+  ;; Discard streaming buffers — the complete event supersedes them.
+  (setq claude-code--streaming-text ""
+        claude-code--streaming-thinking ""
+        claude-code--streaming-active nil)
   (push event claude-code--messages)
   (claude-code--schedule-render))
 
