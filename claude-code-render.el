@@ -116,8 +116,15 @@
       (insert "\n"))
     (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
     (insert "\n")
-    ;; Action buttons: Reset and New Session
+    ;; Action buttons: Cancel (when working), Reset, New Session
     (insert "  ")
+    (when (eq claude-code--status 'working)
+      (insert-button "[Cancel]"
+                     'action (lambda (_btn) (claude-code-cancel))
+                     'help-echo "Cancel the current query (key: c)"
+                     'face 'claude-code-action-button
+                     'follow-link t)
+      (insert "  "))
     (insert-button "[Reset]"
                    'action (lambda (_btn) (claude-code-reset))
                    'help-echo "Hard-reset: clear all messages and restart the backend"

@@ -1021,30 +1021,48 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
     (maphash (lambda (dir buf)
                (when (buffer-live-p buf)
                  (with-current-buffer buf
-                   (push (list :dir dir
-                               :messages claude-code--messages
-                               :session-id claude-code--session-id
-                               :session-overrides claude-code--session-overrides
-                               :streaming-text claude-code--streaming-text
-                               :streaming-thinking claude-code--streaming-thinking
-                               :streaming-active claude-code--streaming-active
-                               ;; Preserve typed input and queued/history state
-                               :input-text (if (and claude-code--input-marker
-                                                    (marker-buffer claude-code--input-marker))
-                                               (buffer-substring-no-properties
-                                                claude-code--input-marker (point-max))
-                                             "")
-                               :input-queued claude-code--input-queued
-                               :input-history claude-code--input-history
-                               ;; Preserve task agent children so the sidebar
-                               ;; survives the reload without losing subagents.
-                               :agent-children (when-let ((a (gethash dir claude-code--agents)))
-                                                 (plist-get a :children)))
-                         saved-states)
-                   ;; Kill the old backend process
-                   (claude-code--stop-process))))
+                   ;; If the backend process is live, keep it running through the
+                   ;; reload.  The process filter/sentinel lambdas call their
+                   ;; handlers by name, so reloaded elisp takes effect on future
+                   ;; events automatically — no restart needed.  Killing a live
+                   ;; process would interrupt any in-flight tool call (e.g. the
+                   ;; agent calling reload via emacsclient from a Bash tool).
+                   (let* ((working-p (and claude-code--process
+                                          (process-live-p claude-code--process))))
+                     (push (list :dir dir
+                                 :messages claude-code--messages
+                                 :session-id claude-code--session-id
+                                 :session-overrides claude-code--session-overrides
+                                 :streaming-text claude-code--streaming-text
+                                 :streaming-thinking claude-code--streaming-thinking
+                                 :streaming-active claude-code--streaming-active
+                                 ;; Preserve typed input and queued/history state
+                                 :input-text (if (and claude-code--input-marker
+                                                      (marker-buffer claude-code--input-marker))
+                                                 (buffer-substring-no-properties
+                                                  claude-code--input-marker (point-max))
+                                               "")
+                                 :input-queued claude-code--input-queued
+                                 :input-history claude-code--input-history
+                                 ;; Preserve task agent children so the sidebar
+                                 ;; survives the reload without losing subagents.
+                                 :agent-children (when-let ((a (gethash dir claude-code--agents)))
+                                                   (plist-get a :children))
+                                 ;; For working sessions: keep the process reference
+                                 ;; so we can restore it after mode re-activation
+                                 ;; wipes buffer-locals via kill-all-local-variables.
+                                 :keep-process working-p
+                                 :saved-process (when working-p claude-code--process))
+                           saved-states)
+                     ;; Only stop the process if not actively executing a tool.
+                     (unless working-p
+                       (claude-code--stop-process))))))
              claude-code--buffers)
-    ;; Re-evaluate all source files
+    ;; Re-evaluate all source files.  Unbind keymap variables first so that
+    ;; `defvar-keymap' (which, like `defvar', skips re-initialization when the
+    ;; variable is already bound) always rebuilds them from the source.
+    (makunbound 'claude-code-mode-map)
+    (makunbound 'claude-code-agents-mode-map)
     (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
                        "claude-code-config" "claude-code-events" "claude-code-render"
                        "claude-code-commands" "claude-code-git-graph"))
@@ -1076,15 +1094,20 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
              dir
              :type 'session
              :description (abbreviate-file-name dir)
-             :status 'starting
+             :status (if (plist-get state :keep-process) 'working 'starting)
              :buffer buf
              :cwd dir
              :children (plist-get state :agent-children))
-            ;; Start a fresh backend, then restore the session ID so the SDK
-            ;; can resume the conversation.  start-process no longer clears
-            ;; the ID, but we set it explicitly here for clarity.
-            (claude-code--start-process)
-            (setq claude-code--session-id (plist-get state :session-id))
+            ;; For sessions that were mid-execution, restore the existing process
+            ;; reference (killed by kill-all-local-variables inside claude-code-mode)
+            ;; and leave them running.  For idle sessions, start a fresh backend.
+            (if (plist-get state :keep-process)
+                (progn
+                  (setq claude-code--process (plist-get state :saved-process))
+                  (setq claude-code--status 'working)
+                  (setq claude-code--session-id (plist-get state :session-id)))
+              (claude-code--start-process)
+              (setq claude-code--session-id (plist-get state :session-id)))
             (claude-code--schedule-render)))))
     ;; Re-activate the agents sidebar mode so its local keymap stays in sync
     ;; with `claude-code-agents-mode-map'.  The buffer may hold a stale

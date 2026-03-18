@@ -59,7 +59,7 @@ this table first to identify which file to read or edit.
 | `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`) | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
 | `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
 | `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
-| `claude-code-test.el` | ERT test suite (149 tests).  Run with `make test`. | `claude-code` |
+| `claude-code-test.el` | ERT test suite (151 tests).  Run with `make test`. | `claude-code` |
 | `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
 
 ### Module dependency graph
@@ -224,12 +224,17 @@ the queued message.
 
 #### Reset and New Sessions
 
-The buffer header displays two clickable action buttons:
+The buffer header displays clickable action buttons:
 
 ```
-  [Reset]  [New Session]
+  [Cancel]  [Reset]  [New Session]
 ```
 
+`[Cancel]` only appears while the agent is working.
+
+- **`[Cancel]`** — cancels the running query (equivalent to `c`).  The
+  conversation history is preserved; the queued message (if any) stays in the
+  input area for editing.
 - **`[Reset]`** — hard-resets the current conversation: clears all messages
   *and* restarts the backend process, giving you a blank slate.  Prompts for
   confirmation.  Also available as `W` in the `?` menu or the `/reset` slash
@@ -557,7 +562,7 @@ state — look for `process: nil` or `status: stopped`.
 Claude Code  [working]  ~/projects/myapp
   default model  bypassPermissions
 ──────────────────────────────────────────────────────────────────────────
-  [Reset]  [New Session]
+  [Reset]  [New Session]   (+ [Cancel] while working)
 ▶ You  [fork]
   Explain the auth module
 
@@ -577,7 +582,7 @@ Claude Code  [working]  ~/projects/myapp
 > your prompt here
 ```
 
-- **Header buttons** — `[Reset]` and `[New Session]` are clickable; click or press `RET` to activate
+- **Header buttons** — `[Cancel]` (while working), `[Reset]`, and `[New Session]` are clickable; click or press `RET` to activate
 - **`[fork]` button** — appears on every `▶ You` heading; forks the conversation at that message
 - **Thinking blocks** — collapsed by default, toggle with `TAB`
 - **Tool-use blocks** — collapsed, heading shows tool name + summary (file path, grep pattern, etc.)
@@ -713,7 +718,7 @@ make test                  # just the ERT tests
 Inside Emacs:
 
 ```
-M-x claude-code-reload     ;; reload source, restart backend, keep conversation
+M-x claude-code-reload     ;; reload source, keep conversation (preserves live backend)
 M-x claude-code-sync       ;; force uv sync after pulling new deps
 M-x claude-code-inspect    ;; show session state for debugging
 ```

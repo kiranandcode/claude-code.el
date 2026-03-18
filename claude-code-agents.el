@@ -51,7 +51,13 @@ Agent plist keys:
         (puthash parent-id
                  (plist-put parent :children
                             (delete id (plist-get parent :children)))
-                 claude-code--agents)))
+                 claude-code--agents)
+        ;; Re-render the parent session buffer so its Spawned Agents panel
+        ;; reflects the removal immediately.
+        (when-let ((parent-buf (plist-get parent :buffer)))
+          (when (buffer-live-p parent-buf)
+            (with-current-buffer parent-buf
+              (claude-code--schedule-render))))))
     (remhash id claude-code--agents)
     (run-hooks 'claude-code-agents-update-hook)))
 

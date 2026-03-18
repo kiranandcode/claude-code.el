@@ -926,6 +926,24 @@
         (call-interactively (key-binding " ")))
       (should (equal " " (buffer-substring-no-properties pos (point)))))))
 
+(ert-deftest claude-code-test-shift-space-scrolls-outside-input ()
+  "S-SPC in the conversation area should be bound to scroll, not undefined."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (goto-char (point-min))
+    (should (eq (key-binding (kbd "S-SPC")) 'claude-code-key-shift-space))))
+
+(ert-deftest claude-code-test-shift-space-self-inserts-in-input ()
+  "S-SPC in the input area should insert a space, not scroll the view.
+Regression: holding Shift while capitalising across a word must not
+trigger `scroll-down-command'."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (goto-char (marker-position claude-code--input-marker))
+    (let ((pos (point)))
+      (call-interactively (key-binding (kbd "S-SPC")))
+      (should (equal " " (buffer-substring-no-properties pos (point)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Text utilities
 ;; ---------------------------------------------------------------------------
