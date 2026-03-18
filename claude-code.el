@@ -526,6 +526,15 @@ Agent plist keys:
   "Return non-nil if AGENT plist is a root (session) agent."
   (eq (plist-get agent :type) 'session))
 
+(defun claude-code--agent-unregister-self ()
+  "Unregister the agent for the current buffer.
+Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
+  (let ((key (or claude-code--session-key claude-code--cwd)))
+    (when key
+      (claude-code--agent-unregister key)
+      (when (eq (gethash claude-code--cwd claude-code--buffers) (current-buffer))
+        (remhash claude-code--cwd claude-code--buffers)))))
+
 (defun claude-code--agent-root-ids ()
   "Return a list of root agent IDs."
   (let (roots)
@@ -1194,6 +1203,7 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
 (defun claude-code--thinking-overlay-string ()
   "Build the spinner overlay string with live stats and queued-message indicator.
 Format: \\n  FRAME Working… (ELAPSED · ↓ CHARS · thought THINKs)\\n
+Followed by one line per queued message:  ⏳ [N] message…
 Character count is an approximation of output size; true token counts
 are only available in the final result event."
   (let* ((frame   (aref claude-code--thinking-frames
@@ -1220,11 +1230,14 @@ are only available in the final result event."
                        (mapconcat #'identity (nreverse parts) " · "))
              (format "\n  %s Working…\n" frame))))
       (if claude-code--input-queued
-          (concat stats-line
-                  (format "  ⏳ queued (%d): %s\n"
-                          (length claude-code--input-queued)
-                          (truncate-string-to-width
-                           (car claude-code--input-queued) 60 nil nil "…")))
+          (let ((queue-lines
+                 (cl-loop for msg in claude-code--input-queued
+                          for i from 1
+                          concat (format "  ⏳ [%d] %s\n"
+                                         i
+                                         (truncate-string-to-width
+                                          msg 60 nil nil "…")))))
+            (concat stats-line queue-lines))
         stats-line))))
 
 (defun claude-code--start-thinking ()
@@ -2015,18 +2028,36 @@ Activates when point is in the input area and the input starts with /."
   "Submit the text currently typed in the input area.
 If the agent is working, append the message to the FIFO queue and clear
 the input area so a new message can be typed.  Queued messages are sent
-in order as the agent becomes ready.  Press `c' to cancel the queue."
+in order as the agent becomes ready.  Press `c' to cancel the queue.
+
+When navigating the queue with \\[claude-code-previous-input], pressing
+RET updates the displayed queue slot in-place and returns to fresh
+input — it does not enqueue a second copy of the message."
   (interactive)
   (when claude-code--input-marker
     (let ((text (string-trim
                  (buffer-substring-no-properties
                   claude-code--input-marker (point-max)))))
-      (unless (string-empty-p text)
+      (cond
+       ;; In queue-edit mode: update the slot in-place, exit navigation.
+       ;; Do NOT re-enqueue or dispatch — the edited message will be sent
+       ;; in its original turn when the agent becomes ready.
+       (claude-code--queue-edit-index
+        (unless (string-empty-p text)
+          (setf (nth claude-code--queue-edit-index claude-code--input-queued)
+                text))
+        (setq claude-code--queue-edit-index nil
+              claude-code--input-history-index -1
+              claude-code--input-history-saved nil)
+        (let ((inhibit-read-only t))
+          (delete-region claude-code--input-marker (point-max)))
+        (claude-code--update-thinking-overlay))
+       ;; Normal mode: submit as a new message.
+       ((not (string-empty-p text))
         ;; Record in per-buffer history and reset navigation state.
         (push text claude-code--input-history)
         (setq claude-code--input-history-index -1
-              claude-code--input-history-saved nil
-              claude-code--queue-edit-index nil)
+              claude-code--input-history-saved nil)
         (if (eq claude-code--status 'working)
             ;; Queue: append to FIFO list and clear input area.
             (progn
@@ -2038,7 +2069,7 @@ in order as the agent becomes ready.  Press `c' to cancel the queue."
           ;; Ready: clear input area and dispatch.
           (let ((inhibit-read-only t))
             (delete-region claude-code--input-marker (point-max)))
-          (claude-code--dispatch-input text))))))
+          (claude-code--dispatch-input text)))))))
 
 (defun claude-code-focus-input ()
   "Move point to the end of the input area, ready to type."
@@ -2053,9 +2084,10 @@ in order as the agent becomes ready.  Press `c' to cancel the queue."
   (goto-char (point-max)))
 
 (defun claude-code--nav-current-input ()
-  "Return the current text in the input area as a trimmed string."
+  "Return the current text in the input area, trimmed."
   (when claude-code--input-marker
-    (buffer-substring-no-properties claude-code--input-marker (point-max))))
+    (string-trim
+     (buffer-substring-no-properties claude-code--input-marker (point-max)))))
 
 (defun claude-code--nav-save-queue-edit ()
   "Write the current input text back to the queue slot being navigated."
@@ -2319,7 +2351,11 @@ Outside the input area, toggle the magit section at point."
   ;; Slash-command completion via CAPF (company picks this up automatically
   ;; via company-capf when company-mode is active in the session).
   (add-hook 'completion-at-point-functions
-            #'claude-code--slash-command-capf nil t))
+            #'claude-code--slash-command-capf nil t)
+  ;; Unregister the agent automatically when the buffer is killed via any
+  ;; path (C-x k, kill-buffer, etc.) — not just via `claude-code-kill'.
+  (add-hook 'kill-buffer-hook
+            #'claude-code--agent-unregister-self nil t))
 
 ;;;; Entry Points
 
@@ -2514,10 +2550,18 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
             (insert "\n")
             (insert (propertize (make-string 38 ?─) 'face 'claude-code-separator))
             (insert "\n\n")
-            (let ((roots (claude-code--agent-root-ids)))
-              (if (null roots)
+            (let ((live-roots
+                   ;; Omit root agents whose buffers have since been killed
+                   ;; without going through `claude-code-kill'.
+                   (seq-filter
+                    (lambda (id)
+                      (when-let ((a (gethash id claude-code--agents)))
+                        (let ((buf (plist-get a :buffer)))
+                          (or (null buf) (buffer-live-p buf)))))
+                    (claude-code--agent-root-ids))))
+              (if (null live-roots)
                   (insert (propertize "  No active sessions\n" 'face 'shadow))
-                (dolist (root-id roots)
+                (dolist (root-id live-roots)
                   (claude-code--agents-render-root root-id)))))
           (goto-char (min old-point (point-max))))))))
 
@@ -2582,6 +2626,7 @@ IS-LAST is non-nil if this is the last sibling."
   :doc "Keymap for the Claude agent sidebar."
   :parent magit-section-mode-map
   "RET" #'claude-code-agents-goto
+  "k"   #'claude-code-agents-kill-at-point
   "q"   #'claude-code-agents-quit
   "g"   #'claude-code-agents-refresh)
 
@@ -2607,8 +2652,14 @@ IS-LAST is non-nil if this is the last sibling."
                       (when-let ((parent (gethash (plist-get agent :parent-id)
                                                   claude-code--agents)))
                         (plist-get parent :buffer)))))
-          (when (and buf (buffer-live-p buf))
-            (pop-to-buffer buf)))))))
+          (if (and buf (buffer-live-p buf))
+              (pop-to-buffer buf)
+            ;; Buffer is gone — offer to remove the stale entry.
+            (when (yes-or-no-p
+                   (format "Buffer for \"%s\" no longer exists. Remove it from the panel? "
+                           (or (plist-get agent :description) agent-id)))
+              (claude-code--agent-unregister
+               (if is-root agent-id (plist-get agent :parent-id))))))))))
 
 (defun claude-code-agents-quit ()
   "Close the agent sidebar window."

@@ -77,7 +77,8 @@ installation instructions instead of producing cryptic JSON parse failures.
    :repo "kiranandcode/claude-code.el"
    :files ("claude-code.el" "python"))
   :commands (claude-code claude-code-quick claude-code-menu
-             claude-code-send-region claude-code-reload)
+             claude-code-send-region claude-code-reload
+             claude-code-git-graph)
   :bind
   (("C-c l"     . claude-code)
    ("C-c L"     . claude-code-menu)
@@ -260,6 +261,58 @@ Claude Agents
 - Press `g` to refresh, `q` to close
 
 The sidebar auto-updates as agents start, make progress, and complete.
+
+### Git Graph
+
+`M-x claude-code-git-graph` opens a read-only buffer showing a visual summary
+of a git repository's history — useful for getting a quick sense of a project
+before diving in:
+
+```
+  ██ myapp  ·  branch: main  ·  1 234 commits total
+
+  Contribution Activity — last 52 weeks
+
+        Jan         Feb         Mar     …
+  Su  ░░░░░░██░██░░░███░░░░░░░░░░██████
+  Mo  ░░░░░░██░██░░░███░░░░░░░░░░██████
+  Tu  ░░░░░░██░██░░░███░░░░░░░░░░██████
+  …
+
+  Less ░▒▓█ More
+
+  Top Contributors
+
+  Alice Johnson          ████████████████████ 412
+  Bob Smith              ██████████░░░░░░░░░░ 201
+  …
+
+  Recent Commits
+
+  a1b2c3d  2 hours ago   (main) Fix login redirect — Alice Johnson
+  d4e5f6a  yesterday     Add password reset flow — Bob Smith
+  …
+```
+
+The buffer shows:
+
+- **Contribution heatmap** — 52-week commit activity grid (Sun–Sat rows,
+  one column per week), colour-coded by commit density
+- **Top contributors** — bar chart of the top 10 authors by all-time commit count
+- **Recent commits** — last 20 commits with short SHA, relative date, branch/tag
+  refs, message, and author
+
+| Key | Action |
+|-----|--------|
+| `g` | Refresh |
+| `q` | Close |
+| `n` / `p` | Move down / up |
+
+You can call it from anywhere — it is not tied to a Claude session:
+
+```
+M-x claude-code-git-graph      ;; prompts for repo directory
+```
 
 ## Configuration
 

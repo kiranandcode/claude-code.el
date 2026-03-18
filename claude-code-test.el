@@ -593,7 +593,6 @@
           claude-code--thinking-block-start-time nil
           claude-code--input-queued (list "my queued message"))
     (let ((s (claude-code--thinking-overlay-string)))
-      (should (string-match-p "queued" s))
       (should (string-match-p "my queued message" s)))))
 
 (ert-deftest claude-code-test-thinking-overlay-queued-truncated ()
@@ -605,11 +604,10 @@
           claude-code--thinking-block-start-time nil
           claude-code--input-queued (list (make-string 80 ?x)))
     (let ((s (claude-code--thinking-overlay-string)))
-      (should (string-match-p "queued" s))
       (should (not (string-match-p (make-string 80 ?x) s))))))
 
 (ert-deftest claude-code-test-thinking-overlay-queued-multiple ()
-  "Overlay should show queue count and first message when multiple are queued."
+  "Overlay should show all queued messages when multiple are queued."
   (claude-code-test-with-buffer
     (setq claude-code--query-start-time nil
           claude-code--streaming-char-count 0
@@ -617,10 +615,12 @@
           claude-code--thinking-block-start-time nil
           claude-code--input-queued (list "first" "second" "third"))
     (let ((s (claude-code--thinking-overlay-string)))
-      (should (string-match-p "queued" s))
-      (should (string-match-p "3" s))
+      (should (string-match-p "\\[1\\]" s))
       (should (string-match-p "first" s))
-      (should (not (string-match-p "second" s))))))
+      (should (string-match-p "\\[2\\]" s))
+      (should (string-match-p "second" s))
+      (should (string-match-p "\\[3\\]" s))
+      (should (string-match-p "third" s)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Streaming char count
@@ -1341,6 +1341,315 @@ The input area is rendered and status is `working'."
     (should (null claude-code--queue-edit-index))
     (should (= 0 claude-code--input-history-index))
     (should (equal "hist1" (claude-code-test--input-text)))))
+
+;; ---------------------------------------------------------------------------
+;; Queue editing — RET in queue-edit mode
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-ret-in-queue-edit-updates-slot-in-place ()
+  "RET in queue-edit mode should update the slot in-place, not append a copy."
+  (claude-code-test-with-working-queue (list "first" "second")
+    ;; Navigate to "second" (newest queued, index 1)
+    (claude-code-previous-input)
+    (should (= 1 claude-code--queue-edit-index))
+    ;; Edit the visible queued message
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max))
+      (insert "second EDITED"))
+    ;; Press RET — should update the slot, not append another message
+    (claude-code-submit-input)
+    (should (equal (list "first" "second EDITED") claude-code--input-queued))
+    ;; Should have exited queue-edit mode
+    (should (null claude-code--queue-edit-index))
+    ;; Input area should be empty after the edit is committed
+    (should (string-empty-p
+             (string-trim
+              (buffer-substring-no-properties
+               claude-code--input-marker (point-max)))))))
+
+(ert-deftest claude-code-test-ret-in-queue-edit-empty-preserves-slot ()
+  "RET in queue-edit mode with an empty input should leave the slot unchanged."
+  (claude-code-test-with-working-queue (list "first" "second")
+    (claude-code-previous-input)              ; navigate to "second"
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max)))  ; clear
+    (claude-code-submit-input)
+    ;; Queue must be unchanged — no deletion, no update
+    (should (equal (list "first" "second") claude-code--input-queued))
+    (should (null claude-code--queue-edit-index))))
+
+(ert-deftest claude-code-test-ret-in-queue-edit-does-not-add-to-history ()
+  "RET in queue-edit mode should NOT push the message onto input history."
+  (claude-code-test-with-working-queue (list "to-edit")
+    (let ((orig-len (length claude-code--input-history)))
+      (claude-code-previous-input)
+      (let ((inhibit-read-only t))
+        (delete-region claude-code--input-marker (point-max))
+        (insert "to-edit MODIFIED"))
+      (claude-code-submit-input)
+      ;; History must not have grown
+      (should (= orig-len (length claude-code--input-history))))))
+
+(ert-deftest claude-code-test-ret-in-queue-edit-first-slot ()
+  "RET in queue-edit mode on the oldest queued slot should update it correctly."
+  (claude-code-test-with-working-queue (list "first" "second" "third")
+    ;; Navigate to "third" → "second" → "first"
+    (claude-code-previous-input)
+    (claude-code-previous-input)
+    (claude-code-previous-input)
+    (should (= 0 claude-code--queue-edit-index))
+    (should (equal "first" (claude-code-test--input-text)))
+    ;; Edit and commit via RET
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max))
+      (insert "first EDITED"))
+    (claude-code-submit-input)
+    (should (equal "first EDITED" (nth 0 claude-code--input-queued)))
+    ;; Other slots untouched
+    (should (equal "second" (nth 1 claude-code--input-queued)))
+    (should (equal "third"  (nth 2 claude-code--input-queued)))))
+
+;; ---------------------------------------------------------------------------
+;; Queue editing — nav-current-input trimming
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-nav-current-input-trims ()
+  "`claude-code--nav-current-input' should return text with whitespace trimmed."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    (let ((inhibit-read-only t))
+      (goto-char (marker-position claude-code--input-marker))
+      (insert "  hello world  "))
+    (should (equal "hello world" (claude-code--nav-current-input)))))
+
+(ert-deftest claude-code-test-queue-edit-save-via-nav-trims-whitespace ()
+  "Saving a queue slot via M-p navigation should store trimmed content."
+  (claude-code-test-with-working-queue (list "first" "second")
+    (claude-code-previous-input)            ; navigate to "second" (index 1)
+    (let ((inhibit-read-only t))
+      (delete-region claude-code--input-marker (point-max))
+      (insert "  second EDITED  "))         ; extra surrounding whitespace
+    (claude-code-previous-input)            ; M-p saves the slot and shows "first"
+    ;; Saved slot must be trimmed
+    (should (equal "second EDITED" (nth 1 claude-code--input-queued)))))
+
+;; ---------------------------------------------------------------------------
+;; Agent panel — kill-buffer-hook auto-cleanup
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-kill-buffer-hook-installed ()
+  "claude-code-mode should add `claude-code--agent-unregister-self' to kill-buffer-hook."
+  (let ((buf (generate-new-buffer " *claude-hook-test*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (claude-code-mode)
+          (should (memq #'claude-code--agent-unregister-self kill-buffer-hook)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
+
+(ert-deftest claude-code-test-kill-buffer-unregisters-agent ()
+  "Killing a claude-code buffer should automatically remove its agent from the registry."
+  (claude-code-test-with-clean-agents
+    (let ((buf (generate-new-buffer " *claude-kill-test*")))
+      (with-current-buffer buf
+        (claude-code-mode)
+        (setq claude-code--cwd "/tmp/test-kill"
+              claude-code--session-key "/tmp/test-kill")
+        (claude-code--agent-register "/tmp/test-kill"
+          :type 'session :status 'ready :buffer buf :children nil))
+      ;; Confirm registration
+      (should (gethash "/tmp/test-kill" claude-code--agents))
+      ;; Killing the buffer should fire the hook and clean up the registry
+      (kill-buffer buf)
+      (should (null (gethash "/tmp/test-kill" claude-code--agents))))))
+
+(ert-deftest claude-code-test-kill-buffer-removes-from-buffers-hash ()
+  "Killing a primary-session buffer should remove it from `claude-code--buffers'."
+  (claude-code-test-with-clean-agents
+    (let ((saved-buffers claude-code--buffers)
+          (buf (generate-new-buffer " *claude-bufhash-test*")))
+      (unwind-protect
+          (progn
+            (setq claude-code--buffers (make-hash-table :test 'equal))
+            (with-current-buffer buf
+              (claude-code-mode)
+              (setq claude-code--cwd "/tmp/test-bufhash"
+                    claude-code--session-key "/tmp/test-bufhash")
+              (puthash "/tmp/test-bufhash" buf claude-code--buffers)
+              (claude-code--agent-register "/tmp/test-bufhash"
+                :type 'session :status 'ready :buffer buf :children nil))
+            (should (eq buf (gethash "/tmp/test-bufhash" claude-code--buffers)))
+            (kill-buffer buf)
+            (should (null (gethash "/tmp/test-bufhash" claude-code--buffers))))
+        (setq claude-code--buffers saved-buffers)))))
+
+;; ---------------------------------------------------------------------------
+;; Agent panel — sidebar filters dead-buffer agents
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-sidebar-omits-dead-buffer-agents ()
+  "Sidebar render should silently skip agents whose session buffer has been killed."
+  (claude-code-test-with-clean-agents
+    (let ((dead-buf (generate-new-buffer " *claude-dead-session*")))
+      (kill-buffer dead-buf)
+      ;; Agent with a dead buffer — should be excluded from the render
+      (claude-code--agent-register "/tmp/dead-proj"
+        :type 'session :description "dead session" :status 'stopped
+        :buffer dead-buf :children nil)
+      ;; Agent with no buffer at all — should still appear (no buf = untracked)
+      (claude-code--agent-register "/tmp/no-buf-proj"
+        :type 'session :description "no-buf session" :status 'ready
+        :buffer nil :children nil)
+      (let ((sidebar (get-buffer-create "*Claude Agents*")))
+        (unwind-protect
+            (progn
+              (with-current-buffer sidebar
+                (claude-code-agents-mode))
+              (claude-code--agents-do-render)
+              (with-current-buffer sidebar
+                (let ((text (buffer-substring-no-properties
+                             (point-min) (point-max))))
+                  (should (not (string-match-p "dead session" text)))
+                  (should (string-match-p "no-buf session" text)))))
+          (kill-buffer sidebar))))))
+
+(ert-deftest claude-code-test-sidebar-shows-live-buffer-agents ()
+  "Sidebar render should include agents whose session buffer is still alive."
+  (claude-code-test-with-clean-agents
+    (let ((live-buf (generate-new-buffer " *claude-live-session*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/live-proj"
+              :type 'session :description "live session" :status 'working
+              :buffer live-buf :children nil)
+            (let ((sidebar (get-buffer-create "*Claude Agents*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar
+                      (claude-code-agents-mode))
+                    (claude-code--agents-do-render)
+                    (with-current-buffer sidebar
+                      (let ((text (buffer-substring-no-properties
+                                   (point-min) (point-max))))
+                        (should (string-match-p "live session" text)))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p live-buf)
+          (kill-buffer live-buf))))))
+
+;; ---------------------------------------------------------------------------
+;; Agent panel — k keybinding
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-agents-k-bound ()
+  "`k' should be bound to `claude-code-agents-kill-at-point' in the agents keymap."
+  (should (eq #'claude-code-agents-kill-at-point
+              (lookup-key claude-code-agents-mode-map (kbd "k")))))
+
+;; ---------------------------------------------------------------------------
+;; Agent panel — kill-at-point
+;; ---------------------------------------------------------------------------
+
+(defun claude-code-test--make-mock-section (agent-id)
+  "Return a minimal magit-section mock whose value is AGENT-ID."
+  (let ((sec (make-instance 'magit-section)))
+    (oset sec value agent-id)
+    sec))
+
+(ert-deftest claude-code-test-kill-at-point-confirmed-removes-agent ()
+  "`k' confirmed on a session agent should unregister it."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer " *claude-kap-test*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/kap-proj"
+              :type 'session :status 'ready
+              :description "kap proj" :buffer session-buf :children nil)
+            (should (gethash "/tmp/kap-proj" claude-code--agents))
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda ()
+                         (claude-code-test--make-mock-section "/tmp/kap-proj")))
+                      ((symbol-function 'yes-or-no-p) (lambda (_) t))
+                      ;; Stub out claude-code-kill: just unregister, no process
+                      ((symbol-function 'claude-code-kill)
+                       (lambda ()
+                         (claude-code--agent-unregister
+                          (or claude-code--session-key claude-code--cwd)))))
+              (with-current-buffer session-buf
+                (claude-code-mode)
+                (setq claude-code--cwd "/tmp/kap-proj"
+                      claude-code--session-key "/tmp/kap-proj")
+                (claude-code-agents-kill-at-point)))
+            (should (null (gethash "/tmp/kap-proj" claude-code--agents))))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))))))
+
+(ert-deftest claude-code-test-kill-at-point-denied-preserves-agent ()
+  "`k' cancelled should leave the agent in the registry."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer " *claude-kap-deny*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/kap-deny"
+              :type 'session :status 'ready
+              :description "kap deny" :buffer session-buf :children nil)
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda ()
+                         (claude-code-test--make-mock-section "/tmp/kap-deny")))
+                      ((symbol-function 'yes-or-no-p) (lambda (_) nil)))
+              (claude-code-agents-kill-at-point))
+            (should (gethash "/tmp/kap-deny" claude-code--agents)))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))))))
+
+;; ---------------------------------------------------------------------------
+;; Agent panel — goto with dead buffer
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-agents-goto-dead-buffer-prompts-and-removes ()
+  "RET on an agent with a dead buffer, confirmed, should unregister the agent."
+  (claude-code-test-with-clean-agents
+    (let ((dead-buf (generate-new-buffer " *claude-goto-dead*")))
+      (kill-buffer dead-buf)
+      (claude-code--agent-register "/tmp/goto-dead"
+        :type 'session :status 'stopped
+        :description "gone session" :buffer dead-buf :children nil)
+      (cl-letf (((symbol-function 'magit-current-section)
+                 (lambda ()
+                   (claude-code-test--make-mock-section "/tmp/goto-dead")))
+                ((symbol-function 'yes-or-no-p) (lambda (_) t)))
+        (claude-code-agents-goto))
+      (should (null (gethash "/tmp/goto-dead" claude-code--agents))))))
+
+(ert-deftest claude-code-test-agents-goto-dead-buffer-cancelled-preserves ()
+  "RET on an agent with a dead buffer, cancelled, should leave the agent in the registry."
+  (claude-code-test-with-clean-agents
+    (let ((dead-buf (generate-new-buffer " *claude-goto-dead-cancel*")))
+      (kill-buffer dead-buf)
+      (claude-code--agent-register "/tmp/goto-dead-cancel"
+        :type 'session :status 'stopped
+        :description "gone cancel" :buffer dead-buf :children nil)
+      (cl-letf (((symbol-function 'magit-current-section)
+                 (lambda ()
+                   (claude-code-test--make-mock-section "/tmp/goto-dead-cancel")))
+                ((symbol-function 'yes-or-no-p) (lambda (_) nil)))
+        (claude-code-agents-goto))
+      (should (gethash "/tmp/goto-dead-cancel" claude-code--agents)))))
+
+(ert-deftest claude-code-test-agents-goto-live-buffer-switches ()
+  "RET on an agent with a live buffer should switch to that buffer."
+  (claude-code-test-with-clean-agents
+    (let ((live-buf (generate-new-buffer " *claude-goto-live*"))
+          (switched-to nil))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/goto-live"
+              :type 'session :status 'working
+              :description "live session" :buffer live-buf :children nil)
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda ()
+                         (claude-code-test--make-mock-section "/tmp/goto-live")))
+                      ((symbol-function 'pop-to-buffer)
+                       (lambda (buf) (setq switched-to buf))))
+              (claude-code-agents-goto))
+            (should (eq live-buf switched-to)))
+        (when (buffer-live-p live-buf) (kill-buffer live-buf))))))
 
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here
