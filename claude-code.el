@@ -848,10 +848,10 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
                                 (marker-position claude-code--input-marker))))
          (at-end (or was-in-input (>= (point) (point-max))))
          (old-point (point)))
-    ;; Remove old thinking overlay
-    (when claude-code--thinking-overlay
-      (delete-overlay claude-code--thinking-overlay)
-      (setq claude-code--thinking-overlay nil))
+    ;; Remove all thinking overlays (including any orphaned ones from previous
+    ;; renders that may have escaped cleanup via the tracked variable).
+    (remove-overlays (point-min) (point-max) 'claude-code-spinner t)
+    (setq claude-code--thinking-overlay nil)
     (let ((inhibit-read-only t))
       (erase-buffer)
       (magit-insert-section (root)
@@ -868,6 +868,7 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
           (overlay-put ov 'after-string
                        (propertize (claude-code--thinking-overlay-string)
                                    'face 'claude-code-thinking))
+          (overlay-put ov 'claude-code-spinner t)
           (setq claude-code--thinking-overlay ov)))
       ;; Insert the input area at the bottom
       (insert "\n")
@@ -890,10 +891,10 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
         (add-text-properties (point-min) boundary
                              '(read-only t))
         ;; Make the boundary rear-nonsticky so typed text after "> "
-        ;; does not inherit read-only.
+        ;; does not inherit read-only or the input-prompt face color.
         (when (> boundary (point-min))
           (put-text-property (1- boundary) boundary
-                             'rear-nonsticky '(read-only)))))
+                             'rear-nonsticky '(read-only face)))))
     ;; Restore point
     (if at-end
         (goto-char (point-max))
@@ -1175,9 +1176,9 @@ are only available in the final result event."
   (when claude-code--thinking-timer
     (cancel-timer claude-code--thinking-timer)
     (setq claude-code--thinking-timer nil))
-  (when claude-code--thinking-overlay
-    (delete-overlay claude-code--thinking-overlay)
-    (setq claude-code--thinking-overlay nil)))
+  ;; Remove all spinner overlays, including any orphaned ones.
+  (remove-overlays (point-min) (point-max) 'claude-code-spinner t)
+  (setq claude-code--thinking-overlay nil))
 
 (defun claude-code--update-thinking-overlay ()
   "Update the thinking spinner overlay text."
