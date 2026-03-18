@@ -1073,42 +1073,55 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
              (buf (gethash dir claude-code--buffers)))
         (when (and buf (buffer-live-p buf))
           (with-current-buffer buf
-            ;; Re-activate the mode (picks up new keymap, render fns, etc.)
-            (claude-code-mode)
-            (setq claude-code--cwd dir)
-            ;; Restore conversation state (except session-id — see below)
-            (setq claude-code--messages (plist-get state :messages)
-                  claude-code--session-overrides (plist-get state :session-overrides)
-                  claude-code--streaming-text (plist-get state :streaming-text)
-                  claude-code--streaming-thinking (plist-get state :streaming-thinking)
-                  claude-code--streaming-active (plist-get state :streaming-active)
-                  claude-code--input-queued (plist-get state :input-queued)
-                  claude-code--input-history (plist-get state :input-history))
-            ;; Stash typed input so the next render restores it into the input area
-            (let ((input-text (plist-get state :input-text)))
-              (when (and input-text (not (string-empty-p input-text)))
-                (setq claude-code--pending-input input-text)))
-            ;; Re-register as root agent, preserving task children so the
-            ;; sidebar retains the subagent tree across the reload.
-            (claude-code--agent-register
-             dir
-             :type 'session
-             :description (abbreviate-file-name dir)
-             :status (if (plist-get state :keep-process) 'working 'starting)
-             :buffer buf
-             :cwd dir
-             :children (plist-get state :agent-children))
-            ;; For sessions that were mid-execution, restore the existing process
-            ;; reference (killed by kill-all-local-variables inside claude-code-mode)
-            ;; and leave them running.  For idle sessions, start a fresh backend.
-            (if (plist-get state :keep-process)
-                (progn
-                  (setq claude-code--process (plist-get state :saved-process))
-                  (setq claude-code--status 'working)
-                  (setq claude-code--session-id (plist-get state :session-id)))
+            (cond
+             ((plist-get state :keep-process)
+              ;; Session has a live backend process (e.g. the agent that called
+              ;; reload is mid-tool-execution).  Do NOT call (claude-code-mode)
+              ;; here — that would invoke kill-all-local-variables and wipe
+              ;; claude-code--process, claude-code--session-id, and all other
+              ;; buffer-locals we need to preserve.  Instead just refresh the
+              ;; keymap in-place so new bindings take effect.
+              (use-local-map claude-code-mode-map)
+              ;; Re-register in the agent table (status stays working).
+              (claude-code--agent-register
+               dir
+               :type 'session
+               :description (abbreviate-file-name dir)
+               :status 'working
+               :buffer buf
+               :cwd dir
+               :children (plist-get state :agent-children))
+              (claude-code--schedule-render))
+             (t
+              ;; Idle session — full mode re-activation + fresh process.
+              (claude-code-mode)
+              (setq claude-code--cwd dir)
+              ;; Restore conversation state (except session-id — see below)
+              (setq claude-code--messages (plist-get state :messages)
+                    claude-code--session-overrides (plist-get state :session-overrides)
+                    claude-code--streaming-text (plist-get state :streaming-text)
+                    claude-code--streaming-thinking (plist-get state :streaming-thinking)
+                    claude-code--streaming-active (plist-get state :streaming-active)
+                    claude-code--input-queued (plist-get state :input-queued)
+                    claude-code--input-history (plist-get state :input-history))
+              ;; Stash typed input so the next render restores it into the input area
+              (let ((input-text (plist-get state :input-text)))
+                (when (and input-text (not (string-empty-p input-text)))
+                  (setq claude-code--pending-input input-text)))
+              ;; Re-register as root agent, preserving task children.
+              (claude-code--agent-register
+               dir
+               :type 'session
+               :description (abbreviate-file-name dir)
+               :status 'starting
+               :buffer buf
+               :cwd dir
+               :children (plist-get state :agent-children))
+              ;; Start a fresh backend, then restore the session ID so the SDK
+              ;; can resume the conversation.
               (claude-code--start-process)
-              (setq claude-code--session-id (plist-get state :session-id)))
-            (claude-code--schedule-render)))))
+              (setq claude-code--session-id (plist-get state :session-id))
+              (claude-code--schedule-render)))))))
     ;; Re-activate the agents sidebar mode so its local keymap stays in sync
     ;; with `claude-code-agents-mode-map'.  The buffer may hold a stale
     ;; reference to an older keymap object if the variable was ever replaced.

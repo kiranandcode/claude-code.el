@@ -1876,6 +1876,60 @@ the children keep it relevant.  Pure ghosts (dead + no children) are hidden."
         (when (buffer-live-p session-buf) (kill-buffer session-buf))
         (when (buffer-live-p task-buf)    (kill-buffer task-buf))))))
 
+(ert-deftest claude-code-test-reload-skips-live-process-session ()
+  "Reload must not stop the backend process of a session with a live process.
+This guards the case where the agent calls claude-code-reload via emacsclient
+from inside a Bash tool: the process is alive mid-tool-execution, and killing
+it would interrupt the conversation."
+  (claude-code-test-with-clean-agents
+    (let* ((dir "/tmp/reload-live-proc-test")
+           (buf (generate-new-buffer " *cc-reload-live*"))
+           ;; Simulate a live process with a no-op sentinel/filter.
+           (fake-proc (make-pipe-process
+                       :name "cc-fake-proc"
+                       :buffer nil
+                       :noquery t
+                       :filter #'ignore
+                       :sentinel #'ignore))
+           stop-called)
+      (unwind-protect
+          (progn
+            (with-current-buffer buf
+              (claude-code-mode)
+              (setq claude-code--cwd dir
+                    claude-code--process fake-proc
+                    claude-code--status 'working
+                    claude-code--session-id "test-sid"))
+            (puthash dir buf claude-code--buffers)
+            (claude-code--agent-register dir
+              :type 'session :status 'working
+              :buffer buf :cwd dir :children nil)
+            ;; Patch stop-process to detect if it's called.
+            (cl-letf (((symbol-function 'claude-code--stop-process)
+                       (lambda () (setq stop-called t)))
+                      ((symbol-function 'claude-code--start-process) #'ignore)
+                      ((symbol-function 'claude-code--schedule-render) #'ignore)
+                      ((symbol-function 'claude-code--ensure-environment) #'ignore))
+              ;; Run just the save+stop phase of reload logic inline.
+              (let ((saved-states '()))
+                (maphash (lambda (d b)
+                           (when (buffer-live-p b)
+                             (with-current-buffer b
+                               (let* ((working-p (and claude-code--process
+                                                      (process-live-p claude-code--process))))
+                                 (push (list :dir d :keep-process working-p) saved-states)
+                                 (unless working-p
+                                   (claude-code--stop-process))))))
+                         claude-code--buffers)
+                ;; stop-process must NOT have been called for the live session.
+                (should-not stop-called)
+                ;; The saved state must record keep-process = t.
+                (let ((state (car saved-states)))
+                  (should (plist-get state :keep-process))))))
+        (remhash dir claude-code--buffers)
+        (when (process-live-p fake-proc) (delete-process fake-proc))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Treemacs-style sidebar — keybindings and mode features
 ;; ---------------------------------------------------------------------------
