@@ -199,6 +199,11 @@ Example:
   "Clickable action buttons (Reset, New Session, Fork) in the Claude buffer."
   :group 'claude-code)
 
+(defface claude-code-config-button
+  '((t :inherit (font-lock-variable-name-face button) :underline nil))
+  "Clickable config value buttons (model, effort, permission mode) in the header."
+  :group 'claude-code)
+
 ;;;; Internal State
 
 (defvar claude-code--package-dir nil

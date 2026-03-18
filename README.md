@@ -50,16 +50,16 @@ this table first to identify which file to read or edit.
 
 | File | Purpose | Depends on |
 |------|---------|-----------|
-| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`), and Emacs-native subagent state vars (`claude-code--subagent-task-id`, `claude-code--subagent-parent-key`, `claude-code--subagent-has-worked`, `claude-code-enable-native-subagents`) | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
+| `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`), and Emacs-native subagent state vars (`claude-code--subagent-task-id`, `claude-code--subagent-parent-key`, `claude-code--subagent-has-worked`, `claude-code-enable-native-subagents`).  Faces include `claude-code-config-button` (header config value buttons) and `claude-code-action-button` (header action buttons). | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
 | `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister/remove-child functions, parent–child tree helpers, the treemacs-style Agent Sidebar (`claude-code-agents-mode`), and per-task progress buffers (`claude-code-task-mode`).  Killing a subagent removes it from the parent's `:children` list and schedules a re-render of the parent session buffer. | `claude-code-vars`, `magit-section` |
 | `claude-code-process.el` | UV/Python environment setup (`claude-code--ensure-environment`), backend process lifecycle (`claude-code--start-process`, `--stop-process`, `--send-json`), and the process filter/sentinel that parse JSON-lines output | `claude-code-vars` |
 | `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` (always injects the current Emacs buffer name so the agent can self-reference) | `claude-code-vars` |
 | `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, Emacs-native subagent completion notifications (`claude-code--subagent-notify-parent`), and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
 | `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
-| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`).  `claude-code-reload` skips killing the backend process for sessions with a live process (e.g. the agent calling reload mid-tool-execution), updating only the keymap in-place via `use-local-map`. | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
+| `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters (`claude-code-set-model`, `claude-code-set-effort`, `claude-code-set-permission-mode`), project config persistence (`claude-code-save-project-config`), Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`).  `claude-code-reload` skips killing the backend process for sessions with a live process (e.g. the agent calling reload mid-tool-execution), updating only the keymap in-place via `use-local-map`. | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
 | `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
 | `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
-| `claude-code-test.el` | ERT test suite (152 tests).  Run with `make test`. | `claude-code` |
+| `claude-code-test.el` | ERT test suite (156 tests).  Run with `make test`. | `claude-code` |
 | `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
 
 ### Module dependency graph
@@ -434,8 +434,29 @@ M-x claude-code-git-graph      ;; prompts for repo directory
 
 ### Session Overrides
 
-Use the transient menu (`?`) to change model, effort, or permission mode
-for the current session without modifying your config.
+The header shows the active model, effort, and permission mode as **clickable
+buttons**.  Click any of them (or press `RET` on them) to change the value for
+the current session via `completing-read`:
+
+```
+model: [claude-sonnet-4-6]  effort: [none]  perms: [bypassPermissions]  [↓ Save as Project Default]
+```
+
+The same setters are available via the transient menu (`?` → Session):
+
+| Key | Command |
+|-----|---------|
+| `m` | Set model |
+| `e` | Set effort |
+| `p` | Set permission mode |
+| `P` | Save as project default |
+
+**Saving to project config:** clicking `[↓ Save as Project Default]` (or
+pressing `P` in the menu) calls `claude-code-save-project-config`, which:
+
+1. Reads the current effective model/effort/permission-mode.
+2. Upserts an entry for the session directory in `claude-code-project-config`.
+3. Persists the change via `customize-save-variable` so it survives Emacs restarts.
 
 ### Org-Roam Integration
 
@@ -560,7 +581,7 @@ state — look for `process: nil` or `status: stopped`.
 
 ```
 Claude Code  [working]  ~/projects/myapp
-  default model  bypassPermissions
+  model: [default]  effort: [none]  perms: [bypassPermissions]  [↓ Save as Project Default]
 ──────────────────────────────────────────────────────────────────────────
   [Reset]  [New Session]   (+ [Cancel] while working)
 ▶ You  [fork]
@@ -582,6 +603,8 @@ Claude Code  [working]  ~/projects/myapp
 > your prompt here
 ```
 
+- **Config buttons** — `[model]`, `[effort]`, and `[perms]` in the header are clickable; click to change the value for this session via `completing-read`
+- **`[↓ Save as Project Default]`** — persists the current model/effort/permission-mode to `claude-code-project-config` for this directory and saves to your Emacs custom file
 - **Header buttons** — `[Cancel]` (while working), `[Reset]`, and `[New Session]` are clickable; click or press `RET` to activate
 - **`[fork]` button** — appears on every `▶ You` heading; forks the conversation at that message
 - **Thinking blocks** — collapsed by default, toggle with `TAB`

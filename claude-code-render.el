@@ -103,16 +103,44 @@
               (propertize (abbreviate-file-name claude-code--cwd)
                           'face 'shadow)))
     (insert "\n")
-    ;; Show active config summary
+    ;; Show active config as clickable buttons
     (let ((model (alist-get 'model cfg))
           (effort (alist-get 'effort cfg))
           (mode (alist-get 'permission-mode cfg)))
-      (insert (propertize
-               (format "  %s%s  %s"
-                       (or model "default model")
-                       (if effort (format " [%s]" effort) "")
-                       (or mode ""))
-               'face 'shadow))
+      (insert "  ")
+      (insert (propertize "model:" 'face 'shadow))
+      (insert " ")
+      (insert-button (format "[%s]" (or model "default"))
+                     'action (lambda (_btn)
+                               (call-interactively #'claude-code-set-model))
+                     'help-echo "Click to change model (or press 'm' in menu)"
+                     'face 'claude-code-config-button
+                     'follow-link t)
+      (insert "  ")
+      (insert (propertize "effort:" 'face 'shadow))
+      (insert " ")
+      (insert-button (format "[%s]" (or effort "none"))
+                     'action (lambda (_btn)
+                               (call-interactively #'claude-code-set-effort))
+                     'help-echo "Click to change effort level (or press 'e' in menu)"
+                     'face 'claude-code-config-button
+                     'follow-link t)
+      (insert "  ")
+      (insert (propertize "perms:" 'face 'shadow))
+      (insert " ")
+      (insert-button (format "[%s]" (or mode "default"))
+                     'action (lambda (_btn)
+                               (call-interactively #'claude-code-set-permission-mode))
+                     'help-echo "Click to change permission mode (or press 'p' in menu)"
+                     'face 'claude-code-config-button
+                     'follow-link t)
+      (insert "  ")
+      (insert-button "[↓ Save as Project Default]"
+                     'action (lambda (_btn)
+                               (call-interactively #'claude-code-save-project-config))
+                     'help-echo "Save current model/effort/perms as project-level defaults"
+                     'face 'claude-code-action-button
+                     'follow-link t)
       (insert "\n"))
     (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
     (insert "\n")

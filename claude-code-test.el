@@ -2291,5 +2291,70 @@ register both in the agents registry, run BODY, then clean up both buffers."
           (should (equal "/tmp/test-project::fork-99"
                          (plist-get task :parent-id))))))))
 
+;; ---------------------------------------------------------------------------
+;; save-project-config
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-save-project-config-creates-entry ()
+  "`claude-code-save-project-config' adds a new entry for the current cwd."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'customize-save-variable) #'ignore)
+              ((symbol-function 'claude-code--schedule-render) #'ignore))
+      (let ((claude-code-project-config nil))
+        (setq claude-code--session-overrides
+              '((model . "claude-opus-4-6")
+                (permission-mode . "acceptEdits")))
+        (claude-code-save-project-config)
+        (let* ((dir (expand-file-name "/tmp/test-project"))
+               (entry (assoc dir claude-code-project-config)))
+          (should entry)
+          (should (equal "claude-opus-4-6"
+                         (alist-get 'model (cdr entry))))
+          (should (equal "acceptEdits"
+                         (alist-get 'permission-mode (cdr entry)))))))))
+
+(ert-deftest claude-code-test-save-project-config-updates-existing ()
+  "`claude-code-save-project-config' updates an existing project entry."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'customize-save-variable) #'ignore)
+              ((symbol-function 'claude-code--schedule-render) #'ignore))
+      (let* ((dir (expand-file-name "/tmp/test-project"))
+             (claude-code-project-config
+              (list (cons dir '((model . "claude-haiku-4-5"))))))
+        (setq claude-code--session-overrides
+              '((model . "claude-sonnet-4-6")))
+        (claude-code-save-project-config)
+        (let ((entry (assoc dir claude-code-project-config)))
+          (should entry)
+          (should (equal "claude-sonnet-4-6"
+                         (alist-get 'model (cdr entry))))
+          ;; should not have duplicated the directory
+          (should (= 1 (length claude-code-project-config))))))))
+
+(ert-deftest claude-code-test-save-project-config-calls-customize-save ()
+  "`claude-code-save-project-config' persists via `customize-save-variable'."
+  (claude-code-test-with-buffer
+    (let ((saved-calls nil))
+      (cl-letf (((symbol-function 'customize-save-variable)
+                 (lambda (sym val)
+                   (push (cons sym val) saved-calls)))
+                ((symbol-function 'claude-code--schedule-render) #'ignore))
+        (let ((claude-code-project-config nil))
+          (claude-code-save-project-config)
+          (should (= 1 (length saved-calls)))
+          (should (eq 'claude-code-project-config
+                      (caar saved-calls))))))))
+
+(ert-deftest claude-code-test-render-header-has-config-buttons ()
+  "The rendered header must contain clickable config buttons."
+  (claude-code-test-with-buffer
+    (cl-letf (((symbol-function 'claude-code--start-thinking) #'ignore))
+      (claude-code--render)
+      (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        (should (string-match-p "model:" text))
+        (should (string-match-p "effort:" text))
+        (should (string-match-p "perms:" text))
+        (should (string-match-p "Save as Project Default" text))))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

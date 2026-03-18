@@ -718,6 +718,23 @@ input.  Edits to queued slots are saved back before moving on."
         mode)
   (claude-code--schedule-render))
 
+(defun claude-code-save-project-config ()
+  "Save the current model/effort/permission-mode as project-level defaults.
+Updates `claude-code-project-config' for the session's working directory and
+persists the change via `customize-save-variable'."
+  (interactive)
+  (let* ((dir (expand-file-name (or claude-code--cwd default-directory)))
+         (cfg (claude-code--session-config))
+         (project-alist (list (cons 'model           (alist-get 'model cfg))
+                              (cons 'effort          (alist-get 'effort cfg))
+                              (cons 'permission-mode (alist-get 'permission-mode cfg)))))
+    (if-let ((entry (assoc dir claude-code-project-config)))
+        (setcdr entry project-alist)
+      (push (cons dir project-alist) claude-code-project-config))
+    (customize-save-variable 'claude-code-project-config claude-code-project-config)
+    (message "Saved project config for %s" (abbreviate-file-name dir))
+    (claude-code--schedule-render)))
+
 ;;;; Transient Menu
 
 (transient-define-prefix claude-code-menu ()
@@ -737,7 +754,8 @@ input.  Edits to queued slots are saved back before moving on."
   ["Session"
    ("m" "Set model" claude-code-set-model)
    ("e" "Set effort" claude-code-set-effort)
-   ("p" "Set permission mode" claude-code-set-permission-mode)]
+   ("p" "Set permission mode" claude-code-set-permission-mode)
+   ("P" "Save as project default" claude-code-save-project-config)]
   ["View"
    ("t" "Toggle thinking" claude-code-toggle-thinking)
    ("T" "Toggle tool details" claude-code-toggle-tool-details)
