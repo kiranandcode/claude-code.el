@@ -1487,30 +1487,42 @@ The input area is rendered and status is `working'."
 ;; ---------------------------------------------------------------------------
 
 (ert-deftest claude-code-test-sidebar-omits-dead-buffer-agents ()
-  "Sidebar render should silently skip agents whose session buffer has been killed."
+  "Sidebar skips ghost entries: dead/nil buffer with no children.
+A session with a dead buffer but live children is still shown because
+the children keep it relevant.  Pure ghosts (dead + no children) are hidden."
   (claude-code-test-with-clean-agents
-    (let ((dead-buf (generate-new-buffer " *claude-dead-session*")))
+    (let ((live-buf        (generate-new-buffer " *claude-live-omit*"))
+          (dead-buf        (generate-new-buffer " *claude-dead-omit*"))
+          (dead-child-buf  (generate-new-buffer " *claude-dead-child-omit*")))
       (kill-buffer dead-buf)
-      ;; Agent with a dead buffer — should be excluded from the render
-      (claude-code--agent-register "/tmp/dead-proj"
-        :type 'session :description "dead session" :status 'stopped
-        :buffer dead-buf :children nil)
-      ;; Agent with no buffer at all — should still appear (no buf = untracked)
-      (claude-code--agent-register "/tmp/no-buf-proj"
-        :type 'session :description "no-buf session" :status 'ready
-        :buffer nil :children nil)
-      (let ((sidebar (get-buffer-create "*Claude Agents*")))
-        (unwind-protect
-            (progn
-              (with-current-buffer sidebar
-                (claude-code-agents-mode))
-              (claude-code--agents-do-render)
-              (with-current-buffer sidebar
-                (let ((text (buffer-substring-no-properties
-                             (point-min) (point-max))))
-                  (should (not (string-match-p "dead session" text)))
-                  (should (string-match-p "no-buf session" text)))))
-          (kill-buffer sidebar))))))
+      (kill-buffer dead-child-buf)
+      (unwind-protect
+          (progn
+            ;; Dead buffer, no children → ghost, should be hidden
+            (claude-code--agent-register "/tmp/dead-proj"
+              :type 'session :description "dead session" :status 'stopped
+              :buffer dead-buf :children nil)
+            ;; Live buffer → should appear
+            (claude-code--agent-register "/tmp/live-proj"
+              :type 'session :description "live session" :status 'ready
+              :buffer live-buf :children nil)
+            ;; Dead buffer but has children → should appear
+            (claude-code--agent-register "/tmp/dead-child-proj"
+              :type 'session :description "dead-with-child" :status 'stopped
+              :buffer dead-child-buf :children '("some-task"))
+            (let ((sidebar (get-buffer-create "*Claude Agents*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar (claude-code-agents-mode))
+                    (claude-code--agents-do-render)
+                    (with-current-buffer sidebar
+                      (let ((text (buffer-substring-no-properties
+                                   (point-min) (point-max))))
+                        (should-not (string-match-p "dead session" text))
+                        (should     (string-match-p "live session" text))
+                        (should     (string-match-p "dead-with-child" text)))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p live-buf) (kill-buffer live-buf))))))
 
 (ert-deftest claude-code-test-sidebar-shows-live-buffer-agents ()
   "Sidebar render should include agents whose session buffer is still alive."

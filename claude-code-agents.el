@@ -66,8 +66,11 @@ Agent plist keys:
                claude-code--agents))))
 
 (defun claude-code--agent-root-p (agent)
-  "Return non-nil if AGENT plist is a root (session) agent."
-  (eq (plist-get agent :type) 'session))
+  "Return non-nil if AGENT plist is a root (top-level) agent.
+Sessions with a :parent-id are children of another session and are
+rendered nested under their parent, not as top-level roots."
+  (and (eq (plist-get agent :type) 'session)
+       (null (plist-get agent :parent-id))))
 
 (defun claude-code--agent-unregister-self ()
   "Unregister the agent for the current buffer.
@@ -352,7 +355,10 @@ For task agents, sends a cancel signal via the parent session."
       (when-let ((agent (gethash agent-id claude-code--agents)))
         (let* ((desc (or (plist-get agent :description) agent-id))
                (type (plist-get agent :type)))
-          (when (yes-or-no-p (format "Kill agent \"%s\"? " desc))
+          (when (yes-or-no-p
+                 (if (eq type 'task)
+                     (format "Cancel task \"%s\"? (cancels the whole parent session) " desc)
+                   (format "Kill session \"%s\"? " desc)))
             (pcase type
               ('session
                (when-let ((buf (plist-get agent :buffer)))
@@ -386,13 +392,27 @@ For task agents, sends a cancel signal via the parent session."
 
 (defvar-keymap claude-code-task-mode-map
   :doc "Keymap for Claude subagent task progress buffers."
-  "q" #'quit-window)
+  "q"       #'quit-window
+  "c"       #'claude-code-task-cancel
+  "C-c C-c" #'claude-code-task-cancel)
 
 (define-derived-mode claude-code-task-mode special-mode "Claude-Task"
   "Major mode for Claude subagent task progress buffers.
 \\{claude-code-task-mode-map}"
   :group 'claude-code
   (setq-local truncate-lines nil))
+
+(defun claude-code-task-cancel ()
+  "Cancel the parent session that spawned this task.
+Since tasks run inside a single SDK query, cancelling them cancels the
+whole parent session query — there is no per-task interrupt in the SDK."
+  (interactive)
+  (if (and claude-code--task-parent-buffer
+           (buffer-live-p claude-code--task-parent-buffer))
+      (with-current-buffer claude-code--task-parent-buffer
+        (claude-code-cancel)
+        (message "Cancelling parent session…"))
+    (message "Parent session buffer is gone — nothing to cancel")))
 
 (defun claude-code--task-buffer-create (task-id desc parent-buf)
   "Create and return a task progress buffer for TASK-ID with DESC.
@@ -411,8 +431,14 @@ PARENT-BUF is the parent session buffer."
         (insert "\n")
         (when desc
           (insert (propertize (format "  %s\n" desc) 'face 'bold)))
-        (insert (propertize "  ⠹ working…\n"
-                            'face 'claude-code-agent-status-working))
+        (insert (propertize "  ⠹ working…  " 'face 'claude-code-agent-status-working))
+        (insert-button "[Cancel]"
+                       'action (lambda (_btn)
+                                 (claude-code-task-cancel))
+                       'face 'warning
+                       'follow-link t
+                       'help-echo "Cancel the parent session")
+        (insert "\n")
         (insert (propertize (make-string 50 ?─) 'face 'claude-code-separator))
         (insert "\n\n")))
     buf))
