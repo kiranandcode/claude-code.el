@@ -129,6 +129,8 @@ conversation).  Inside the input area, all keys type normally.
 | `n` | `claude-code-open-notes` | Open the global notes org file |
 | `d` | `claude-code-open-dir-notes` | Open/create project context notes (org-roam) |
 | `o` | `claude-code-open-dir-todos` | Open/create project TODO list (org-roam) |
+| `M-p` | `claude-code-previous-input` | Recall previous input (older) |
+| `M-n` | `claude-code-next-input` | Recall next input (more recent) |
 | `TAB` | (magit-section) | Toggle section at point |
 | `?` | `claude-code-menu` | Transient command menu |
 | `q` | `quit-window` | Bury buffer |
@@ -159,6 +161,18 @@ Type `/` in the input area to trigger slash commands with auto-complete (via
 | `/todos` | Open or create project TODO list |
 | `/inspect` | Show session state |
 | `/help` | Show the transient command menu |
+
+### Input History
+
+Press `M-p` / `M-n` in the input area to cycle through previously submitted
+prompts in the current session (like shell history):
+
+- **`M-p`** — older input (back in history)
+- **`M-n`** — newer input (forward in history)
+
+Cycling past the newest entry restores whatever you had typed before you
+started navigating.  If the agent is working, navigating history also updates
+the queued message.
 
 ### Message Queuing
 

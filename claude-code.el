@@ -276,6 +276,11 @@ Useful for debugging — inspect with:
   "Buffer-local config overrides set via the transient menu.
 Merged on top of project config + defaults.")
 
+(defvar-local claude-code--session-key nil
+  "Key used to register this session in `claude-code--agents'.
+For primary sessions this equals `claude-code--cwd'; for secondary or
+forked sessions it is a unique string so the primary entry is not clobbered.")
+
 (defvar-local claude-code--input-marker nil
   "Marker for the start of the user-editable input area at the buffer bottom.")
 
@@ -351,6 +356,8 @@ DOC is the docstring."
 
 (defconst claude-code--slash-commands
   '(("/clear"         . "Clear the conversation history")
+    ("/reset"         . "Hard-reset: clear messages and restart the backend")
+    ("/new"           . "Open a new independent session for this directory")
     ("/model"         . "Set the model for this session")
     ("/effort"        . "Set the thinking effort level")
     ("/notes"         . "Open the global notes file")
@@ -364,6 +371,10 @@ DOC is the docstring."
 
 (defvar-local claude-code--input-queued nil
   "Non-nil when the input area has been queued to send on next ready status.")
+
+(defvar-local claude-code--pending-input nil
+  "Input text to restore into the input area on the next render.
+Used by `claude-code-reload' to survive the mode reinitialization.")
 
 (defvar-local claude-code--input-history nil
   "List of previously submitted inputs in this session, most recent first.")
@@ -552,6 +563,9 @@ Ensures the Python environment is set up before launching."
   (claude-code--stop-thinking)
   (when (and claude-code--process
              (process-live-p claude-code--process))
+    ;; Silence the sentinel so an intentional stop doesn't append a
+    ;; spurious "Backend process exited" info message.
+    (set-process-sentinel claude-code--process #'ignore)
     (claude-code--send-json '((type . "quit")))
     (sit-for 0.1)
     (when (process-live-p claude-code--process)
@@ -849,10 +863,14 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
   ;; Save any text the user has typed in the input area before erasing.
   (let* ((input-active (and claude-code--input-marker
                             (marker-buffer claude-code--input-marker)))
-         (saved-input (if input-active
-                          (buffer-substring-no-properties
-                           claude-code--input-marker (point-max))
-                        ""))
+         (saved-input (cond
+                       (input-active
+                        (buffer-substring-no-properties
+                         claude-code--input-marker (point-max)))
+                       (claude-code--pending-input
+                        (prog1 claude-code--pending-input
+                          (setq claude-code--pending-input nil)))
+                       (t "")))
          (was-in-input (and input-active
                             (>= (point)
                                 (marker-position claude-code--input-marker))))
@@ -952,7 +970,8 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
 
 (defun claude-code--render-user-msg (msg)
   "Render a user MSG."
-  (magit-insert-section (claude-user)
+  ;; Store MSG as the section value so `claude-code-fork' can retrieve it.
+  (magit-insert-section (claude-user msg)
     (magit-insert-heading
       (propertize "▶ You" 'face 'claude-code-user-prompt))
     (insert "  " (alist-get 'prompt msg) "\n\n")))
@@ -1552,9 +1571,12 @@ so it can be edited and re-submitted."
   "Kill the Claude session and buffer."
   (interactive)
   (claude-code--stop-process)
-  (when claude-code--cwd
-    (claude-code--agent-unregister claude-code--cwd)
-    (remhash claude-code--cwd claude-code--buffers))
+  (let ((key (or claude-code--session-key claude-code--cwd)))
+    (when key
+      (claude-code--agent-unregister key)
+      ;; Only remove from the primary-session hash when this buffer owns that slot.
+      (when (eq (gethash claude-code--cwd claude-code--buffers) (current-buffer))
+        (remhash claude-code--cwd claude-code--buffers))))
   (kill-buffer))
 
 (defun claude-code-restart ()
@@ -1575,6 +1597,101 @@ Use this when the backend crashes or stops responding."
         claude-code--messages)
   (claude-code--schedule-render)
   (message "claude-code: backend restarted"))
+
+(defun claude-code-reset ()
+  "Hard-reset the current conversation: clear all messages and restart the backend.
+Unlike `claude-code-clear', this also restarts the Python process so you get a
+truly blank slate.  Prompts for confirmation since the operation is irreversible."
+  (interactive)
+  (when (yes-or-no-p "Reset conversation? All messages will be cleared and the backend restarted. ")
+    ;; Clear subagents from registry (same as claude-code-clear).
+    (when claude-code--cwd
+      (when-let ((agent (gethash (or claude-code--session-key claude-code--cwd)
+                                 claude-code--agents)))
+        (dolist (child-id (plist-get agent :children))
+          (remhash child-id claude-code--agents))
+        (puthash (or claude-code--session-key claude-code--cwd)
+                 (plist-put agent :children nil)
+                 claude-code--agents)
+        (run-hooks 'claude-code-agents-update-hook)))
+    (setq claude-code--messages '()
+          claude-code--session-id nil
+          claude-code--streaming-text ""
+          claude-code--streaming-thinking ""
+          claude-code--streaming-active nil)
+    (claude-code--stop-process)
+    (claude-code--start-process)
+    (claude-code--schedule-render)
+    (message "claude-code: conversation reset")))
+
+(defun claude-code-new-session ()
+  "Open a new independent Claude session for the current session's directory.
+Creates a fresh buffer and backend process alongside the existing conversation,
+leaving the current buffer and its history untouched."
+  (interactive)
+  (let* ((cwd (or claude-code--cwd default-directory))
+         (base-name (claude-code--buffer-name cwd))
+         ;; generate-new-buffer-name appends <2>, <3>, … to avoid collisions.
+         (buf-name (generate-new-buffer-name base-name))
+         ;; Use a time-based suffix so the agent key is globally unique.
+         (agent-key (format "%s::%s" cwd (format-time-string "%s%N")))
+         (buf (get-buffer-create buf-name)))
+    (with-current-buffer buf
+      (claude-code-mode)
+      (setq claude-code--cwd cwd
+            claude-code--session-key agent-key)
+      (claude-code--agent-register
+       agent-key
+       :type 'session
+       :description (format "%s (new)" (abbreviate-file-name cwd))
+       :status 'starting
+       :buffer buf
+       :cwd cwd
+       :children nil)
+      (claude-code--start-process)
+      (claude-code--schedule-render))
+    (pop-to-buffer buf)))
+
+(defun claude-code-fork ()
+  "Fork the conversation at the user message at point.
+Creates a new buffer pre-loaded with the conversation history up to and
+including the selected user message, then starts a fresh backend process.
+Point must be on a ▶ You message heading (not in the input area)."
+  (interactive)
+  (let* ((section (magit-current-section))
+         (type    (and section (oref section type))))
+    (unless (eq type 'claude-user)
+      (user-error "Move point to a '▶ You' message to fork from there"))
+    (let* ((target-msg   (oref section value))
+           (pos          (cl-position target-msg claude-code--messages :test #'eq))
+           ;; claude-code--messages is newest-first.  nthcdr pos gives the
+           ;; target message plus everything older — exactly what we want.
+           (forked-msgs  (copy-sequence (nthcdr pos claude-code--messages)))
+           (cwd          (or claude-code--cwd default-directory))
+           (base-name    (claude-code--buffer-name cwd))
+           (buf-name     (generate-new-buffer-name base-name))
+           (agent-key    (format "%s::%s" cwd (format-time-string "%s%N")))
+           (buf          (get-buffer-create buf-name)))
+      (with-current-buffer buf
+        (claude-code-mode)
+        (setq claude-code--cwd        cwd
+              claude-code--session-id nil        ; fresh backend session
+              claude-code--session-key agent-key
+              claude-code--messages   forked-msgs)
+        (claude-code--agent-register
+         agent-key
+         :type 'session
+         :description (format "%s (fork)" (abbreviate-file-name cwd))
+         :status 'starting
+         :buffer buf
+         :cwd cwd
+         :children nil)
+        (claude-code--start-process)
+        (claude-code--schedule-render))
+      (pop-to-buffer buf)
+      (message "Forked at: %s"
+               (truncate-string-to-width
+                (alist-get 'prompt target-msg) 60)))))
 
 (defun claude-code-open-notes ()
   "Open the notes org file."
@@ -1780,6 +1897,8 @@ User prompts (newest first):
   (let ((cmd (car (split-string (string-trim text)))))
     (pcase cmd
       ("/clear"         (call-interactively #'claude-code-clear))
+      ("/reset"         (call-interactively #'claude-code-reset))
+      ("/new"           (call-interactively #'claude-code-new-session))
       ("/model"         (call-interactively #'claude-code-set-model))
       ("/effort"        (call-interactively #'claude-code-set-effort))
       ("/notes"         (call-interactively #'claude-code-open-notes))
@@ -1951,9 +2070,13 @@ unsaved text when cycling past the most recent entry."
   ["Control"
    ("c" "Cancel" claude-code-cancel)
    ("C" "Clear conversation" claude-code-clear)
+   ("W" "Reset (clear + restart)" claude-code-reset)
    ("k" "Kill session" claude-code-kill)
    ("R" "Restart backend" claude-code-restart)
    ("S" "Sync Python env" claude-code-sync)]
+  ["Branch"
+   ("N" "New session (same dir)" claude-code-new-session)
+   ("f" "Fork at message at point" claude-code-fork)]
   ["Session"
    ("m" "Set model" claude-code-set-model)
    ("e" "Set effort" claude-code-set-effort)
@@ -1982,6 +2105,9 @@ unsaved text when cycling past the most recent entry."
   "C"   #'claude-code-key-clear
   "k"   #'claude-code-key-kill
   "R"   #'claude-code-key-restart
+  "N"   #'claude-code-key-new-session
+  "f"   #'claude-code-key-fork
+  "W"   #'claude-code-key-reset
   "n"   #'claude-code-key-open-notes
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
@@ -2021,6 +2147,25 @@ Outside the input area, toggle the magit section at point."
     (insert "\t"))
    (t
     (call-interactively #'magit-section-toggle))))
+
+(defun claude-code-key-new-session ()
+  "Open a new independent Claude session for the current directory."
+  (interactive)
+  (call-interactively #'claude-code-new-session))
+
+(defun claude-code-key-fork ()
+  "Fork conversation at the user message at point; self-insert in input area."
+  (interactive)
+  (if (claude-code--input-area-p)
+      (claude-code--self-insert-or-undefined)
+    (call-interactively #'claude-code-fork)))
+
+(defun claude-code-key-reset ()
+  "Hard-reset conversation (clear + restart); self-insert in input area."
+  (interactive)
+  (if (claude-code--input-area-p)
+      (claude-code--self-insert-or-undefined)
+    (call-interactively #'claude-code-reset)))
 
 ;; Override `suppress-keymap' from `special-mode': bind all printable
 ;; ASCII characters so they self-insert in the input area.  We skip
@@ -2085,7 +2230,8 @@ Outside the input area, toggle the magit section at point."
         (puthash directory buf claude-code--buffers)
         (with-current-buffer buf
           (claude-code-mode)
-          (setq claude-code--cwd directory)
+          (setq claude-code--cwd directory
+                claude-code--session-key directory)
           (claude-code--agent-register
            directory
            :type 'session
@@ -2133,7 +2279,15 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
                                :session-overrides claude-code--session-overrides
                                :streaming-text claude-code--streaming-text
                                :streaming-thinking claude-code--streaming-thinking
-                               :streaming-active claude-code--streaming-active)
+                               :streaming-active claude-code--streaming-active
+                               ;; Preserve typed input and queued/history state
+                               :input-text (if (and claude-code--input-marker
+                                                    (marker-buffer claude-code--input-marker))
+                                               (buffer-substring-no-properties
+                                                claude-code--input-marker (point-max))
+                                             "")
+                               :input-queued claude-code--input-queued
+                               :input-history claude-code--input-history)
                          saved-states)
                    ;; Kill the old backend process
                    (claude-code--stop-process))))
@@ -2155,7 +2309,13 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
                   claude-code--session-overrides (plist-get state :session-overrides)
                   claude-code--streaming-text (plist-get state :streaming-text)
                   claude-code--streaming-thinking (plist-get state :streaming-thinking)
-                  claude-code--streaming-active (plist-get state :streaming-active))
+                  claude-code--streaming-active (plist-get state :streaming-active)
+                  claude-code--input-queued (plist-get state :input-queued)
+                  claude-code--input-history (plist-get state :input-history))
+            ;; Stash typed input so the next render restores it into the input area
+            (let ((input-text (plist-get state :input-text)))
+              (when (and input-text (not (string-empty-p input-text)))
+                (setq claude-code--pending-input input-text)))
             ;; Re-register as root agent
             (claude-code--agent-register
              dir
