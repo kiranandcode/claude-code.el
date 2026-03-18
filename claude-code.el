@@ -365,6 +365,16 @@ DOC is the docstring."
 (defvar-local claude-code--input-queued nil
   "Non-nil when the input area has been queued to send on next ready status.")
 
+(defvar-local claude-code--input-history nil
+  "List of previously submitted inputs in this session, most recent first.")
+
+(defvar-local claude-code--input-history-index -1
+  "Index into `claude-code--input-history' during history navigation.
+-1 means not currently navigating (fresh input).")
+
+(defvar-local claude-code--input-history-saved nil
+  "Text saved before history navigation began; restored when cycling past the end.")
+
 (defvar-local claude-code--query-start-time nil
   "Float time when the current query started (set when status → working).")
 
@@ -1819,6 +1829,10 @@ or cancelled (press `c' to cancel the queue)."
                  (buffer-substring-no-properties
                   claude-code--input-marker (point-max)))))
       (unless (string-empty-p text)
+        ;; Record in per-buffer history and reset navigation state.
+        (push text claude-code--input-history)
+        (setq claude-code--input-history-index -1
+              claude-code--input-history-saved nil)
         (if (eq claude-code--status 'working)
             ;; Queue: keep text in input area, show indicator in spinner.
             (progn
@@ -1833,6 +1847,52 @@ or cancelled (press `c' to cancel the queue)."
   "Move point to the end of the input area, ready to type."
   (interactive)
   (goto-char (point-max)))
+
+(defun claude-code--replace-input (text)
+  "Replace the contents of the input area with TEXT."
+  (let ((inhibit-read-only t))
+    (delete-region claude-code--input-marker (point-max))
+    (insert text))
+  (goto-char (point-max))
+  ;; Keep queued text in sync when the agent is working.
+  (when (eq claude-code--status 'working)
+    (setq claude-code--input-queued text)
+    (claude-code--update-thinking-overlay)))
+
+(defun claude-code-previous-input ()
+  "Replace the input area with the previous (older) submitted input.
+Cycles backward through `claude-code--input-history'.  If there are queued
+messages (agent is working), navigating history changes which text is queued.
+\\[claude-code-next-input] moves forward again."
+  (interactive)
+  (unless (claude-code--input-area-p)
+    (goto-char (point-max)))
+  (when claude-code--input-marker
+    (let ((history claude-code--input-history)
+          (new-index (1+ claude-code--input-history-index)))
+      (when (< new-index (length history))
+        ;; On first navigation, snapshot whatever is currently in the input.
+        (when (= claude-code--input-history-index -1)
+          (setq claude-code--input-history-saved
+                (buffer-substring-no-properties
+                 claude-code--input-marker (point-max))))
+        (setq claude-code--input-history-index new-index)
+        (claude-code--replace-input (nth new-index history))))))
+
+(defun claude-code-next-input ()
+  "Replace the input area with the next (more recent) submitted input.
+Cycles forward through `claude-code--input-history', restoring the original
+unsaved text when cycling past the most recent entry."
+  (interactive)
+  (when (and claude-code--input-marker
+             (>= claude-code--input-history-index 0))
+    (let ((new-index (1- claude-code--input-history-index)))
+      (setq claude-code--input-history-index new-index)
+      (if (= new-index -1)
+          ;; Restore the text that was in the input before navigation started.
+          (claude-code--replace-input (or claude-code--input-history-saved ""))
+        (claude-code--replace-input
+         (nth new-index claude-code--input-history))))))
 
 (defun claude-code-return ()
   "Submit the input if point is in the input area; otherwise toggle section."
@@ -1934,7 +1994,9 @@ or cancelled (press `c' to cancel the queue)."
   "RET" #'claude-code-return
   "C-j" #'newline
   "DEL" #'claude-code-key-delete-backward
-  "TAB" #'claude-code-key-tab)
+  "TAB" #'claude-code-key-tab
+  "M-p" #'claude-code-previous-input
+  "M-n" #'claude-code-next-input)
 
 (defun claude-code-key-delete-backward ()
   "Delete backward in input area, scroll down elsewhere."
