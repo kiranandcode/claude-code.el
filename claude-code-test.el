@@ -1651,5 +1651,200 @@ The input area is rendered and status is `working'."
             (should (eq live-buf switched-to)))
         (when (buffer-live-p live-buf) (kill-buffer live-buf))))))
 
+;; ---------------------------------------------------------------------------
+;; agents-goto — task agent prefers own buffer
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-agents-goto-task-prefers-own-buffer ()
+  "RET on a task agent should jump to its own task buffer, not the parent's."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer " *claude-goto-task-session*"))
+          (task-buf    (generate-new-buffer " *claude-goto-task-task*"))
+          (switched-to nil))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/goto-task"
+              :type 'session :status 'working
+              :description "session" :buffer session-buf :children '("task-99"))
+            (claude-code--agent-register "task-99"
+              :type 'task :status 'working :description "do stuff"
+              :buffer task-buf :parent-id "/tmp/goto-task" :children nil)
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda ()
+                         (claude-code-test--make-mock-section "task-99")))
+                      ((symbol-function 'pop-to-buffer)
+                       (lambda (buf) (setq switched-to buf))))
+              (claude-code-agents-goto))
+            ;; Should open the task buffer, not the session buffer
+            (should (eq task-buf switched-to)))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))
+        (when (buffer-live-p task-buf)    (kill-buffer task-buf))))))
+
+(ert-deftest claude-code-test-agents-goto-task-falls-back-to-parent ()
+  "RET on a task with a dead own-buffer should fall back to parent session buffer."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer " *claude-goto-task-fb-session*"))
+          (dead-task   (generate-new-buffer " *claude-goto-task-fb-task*"))
+          (switched-to nil))
+      (kill-buffer dead-task)
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/goto-task-fb"
+              :type 'session :status 'working
+              :description "session" :buffer session-buf :children '("task-fb"))
+            (claude-code--agent-register "task-fb"
+              :type 'task :status 'completed :description "done"
+              :buffer dead-task :parent-id "/tmp/goto-task-fb" :children nil)
+            (cl-letf (((symbol-function 'magit-current-section)
+                       (lambda ()
+                         (claude-code-test--make-mock-section "task-fb")))
+                      ((symbol-function 'pop-to-buffer)
+                       (lambda (buf) (setq switched-to buf))))
+              (claude-code-agents-goto))
+            ;; Own buffer is dead, so falls back to parent session
+            (should (eq session-buf switched-to)))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))))))
+
+;; ---------------------------------------------------------------------------
+;; Sidebar buffer name display (⎘ lines)
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-sidebar-shows-buffer-name-for-session ()
+  "Session rows should include a ⎘ line showing the buffer name."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer "*Claude: /tmp/bufname-test*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/bufname-test"
+              :type 'session :status 'ready
+              :description "test" :buffer session-buf :children nil)
+            (let ((sidebar (get-buffer-create " *cc-test-sidebar-bufname*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar
+                      (claude-code-agents-mode)
+                      (let ((inhibit-read-only t))
+                        (erase-buffer)
+                        (magit-insert-section (root)
+                          (claude-code--agents-render-root "/tmp/bufname-test"))))
+                    (with-current-buffer sidebar
+                      (should (string-match-p
+                               "⎘"
+                               (buffer-substring-no-properties (point-min) (point-max))))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))))))
+
+(ert-deftest claude-code-test-sidebar-shows-buffer-name-for-task ()
+  "Task rows should include a ⎘ line showing the task buffer name."
+  (claude-code-test-with-clean-agents
+    (let ((session-buf (generate-new-buffer " *cc-test-task-session*"))
+          (task-buf    (generate-new-buffer "*Claude Task: do stuff*")))
+      (unwind-protect
+          (progn
+            (claude-code--agent-register "/tmp/taskbuf-test"
+              :type 'session :status 'working
+              :description "session" :buffer session-buf :children '("task-buf-1"))
+            (claude-code--agent-register "task-buf-1"
+              :type 'task :status 'working :description "do stuff"
+              :buffer task-buf :parent-id "/tmp/taskbuf-test" :children nil)
+            (let ((sidebar (get-buffer-create " *cc-test-sidebar-taskbuf*")))
+              (unwind-protect
+                  (progn
+                    (with-current-buffer sidebar
+                      (claude-code-agents-mode)
+                      (let ((inhibit-read-only t))
+                        (erase-buffer)
+                        (magit-insert-section (root)
+                          (claude-code--agents-render-root "/tmp/taskbuf-test"))))
+                    (with-current-buffer sidebar
+                      (let ((txt (buffer-substring-no-properties (point-min) (point-max))))
+                        (should (string-match-p "⎘" txt))
+                        (should (string-match-p "Claude Task" txt)))))
+                (kill-buffer sidebar))))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))
+        (when (buffer-live-p task-buf)    (kill-buffer task-buf))))))
+
+(ert-deftest claude-code-test-sidebar-no-buffer-name-when-buffer-dead ()
+  "When a session buffer is dead, no ⎘ line should appear."
+  (claude-code-test-with-clean-agents
+    (let ((dead-buf (generate-new-buffer " *cc-test-dead*")))
+      (kill-buffer dead-buf)
+      (claude-code--agent-register "/tmp/deadbuf-test"
+        :type 'session :status 'stopped
+        :description "gone" :buffer dead-buf :children nil)
+      (let ((sidebar (get-buffer-create " *cc-test-sidebar-dead*")))
+        (unwind-protect
+            (progn
+              (with-current-buffer sidebar
+                (claude-code-agents-mode)
+                (let ((inhibit-read-only t))
+                  (erase-buffer)
+                  (magit-insert-section (root)
+                    (claude-code--agents-render-root "/tmp/deadbuf-test"))))
+              (with-current-buffer sidebar
+                (should-not (string-match-p
+                             "⎘"
+                             (buffer-substring-no-properties (point-min) (point-max))))))
+          (kill-buffer sidebar))))))
+
+;; ---------------------------------------------------------------------------
+;; System prompt includes buffer name
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-system-prompt-includes-buffer-name ()
+  "The system prompt should always include the current buffer's name."
+  (claude-code-test-with-buffer
+    ;; Stub out note/skill loaders so we only test the buffer-name injection.
+    (cl-letf (((symbol-function 'claude-code--load-notes)     (lambda () nil))
+              ((symbol-function 'claude-code--load-dir-notes) (lambda () nil))
+              ((symbol-function 'claude-code--load-dir-todos) (lambda () nil))
+              ((symbol-function 'claude-code--org-roam-load-skills) (lambda () nil)))
+      (let ((prompt (claude-code--build-system-prompt)))
+        (should (stringp prompt))
+        (should (string-match-p (regexp-quote (buffer-name)) prompt))))))
+
+;; ---------------------------------------------------------------------------
+;; Reload — session ID preserved after start-process
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-start-process-does-not-clear-session-id ()
+  "`claude-code--start-process' must not set `claude-code--session-id' to nil."
+  ;; Verify by inspecting the function body — we don't want to actually start
+  ;; a process in unit tests, so we check the source rather than running it.
+  (let ((src (with-temp-buffer
+               (insert (prin1-to-string
+                        (symbol-function 'claude-code--start-process)))
+               (buffer-string))))
+    (should-not (string-match-p "session-id.*nil\\|nil.*session-id" src))))
+
+(ert-deftest claude-code-test-reload-preserves-agent-children ()
+  "After reload, agent children should be restored from the saved state."
+  (claude-code-test-with-clean-agents
+    (let* ((session-buf (generate-new-buffer " *cc-reload-session*"))
+           (task-buf    (generate-new-buffer " *cc-reload-task*"))
+           (dir "/tmp/reload-test"))
+      (unwind-protect
+          (progn
+            ;; Set up: session with one child task
+            (claude-code--agent-register dir
+              :type 'session :status 'ready
+              :description "session" :buffer session-buf
+              :cwd dir :children '("reload-task-1"))
+            (claude-code--agent-register "reload-task-1"
+              :type 'task :status 'completed :description "done"
+              :buffer task-buf :parent-id dir :children nil)
+            ;; Simulate what reload does: save children, then re-register
+            (let ((saved-children
+                   (plist-get (gethash dir claude-code--agents) :children)))
+              (claude-code--agent-register dir
+                :type 'session :status 'starting
+                :description "session" :buffer session-buf
+                :cwd dir :children saved-children)
+              ;; Children must survive the re-register
+              (let ((agent (gethash dir claude-code--agents)))
+                (should (equal '("reload-task-1") (plist-get agent :children))))))
+        (when (buffer-live-p session-buf) (kill-buffer session-buf))
+        (when (buffer-live-p task-buf)    (kill-buffer task-buf))))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

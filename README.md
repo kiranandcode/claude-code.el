@@ -51,9 +51,9 @@ this table first to identify which file to read or edit.
 | File | Purpose | Depends on |
 |------|---------|-----------|
 | `claude-code-vars.el` | All `defcustom`, `defface`, `defvar`/`defvar-local` declarations, the `claude-code--def-key-command` macro, and shared constants (`claude-code--thinking-frames`, `claude-code--slash-commands`) | External: `magit-section`, `transient`, `cl-lib`, `json`, `project`, `seq` |
-| `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister functions, parent–child tree helpers, and the treemacs-style Agent Sidebar (`claude-code-agents-mode`) | `claude-code-vars`, `magit-section` |
+| `claude-code-agents.el` | Global agent registry (`claude-code--agents` hash), register/update/unregister functions, parent–child tree helpers, the treemacs-style Agent Sidebar (`claude-code-agents-mode`), and per-task progress buffers (`claude-code-task-mode`) | `claude-code-vars`, `magit-section` |
 | `claude-code-process.el` | UV/Python environment setup (`claude-code--ensure-environment`), backend process lifecycle (`claude-code--start-process`, `--stop-process`, `--send-json`), and the process filter/sentinel that parse JSON-lines output | `claude-code-vars` |
-| `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` | `claude-code-vars` |
+| `claude-code-config.el` | Session config merging (defaults → project overrides → session overrides via `claude-code--session-config`), org-roam project-notes/TODOs/skills loading, and `claude-code--build-system-prompt` (always injects the current Emacs buffer name so the agent can self-reference) | `claude-code-vars` |
 | `claude-code-events.el` | Dispatches backend events (`claude-code--handle-event`), handles status transitions, streaming deltas (text/thinking), task sub-agent events, and owns `claude-code--schedule-render` (debounced render timer) | `claude-code-vars`, `claude-code-agents` |
 | `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
 | `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters, the `claude-code-menu` transient, keymap, `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`) | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
@@ -89,7 +89,7 @@ invoked.
 - Emacs 30.0+
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
-- `ANTHROPIC_API_KEY` environment variable
+- [Claude Code](https://claude.ai/download) installed and authenticated (uses your Claude.ai subscription — no API key needed)
 
 ### Setup
 
@@ -286,18 +286,23 @@ Claude Agents
 
 ● ~/projects/myapp          [working]
   Explain the auth module
+  ⎘ *Claude: ~/projects/myapp*
   ├ ⠹ Search codebase      [working]
+  │   ⎘ *Claude Task: Search codebase*
   │   ⚙ Grep
   ├ ✓ Read config files   [completed]
   │   Found 3 config files
   └ ⠹ Analyze patterns     [working]
 
 ● ~/other-project            [ready]
+  ⎘ *Claude: ~/other-project*
 ```
 
 - **Root nodes** are sessions (one per project directory)
 - **Child nodes** are subagents spawned by the main agent
-- Press `RET` on any node to jump to its conversation buffer
+- **`⎘ buffer-name`** shows the Emacs buffer each agent lives in
+- Press `RET` on a session node to jump to its conversation buffer
+- Press `RET` on a task node to jump to its dedicated task progress buffer
 - Press `g` to refresh, `q` to close
 
 The sidebar auto-updates as agents start, make progress, and complete.

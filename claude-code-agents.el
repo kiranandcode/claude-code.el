@@ -179,6 +179,8 @@ Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
     (let* ((status (plist-get agent :status))
            (desc (plist-get agent :description))
            (children (plist-get agent :children))
+           (buf (plist-get agent :buffer))
+           (buf-name (when (and buf (buffer-live-p buf)) (buffer-name buf)))
            (icon (claude-code--agents-status-icon status))
            (sface (claude-code--agents-status-face status)))
       (magit-insert-section (claude-agent agent-id nil)
@@ -194,6 +196,11 @@ Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
                    (format "  %s\n"
                            (truncate-string-to-width desc 36))
                    'face 'shadow)))
+        (when buf-name
+          (insert (propertize
+                   (format "  ⎘ %s\n"
+                           (truncate-string-to-width buf-name 36))
+                   'face 'shadow)))
         (when children
           (let ((last-idx (1- (length children))))
             (cl-loop for child-id in children
@@ -208,6 +215,8 @@ IS-LAST is non-nil if this is the last sibling."
   (when-let ((agent (gethash agent-id claude-code--agents)))
     (let* ((status (plist-get agent :status))
            (desc (plist-get agent :description))
+           (buf (plist-get agent :buffer))
+           (buf-name (when (and buf (buffer-live-p buf)) (buffer-name buf)))
            (icon (claude-code--agents-status-icon status))
            (sface (claude-code--agents-status-face status))
            (branch (if is-last "└" "├"))
@@ -221,6 +230,10 @@ IS-LAST is non-nil if this is the last sibling."
                               'face 'claude-code-agent-task)
                   "  "
                   (propertize (format "[%s]" status) 'face sface)))
+        (when buf-name
+          (insert (propertize (format "  %s   ⎘ %s\n" cont
+                                      (truncate-string-to-width buf-name 30))
+                              'face 'shadow)))
         (when-let ((tool (plist-get agent :last-tool)))
           (insert (propertize (format "  %s   ⚙ %s\n" cont tool)
                               'face 'shadow)))
@@ -232,11 +245,16 @@ IS-LAST is non-nil if this is the last sibling."
 
 (defvar-keymap claude-code-agents-mode-map
   :doc "Keymap for the Claude agent sidebar."
-  :parent magit-section-mode-map
-  "RET" #'claude-code-agents-goto
-  "k"   #'claude-code-agents-kill-at-point
-  "q"   #'claude-code-agents-quit
-  "g"   #'claude-code-agents-refresh)
+  :parent magit-section-mode-map)
+
+;; Use keymap-set (not defvar-keymap literals) so bindings are always
+;; re-applied when the file is reloaded, mutating the existing map object
+;; in-place rather than creating a fresh one.  This ensures any live buffer
+;; that holds a reference to the same keymap picks up the changes immediately.
+(keymap-set claude-code-agents-mode-map "RET" #'claude-code-agents-goto)
+(keymap-set claude-code-agents-mode-map "k"   #'claude-code-agents-kill-at-point)
+(keymap-set claude-code-agents-mode-map "q"   #'claude-code-agents-quit)
+(keymap-set claude-code-agents-mode-map "g"   #'claude-code-agents-refresh)
 
 (define-derived-mode claude-code-agents-mode magit-section-mode "Agents"
   "Major mode for the Claude agent sidebar.
@@ -249,17 +267,24 @@ IS-LAST is non-nil if this is the last sibling."
             #'claude-code--agents-schedule-render))
 
 (defun claude-code-agents-goto ()
-  "Jump to the conversation buffer for the agent at point."
+  "Jump to the buffer for the agent at point.
+For session agents jumps to the conversation buffer.
+For task agents jumps to the task progress buffer; if that is gone,
+falls back to the parent session buffer."
   (interactive)
   (when-let ((section (magit-current-section)))
     (when-let ((agent-id (oref section value)))
       (when-let ((agent (gethash agent-id claude-code--agents)))
         (let* ((is-root (claude-code--agent-root-p agent))
+               ;; For tasks: prefer own task buffer, fall back to parent session.
                (buf (if is-root
                         (plist-get agent :buffer)
-                      (when-let ((parent (gethash (plist-get agent :parent-id)
-                                                  claude-code--agents)))
-                        (plist-get parent :buffer)))))
+                      (let ((own (plist-get agent :buffer)))
+                        (if (and own (buffer-live-p own))
+                            own
+                          (when-let ((parent (gethash (plist-get agent :parent-id)
+                                                      claude-code--agents)))
+                            (plist-get parent :buffer)))))))
           (if (and buf (buffer-live-p buf))
               (pop-to-buffer buf)
             ;; Buffer is gone — offer to remove the stale entry.
@@ -309,6 +334,84 @@ For task agents, sends a cancel signal via the parent session."
                    (claude-code--agent-unregister agent-id))))
               (_
                (claude-code--agent-unregister agent-id)))))))))
+
+;;;; Task Buffers
+
+(defvar-local claude-code--task-id nil
+  "Task ID for this task buffer.")
+
+(defvar-local claude-code--task-parent-buffer nil
+  "Parent session buffer for this task buffer.")
+
+(defvar-local claude-code--task-last-tool nil
+  "Last tool name appended to this task buffer (used to deduplicate).")
+
+(defvar-keymap claude-code-task-mode-map
+  :doc "Keymap for Claude subagent task progress buffers."
+  "q" #'quit-window)
+
+(define-derived-mode claude-code-task-mode special-mode "Claude-Task"
+  "Major mode for Claude subagent task progress buffers.
+\\{claude-code-task-mode-map}"
+  :group 'claude-code
+  (setq-local truncate-lines nil))
+
+(defun claude-code--task-buffer-create (task-id desc parent-buf)
+  "Create and return a task progress buffer for TASK-ID with DESC.
+PARENT-BUF is the parent session buffer."
+  (let* ((short-desc (truncate-string-to-width (or desc task-id) 45))
+         (name (format "*Claude Task: %s*" short-desc))
+         (buf (generate-new-buffer name)))
+    (with-current-buffer buf
+      (claude-code-task-mode)
+      (setq-local claude-code--task-id task-id)
+      (setq-local claude-code--task-parent-buffer parent-buf)
+      (let ((inhibit-read-only t))
+        (insert (propertize "Claude Subagent" 'face 'claude-code-header))
+        (insert "\n")
+        (insert (propertize (make-string 50 ?─) 'face 'claude-code-separator))
+        (insert "\n")
+        (when desc
+          (insert (propertize (format "  %s\n" desc) 'face 'bold)))
+        (insert (propertize "  ⠹ working…\n"
+                            'face 'claude-code-agent-status-working))
+        (insert (propertize (make-string 50 ?─) 'face 'claude-code-separator))
+        (insert "\n\n")))
+    buf))
+
+(defun claude-code--task-buffer-append-tool (buf tool-name)
+  "Append TOOL-NAME as a step to task BUF, deduplicating consecutive identical calls."
+  (when (and buf (buffer-live-p buf))
+    (with-current-buffer buf
+      (unless (equal tool-name claude-code--task-last-tool)
+        (setq claude-code--task-last-tool tool-name)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (insert (propertize (format "  ⚙ %s\n" tool-name)
+                              'face 'claude-code-tool-name)))))))
+
+(defun claude-code--task-buffer-finalize (buf status summary)
+  "Mark task BUF as done with STATUS symbol string and SUMMARY text."
+  (when (and buf (buffer-live-p buf))
+    (with-current-buffer buf
+      (let* ((inhibit-read-only t)
+             (sym (intern (or status "completed")))
+             (icon (claude-code--agents-status-icon sym))
+             (face (claude-code--agents-status-face sym)))
+        ;; Replace the "working…" status line in the header
+        (save-excursion
+          (goto-char (point-min))
+          (when (re-search-forward "  ⠹ working…" nil t)
+            (replace-match
+             (propertize (format "  %s %s" icon status) 'face face))))
+        ;; Append a summary footer
+        (goto-char (point-max))
+        (insert "\n")
+        (insert (propertize (make-string 50 ?─) 'face 'claude-code-separator))
+        (insert "\n")
+        (insert (propertize
+                 (format "  %s %s\n" icon (or summary "Done."))
+                 'face face))))))
 
 ;;;###autoload
 (defun claude-code-agents-capture-to-org (file)

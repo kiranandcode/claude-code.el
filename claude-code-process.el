@@ -74,9 +74,9 @@ Ensures the Python environment is set up before launching."
   (when (and claude-code--process
              (process-live-p claude-code--process))
     (delete-process claude-code--process))
-  ;; Clear stale session ID — old sessions can't be resumed across
-  ;; backend restarts and will cause the Agent SDK to crash.
-  (setq claude-code--session-id nil)
+  ;; Do NOT clear claude-code--session-id here.  The backend's handle_query
+  ;; already retries without resume on failure, so a stale ID is safe and
+  ;; preserving it lets claude-code-reload resume the conversation.
   (let* ((default-directory (expand-file-name "python/" claude-code--package-dir))
          (buf (current-buffer))
          (proc (make-process

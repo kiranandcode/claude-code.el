@@ -965,7 +965,11 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
                                                 claude-code--input-marker (point-max))
                                              "")
                                :input-queued claude-code--input-queued
-                               :input-history claude-code--input-history)
+                               :input-history claude-code--input-history
+                               ;; Preserve task agent children so the sidebar
+                               ;; survives the reload without losing subagents.
+                               :agent-children (when-let ((a (gethash dir claude-code--agents)))
+                                                 (plist-get a :children)))
                          saved-states)
                    ;; Kill the old backend process
                    (claude-code--stop-process))))
@@ -984,9 +988,8 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
             ;; Re-activate the mode (picks up new keymap, render fns, etc.)
             (claude-code-mode)
             (setq claude-code--cwd dir)
-            ;; Restore conversation
+            ;; Restore conversation state (except session-id — see below)
             (setq claude-code--messages (plist-get state :messages)
-                  claude-code--session-id (plist-get state :session-id)
                   claude-code--session-overrides (plist-get state :session-overrides)
                   claude-code--streaming-text (plist-get state :streaming-text)
                   claude-code--streaming-thinking (plist-get state :streaming-thinking)
@@ -997,7 +1000,8 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
             (let ((input-text (plist-get state :input-text)))
               (when (and input-text (not (string-empty-p input-text)))
                 (setq claude-code--pending-input input-text)))
-            ;; Re-register as root agent
+            ;; Re-register as root agent, preserving task children so the
+            ;; sidebar retains the subagent tree across the reload.
             (claude-code--agent-register
              dir
              :type 'session
@@ -1005,10 +1009,21 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
              :status 'starting
              :buffer buf
              :cwd dir
-             :children nil)
-            ;; Start a fresh backend
+             :children (plist-get state :agent-children))
+            ;; Start a fresh backend, then restore the session ID so the SDK
+            ;; can resume the conversation.  start-process no longer clears
+            ;; the ID, but we set it explicitly here for clarity.
             (claude-code--start-process)
+            (setq claude-code--session-id (plist-get state :session-id))
             (claude-code--schedule-render)))))
+    ;; Re-activate the agents sidebar mode so its local keymap stays in sync
+    ;; with `claude-code-agents-mode-map'.  The buffer may hold a stale
+    ;; reference to an older keymap object if the variable was ever replaced.
+    (when-let ((agents-buf (get-buffer "*Claude Agents*")))
+      (when (buffer-live-p agents-buf)
+        (with-current-buffer agents-buf
+          (claude-code-agents-mode)
+          (claude-code--agents-do-render))))
     (message "claude-code reloaded (%d buffer%s)"
              (length saved-states)
              (if (= 1 (length saved-states)) "" "s"))))

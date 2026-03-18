@@ -10,6 +10,7 @@
 
 (require 'claude-code-vars)
 (require 'claude-code-config)
+(require 'claude-code-agents)
 (require 'magit-section)
 
 ;;;; Buffer Rendering
@@ -45,7 +46,9 @@
         (dolist (msg (reverse claude-code--messages))
           (claude-code--render-message msg))
         ;; Show in-progress streaming content
-        (claude-code--render-streaming))
+        (claude-code--render-streaming)
+        ;; Pinned spawned-agents panel (below all output, above input)
+        (claude-code--render-subagents-panel))
       ;; Thinking spinner overlay (cheap to update, sits at end of buffer)
       (when (eq claude-code--status 'working)
         (let ((ov (make-overlay (point-max) (point-max))))
@@ -283,6 +286,51 @@
         (insert "\n")))
     (when (not (string-empty-p claude-code--streaming-text))
       (claude-code--render-text claude-code--streaming-text))))
+
+;;;; Spawned Agents Panel
+
+(defun claude-code--render-subagents-panel ()
+  "Render a pinned Spawned Agents panel after all messages.
+Shows one clickable link per subagent task, with its status and summary."
+  (when-let* ((session-key (or claude-code--session-key claude-code--cwd))
+              (parent (gethash session-key claude-code--agents))
+              ;; Also try cwd as fallback (tasks register parent-id as cwd)
+              (children (or (plist-get parent :children)
+                            (when-let ((cwd-agent (gethash claude-code--cwd
+                                                           claude-code--agents)))
+                              (plist-get cwd-agent :children)))))
+    (when children
+      (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
+      (insert "\n")
+      (insert (propertize "  Spawned Agents\n" 'face 'claude-code-assistant-label))
+      (dolist (child-id children)
+        (when-let ((child (gethash child-id claude-code--agents)))
+          (let* ((status  (plist-get child :status))
+                 (desc    (or (plist-get child :description) "task"))
+                 (buf     (plist-get child :buffer))
+                 (icon    (claude-code--agents-status-icon status))
+                 (sface   (claude-code--agents-status-face status)))
+            (insert "    ")
+            (insert (propertize icon 'face sface))
+            (insert " ")
+            ;; Description — clickable if the task buffer is live
+            (let ((btn-start (point)))
+              (insert (truncate-string-to-width desc 50))
+              (when (and buf (buffer-live-p buf))
+                (make-text-button btn-start (point)
+                                  'action (let ((b buf))
+                                            (lambda (_) (pop-to-buffer b)))
+                                  'face 'claude-code-file-link
+                                  'help-echo "Jump to subagent buffer"
+                                  'follow-link t)))
+            (insert "  ")
+            (insert (propertize (format "[%s]" status) 'face sface))
+            (when-let ((summary (plist-get child :summary)))
+              (insert "  ")
+              (insert (propertize (truncate-string-to-width summary 35)
+                                  'face 'shadow)))
+            (insert "\n"))))
+      (insert "\n"))))
 
 ;;;; Text Utilities
 

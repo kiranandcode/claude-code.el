@@ -45,7 +45,11 @@
             :type 'task :description desc :status 'working
             :parent-id claude-code--cwd :cwd claude-code--cwd
             :children nil)
-           (claude-code--agent-add-child claude-code--cwd task-id))
+           (claude-code--agent-add-child claude-code--cwd task-id)
+           ;; Create a dedicated task buffer and store it on the agent entry
+           (let ((task-buf (claude-code--task-buffer-create
+                            task-id desc (current-buffer))))
+             (claude-code--agent-update task-id :buffer task-buf)))
          (push `((type . "info")
                  (text . ,(format "Subagent started: %s" desc)))
                claude-code--messages)
@@ -57,7 +61,12 @@
             task-id
             :description (alist-get 'description event)
             :last-tool (alist-get 'last_tool_name event)
-            :status 'working))))
+            :status 'working)
+           ;; Forward tool-use events to the task buffer
+           (when-let* ((child (gethash task-id claude-code--agents))
+                       (tool  (alist-get 'last_tool_name event)))
+             (claude-code--task-buffer-append-tool
+              (plist-get child :buffer) tool)))))
       ("task_notification"
        (let ((task-id (alist-get 'task_id event))
              (status (alist-get 'status event))
@@ -66,7 +75,11 @@
            (claude-code--agent-update
             task-id
             :status (intern (or status "completed"))
-            :summary summary))
+            :summary summary)
+           ;; Finalize the task buffer with status and summary
+           (when-let ((child (gethash task-id claude-code--agents)))
+             (claude-code--task-buffer-finalize
+              (plist-get child :buffer) status summary)))
          (push `((type . "info")
                  (text . ,(format "Subagent %s: %s" status summary)))
                claude-code--messages)

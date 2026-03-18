@@ -227,6 +227,12 @@ set to \"t\" in their PROPERTIES drawer."
 (defun claude-code--build-system-prompt ()
   "Build the system prompt from notes, dir context, todos, and org-roam skills."
   (let ((parts nil))
+    ;; Always inject the Emacs buffer name so the agent can reference itself
+    ;; via `emacsclient' (e.g. to read its own buffer or send keystrokes).
+    (push (format "You are running inside Emacs buffer \"%s\".
+To interact with your own conversation buffer via emacsclient, use that name."
+                  (buffer-name))
+          parts)
     (when-let ((notes (claude-code--load-notes)))
       (push (format "The user has provided the following persistent notes:\n\n%s"
                     notes)
