@@ -1945,11 +1945,20 @@ or cancelled (press `c' to cancel the queue)."
     (call-interactively #'scroll-down-command)))
 
 (defun claude-code-key-tab ()
-  "Insert tab in input area, toggle section elsewhere."
+  "Complete slash command in input area when applicable, insert tab otherwise.
+Outside the input area, toggle the magit section at point."
   (interactive)
-  (if (claude-code--input-area-p)
-      (insert "\t")
-    (call-interactively #'magit-section-toggle)))
+  (cond
+   ((and (claude-code--input-area-p)
+         (string-match "\\`/"
+                       (buffer-substring-no-properties
+                        (marker-position claude-code--input-marker)
+                        (point-max))))
+    (completion-at-point))
+   ((claude-code--input-area-p)
+    (insert "\t"))
+   (t
+    (call-interactively #'magit-section-toggle))))
 
 ;; Override `suppress-keymap' from `special-mode': bind all printable
 ;; ASCII characters so they self-insert in the input area.  We skip
