@@ -159,7 +159,7 @@ If the process is dead, restart it automatically before sending."
         (setq claude-code--process nil)
         (claude-code--stop-thinking)
         (when claude-code--cwd
-          (claude-code--agent-update claude-code--cwd :status 'stopped))
+          (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'stopped))
         (push `((type . "info")
                 (text . ,(format "Backend process exited: %s  Press R to restart."
                                  (string-trim event))))

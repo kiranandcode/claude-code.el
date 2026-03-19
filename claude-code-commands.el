@@ -1033,6 +1033,10 @@ PROMPT           full task instructions sent as the subagent's first message."
       ;; Start the backend process (prompt will be sent once it's ready)
       (claude-code--start-process)
       (claude-code--schedule-render))
+    ;; ── Display the subagent buffer so the user can see it ────────────────
+    ;; Use display-buffer (not pop-to-buffer) so we don't steal focus from
+    ;; the parent session that is still running.
+    (display-buffer agent-buf '(display-buffer-pop-up-window))
     ;; ── Notify the parent session ─────────────────────────────────────────
     (with-current-buffer parent-buf
       (push `((type . "info")

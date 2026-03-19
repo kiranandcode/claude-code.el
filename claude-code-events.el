@@ -106,7 +106,7 @@
            (setq claude-code--input-queued (cdr claude-code--input-queued))
            (claude-code--dispatch-input queued)))
        (when claude-code--cwd
-         (claude-code--agent-update claude-code--cwd :status 'ready)))
+         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'ready)))
       ("working"
        (setq claude-code--status 'working)
        (setq claude-code--query-start-time (float-time)
@@ -115,7 +115,7 @@
              claude-code--thinking-block-start-time nil)
        (claude-code--start-thinking)
        (when claude-code--cwd
-         (claude-code--agent-update claude-code--cwd :status 'working))
+         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'working))
        ;; Mark that this subagent has actually started doing real work
        (when claude-code--subagent-task-id
          (setq claude-code--subagent-has-worked t)))
@@ -128,7 +128,7 @@
              claude-code--input-queued nil
              claude-code--queue-edit-index nil)
        (when claude-code--cwd
-         (claude-code--agent-update claude-code--cwd :status 'ready))
+         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'ready))
        (push '((type . "info") (text . "Cancelled."))
              claude-code--messages))
       ("error"
@@ -137,7 +137,7 @@
        (setq claude-code--query-start-time nil
              claude-code--thinking-block-start-time nil)
        (when claude-code--cwd
-         (claude-code--agent-update claude-code--cwd :status 'error))))
+         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'error))))
     (claude-code--schedule-render)))
 
 (defun claude-code--handle-system-event (event)
