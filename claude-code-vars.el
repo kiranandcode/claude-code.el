@@ -348,6 +348,7 @@ DOC is the docstring."
     ("/project-notes" . "Open or create project context notes")
     ("/todos"         . "Open or create project TODO list")
     ("/inspect"       . "Show session state")
+    ("/stats"         . "Show token/cost usage statistics")
     ("/help"          . "Show the command menu"))
   "Slash commands available in the Claude input area.")
 

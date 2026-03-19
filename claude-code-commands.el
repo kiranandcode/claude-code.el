@@ -546,6 +546,7 @@ User prompts (newest first):
       ("/project-notes" (call-interactively #'claude-code-open-dir-notes))
       ("/todos"         (call-interactively #'claude-code-open-dir-todos))
       ("/inspect"       (call-interactively #'claude-code-inspect))
+      ("/stats"         (call-interactively #'claude-code-stats))
       ("/help"          (call-interactively #'claude-code-menu))
       (_                (message "Unknown slash command: %s  (try /help)" cmd)))))
 

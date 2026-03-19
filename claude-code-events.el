@@ -9,6 +9,7 @@
 
 (require 'claude-code-vars)
 (require 'claude-code-agents)
+(require 'claude-code-stats)
 
 ;;;; Event Handling
 
@@ -164,6 +165,12 @@ to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
   (claude-code--flush-streaming)
   (claude-code--stop-thinking)
   (push event claude-code--messages)
+  ;; Record stats (in-memory, session lifetime only)
+  (claude-code-stats-record!
+   (or claude-code--cwd default-directory)
+   (alist-get 'total_cost_usd event)
+   (alist-get 'num_turns event)
+   (alist-get 'duration_ms event))
   ;; If this is an Emacs-native subagent that has actually run (not the
   ;; startup ready→working edge), notify the parent session of completion.
   (when (and claude-code--subagent-task-id

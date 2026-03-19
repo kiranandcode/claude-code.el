@@ -33,6 +33,7 @@
 (require 'claude-code-agents)
 (require 'claude-code-process)
 (require 'claude-code-config)
+(require 'claude-code-stats)
 (require 'claude-code-events)
 (require 'claude-code-render)
 (require 'claude-code-commands)
