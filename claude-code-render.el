@@ -83,9 +83,22 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
       (magit-insert-section (root)
         (claude-code--render-header)
         (insert "\n")
-        ;; Messages are stored newest-first; render oldest-first
-        (dolist (msg (reverse claude-code--messages))
-          (claude-code--render-message msg))
+        ;; Messages are stored newest-first; render oldest-first.
+        ;; Consecutive assistant messages are grouped under one heading.
+        (let ((pending-assistant nil))
+          (dolist (msg (reverse claude-code--messages))
+            (let ((type (alist-get 'type msg)))
+              (if (equal type "assistant")
+                  (push msg pending-assistant)
+                (progn
+                  (when pending-assistant
+                    (claude-code--render-assistant-group
+                     (nreverse pending-assistant))
+                    (setq pending-assistant nil))
+                  (claude-code--render-message msg)))))
+          (when pending-assistant
+            (claude-code--render-assistant-group
+             (nreverse pending-assistant))))
         ;; Show in-progress streaming content
         (claude-code--render-streaming)
         ;; Pinned spawned-agents panel (below all output, above input)
@@ -264,18 +277,24 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
         (insert "\n")))
     (insert "  " (alist-get 'prompt msg) "\n\n")))
 
-(defun claude-code--render-assistant-msg (msg)
-  "Render an assistant MSG with its content blocks."
+(defun claude-code--render-assistant-group (msgs)
+  "Render a list of consecutive assistant MSGS under a single ◀ Assistant heading."
   (magit-insert-section (claude-assistant nil nil)
     (magit-insert-heading
       (propertize "◀ Assistant" 'face 'claude-code-assistant-label))
-    (let ((content (alist-get 'content msg)))
-      ;; json-parse-string returns vectors for arrays
-      (when (vectorp content)
-        (setq content (append content nil)))
-      (dolist (block content)
-        (claude-code--render-content-block block)))
+    (dolist (msg msgs)
+      (let ((content (alist-get 'content msg)))
+        ;; json-parse-string returns vectors for arrays
+        (when (vectorp content)
+          (setq content (append content nil)))
+        (dolist (block content)
+          (claude-code--render-content-block block))))
     (insert "\n")))
+
+(defun claude-code--render-assistant-msg (msg)
+  "Render a single assistant MSG.  Use `claude-code--render-assistant-group' for
+grouped rendering; this entry point is kept for ad-hoc use."
+  (claude-code--render-assistant-group (list msg)))
 
 (defun claude-code--render-content-block (block)
   "Render a single content BLOCK."

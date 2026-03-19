@@ -67,9 +67,11 @@ this table first to identify which file to read or edit.
 | `claude-code-render.el` | Full buffer rendering (`claude-code--render` and all `claude-code--render-*` helpers), text utilities (`claude-code--indent`, `--insert-linkified`), inline image display (`claude-code--insert-image`, `claude-code--image-type-from-media-type`), and the thinking-spinner animation (`claude-code--start-thinking`, `--stop-thinking`) | `claude-code-vars`, `claude-code-config`, `magit-section` |
 | `claude-code-commands.el` | All user-facing interactive commands (`claude-code-send`, `claude-code-cancel`, `claude-code-fork`, etc.), input area handling and history navigation, slash-command dispatch, session config setters (`claude-code-set-model`, `claude-code-set-effort`, `claude-code-set-permission-mode`), project config persistence (`claude-code-save-project-config`), image attachment (`claude-code-attach-image`, `claude-code--image-media-type`), Emacs-native subagent spawning (`claude-code--spawn-subagent`), the `claude-code-menu` transient, keymap (`C-c i` for image attach), `claude-code-mode` major mode definition, and the main entry points (`claude-code`, `claude-code-quick`, `claude-code-reload`).  `claude-code-reload` skips killing the backend process for sessions with a live process (e.g. the agent calling reload mid-tool-execution), updating only the keymap in-place via `use-local-map`. | `claude-code-vars`, `claude-code-agents`, `claude-code-process`, `claude-code-config`, `claude-code-events`, `claude-code-render` |
 | `claude-code-git-graph.el` | Standalone git repository visualizer (`claude-code-git-graph`): 52-week contribution heatmap, top-contributors bar chart, and recent-commits log.  No dependency on the rest of the package. | `claude-code-vars` |
+| `claude-code-frame-render.el` | Renders the live Emacs frame as an ANSI-decorated ASCII snapshot.  Public API: `claude-code-frame-render` (returns string) and `claude-code-frame-render-to-file`.  Used by the `EmacsRenderFrame` MCP tool so Claude can "see" the UI state.  Ported from `render-emacs.el` with all internal symbols namespaced under `claude-code-fr--`. | `cl-lib` |
+| `claude-code-emacs-tools.el` | Emacs-side helpers invoked by the Python backend's MCP tools via `emacsclient --eval`.  Provides: `claude-code-tools-eval` (elisp eval with paren validation), `claude-code-tools-get-messages`, `claude-code-tools-get-buffer`, `claude-code-tools-list-buffers`, `claude-code-tools-search-forward/backward`, `claude-code-tools-goto-line`, `claude-code-tools-switch-buffer`, `claude-code-tools-get-point-info`, `claude-code-tools-get-debug-info`, `claude-code-tools-render-frame`. | `cl-lib`, `claude-code-frame-render` |
 | `claude-code.el` | Package entry point — `require`s all modules above in load order and `provide`s `claude-code` | All of the above |
-| `claude-code-test.el` | ERT test suite (181 tests).  Run with `make test`. | `claude-code` |
-| `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout | `claude-agent-sdk` (PyPI) |
+| `claude-code-test.el` | ERT test suite.  Run with `make test`. | `claude-code` |
+| `python/claude_code_backend.py` | Async Python backend: reads JSON-line commands from stdin, calls the Claude Agent SDK, and writes JSON-line events to stdout.  Registers an in-process MCP server exposing 12 Emacs tools (`EvalEmacs`, `EmacsRenderFrame`, `EmacsGetMessages`, `EmacsGetDebugInfo`, `EmacsGetBuffer`, `EmacsGetBufferRegion`, `EmacsListBuffers`, `EmacsSwitchBuffer`, `EmacsGetPointInfo`, `EmacsSearchForward`, `EmacsSearchBackward`, `EmacsGotoLine`). | `claude-agent-sdk` (PyPI) |
 
 ### Module dependency graph
 
@@ -83,7 +85,9 @@ claude-code-vars
     ├── claude-code-events
     │       └── (uses render, commands — forward refs, resolved at runtime)
     ├── claude-code-commands   ← aggregates everything
-    └── claude-code-git-graph
+    ├── claude-code-git-graph
+    ├── claude-code-frame-render   ← Emacs frame → ANSI snapshot
+    └── claude-code-emacs-tools    ← MCP tool helpers (uses frame-render)
 ```
 
 Forward references (functions called across module boundaries at runtime, not

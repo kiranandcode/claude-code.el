@@ -2661,5 +2661,514 @@ register both in the agents registry, run BODY, then clean up both buffers."
         (should (string-match-p "hello" text))
         (should (not (string-match-p "📎" text)))))))
 
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — paren checker
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-check-parens-balanced ()
+  "Well-balanced code should return nil (no error)."
+  (should (null (claude-code-tools--check-parens "(+ 1 2)")))
+  (should (null (claude-code-tools--check-parens "(progn (foo) (bar))")))
+  (should (null (claude-code-tools--check-parens ""))))
+
+(ert-deftest claude-code-tools-check-parens-extra-close ()
+  "Extra close paren should be detected."
+  (should (stringp (claude-code-tools--check-parens "(foo))"))))
+
+(ert-deftest claude-code-tools-check-parens-unclosed ()
+  "Unclosed open paren should be detected."
+  (should (stringp (claude-code-tools--check-parens "(foo ("))))
+
+(ert-deftest claude-code-tools-check-parens-nested ()
+  "Deeply nested balanced code should pass."
+  (should (null (claude-code-tools--check-parens
+                 "(let ((x (+ 1 (funcall #'foo 'bar)))) x)"))))
+
+(ert-deftest claude-code-tools-check-parens-string-with-parens ()
+  "Parens inside strings should not affect balance count."
+  (should (null (claude-code-tools--check-parens
+                 "(message \"hello (world)\")")))
+  (should (null (claude-code-tools--check-parens
+                 "(message \"((unmatched in string))\")"))))
+
+(ert-deftest claude-code-tools-check-parens-comment-with-parens ()
+  "Parens in line comments should not affect balance count."
+  (should (null (claude-code-tools--check-parens
+                 "(foo) ; this is a comment (with parens"))))
+
+(ert-deftest claude-code-tools-check-parens-unclosed-string ()
+  "Unclosed string literals should be reported."
+  (should (stringp (claude-code-tools--check-parens
+                    "(message \"unclosed string"))))
+
+(ert-deftest claude-code-tools-check-parens-escaped-quote-in-string ()
+  "Escaped double-quotes inside strings should not prematurely close them."
+  (should (null (claude-code-tools--check-parens
+                 "(message \"say \\\"hello\\\"\")"))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — safe-print
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-safe-print-short ()
+  "Short values should be printed without truncation."
+  (should (equal "42" (claude-code-tools--safe-print 42)))
+  (should (equal "\"hello\"" (claude-code-tools--safe-print "hello")))
+  (should (equal "t" (claude-code-tools--safe-print t)))
+  (should (equal "nil" (claude-code-tools--safe-print nil))))
+
+(ert-deftest claude-code-tools-safe-print-truncated ()
+  "Values whose print exceeds max-chars should be truncated."
+  (let ((long-str (make-string 5000 ?x)))
+    (let ((result (claude-code-tools--safe-print long-str 100)))
+      (should (string-match-p "truncated" result))
+      (should (< (length result) 200)))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — eval
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-eval-ok ()
+  "Successful eval should return a string starting with 'ok: '."
+  (let ((result (claude-code-tools-eval "(+ 1 2)")))
+    (should (stringp result))
+    (should (string-prefix-p "ok: " result))
+    (should (string-match-p "3" result))))
+
+(ert-deftest claude-code-tools-eval-error ()
+  "Failed eval should return a string starting with 'error: '."
+  (let ((result (claude-code-tools-eval "(/ 1 0)")))
+    (should (stringp result))
+    (should (string-prefix-p "error: " result))))
+
+(ert-deftest claude-code-tools-eval-paren-error ()
+  "Unbalanced parens should be caught before eval."
+  (let ((result (claude-code-tools-eval "(foo (bar")))
+    (should (string-prefix-p "error: syntax" result))))
+
+(ert-deftest claude-code-tools-eval-returns-nil-ok ()
+  "Expressions evaluating to nil should succeed with 'ok: nil'."
+  (let ((result (claude-code-tools-eval "nil")))
+    (should (string-prefix-p "ok: " result))
+    (should (string-match-p "nil" result))))
+
+(ert-deftest claude-code-tools-eval-empty-parens-ok ()
+  "Empty paren expression () should be caught as error — not valid elisp."
+  ;; () is not valid in Emacs Lisp; it's nil in Common Lisp but signals an
+  ;; error here.
+  (let ((result (claude-code-tools-eval "()")))
+    ;; Either ok: or error: is acceptable as long as we don't crash.
+    (should (or (string-prefix-p "ok: " result)
+                (string-prefix-p "error: " result)))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — get-messages
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-get-messages-returns-string ()
+  "`claude-code-tools-get-messages' should return a string."
+  (should (stringp (claude-code-tools-get-messages))))
+
+(ert-deftest claude-code-tools-get-messages-respects-limit ()
+  "Requesting fewer chars should return at most that many characters."
+  (let ((result (claude-code-tools-get-messages 50)))
+    (should (stringp result))
+    (should (<= (length result) 50))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — get-buffer
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-get-buffer-existing ()
+  "`claude-code-tools-get-buffer' should return contents of an existing buffer."
+  (let ((buf (generate-new-buffer " *cc-tools-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "hello\nworld\n"))
+          (let ((result (claude-code-tools-get-buffer (buffer-name buf))))
+            (should (string-match-p "hello" result))
+            (should (string-match-p "world" result))))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-tools-get-buffer-missing ()
+  "`claude-code-tools-get-buffer' should return an error for a missing buffer."
+  (let ((result (claude-code-tools-get-buffer "nonexistent-buffer-xyzzy-123")))
+    (should (string-prefix-p "error:" result))))
+
+(ert-deftest claude-code-tools-get-buffer-with-line-numbers ()
+  "With line numbers, output should have numeric prefixes."
+  (let ((buf (generate-new-buffer " *cc-tools-linenum*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "alpha\nbeta\ngamma\n"))
+          (let ((result (claude-code-tools-get-buffer (buffer-name buf) t)))
+            (should (string-match-p "   1  alpha" result))
+            (should (string-match-p "   2  beta" result))
+            (should (string-match-p "   3  gamma" result))))
+      (kill-buffer buf))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — get-buffer-region
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-get-buffer-region-basic ()
+  "Region retrieval should return only the requested lines."
+  (let ((buf (generate-new-buffer " *cc-tools-region*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "line1\nline2\nline3\nline4\nline5\n"))
+          (let ((result (claude-code-tools-get-buffer-region
+                         (buffer-name buf) 2 4)))
+            (should (string-match-p "line2" result))
+            (should (string-match-p "line3" result))
+            (should (string-match-p "line4" result))
+            (should (not (string-match-p "line1" result)))
+            (should (not (string-match-p "line5" result)))))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-tools-get-buffer-region-invalid-range ()
+  "start > end should return an error string."
+  (let ((buf (generate-new-buffer " *cc-tools-invalid*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "x\n"))
+          (let ((result (claude-code-tools-get-buffer-region
+                         (buffer-name buf) 5 2)))
+            (should (string-prefix-p "error:" result))))
+      (kill-buffer buf))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — list-buffers
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-list-buffers-returns-string ()
+  "`claude-code-tools-list-buffers' should return a non-empty string."
+  (let ((result (claude-code-tools-list-buffers)))
+    (should (stringp result))
+    (should (> (length result) 0))))
+
+(ert-deftest claude-code-tools-list-buffers-includes-messages ()
+  "The *Messages* buffer should appear in the listing."
+  ;; Ensure *Messages* exists
+  (message "test")
+  (let ((result (claude-code-tools-list-buffers)))
+    (should (string-match-p "\\*Messages\\*" result))))
+
+(ert-deftest claude-code-tools-list-buffers-includes-header ()
+  "The listing should include a column header."
+  (let ((result (claude-code-tools-list-buffers)))
+    (should (string-match-p "BUFFER" result))
+    (should (string-match-p "MODE" result))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — search-forward / search-backward
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-search-forward-found ()
+  "`claude-code-tools-search-forward' should return ok on match."
+  (let ((buf (generate-new-buffer " *cc-tools-sf*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "foo bar baz\n"))
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (let ((result (claude-code-tools-search-forward "bar" (buffer-name buf))))
+              (should (string-prefix-p "ok:" result))
+              (should (string-match-p "bar" result)))))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-tools-search-forward-not-found ()
+  "`claude-code-tools-search-forward' should return not-found when no match."
+  (let ((buf (generate-new-buffer " *cc-tools-sf-nf*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "foo\n"))
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (let ((result (claude-code-tools-search-forward "zzz" (buffer-name buf) t)))
+              (should (string-match-p "not found" result)))))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-tools-search-backward-found ()
+  "`claude-code-tools-search-backward' should return ok on match."
+  (let ((buf (generate-new-buffer " *cc-tools-sb*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "foo bar baz\n"))
+          (with-current-buffer buf
+            (goto-char (point-max))
+            (let ((result (claude-code-tools-search-backward "bar" (buffer-name buf))))
+              (should (string-prefix-p "ok:" result)))))
+      (kill-buffer buf))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — goto-line
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-goto-line-moves-point ()
+  "`claude-code-tools-goto-line' should move point to the given line."
+  (let ((buf (generate-new-buffer " *cc-tools-goto*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "line1\nline2\nline3\n"))
+          (with-current-buffer buf
+            (let ((result (claude-code-tools-goto-line 2 (buffer-name buf))))
+              (should (stringp result))
+              (should (= 2 (line-number-at-pos (point)))))))
+      (kill-buffer buf))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — get-point-info
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-get-point-info-format ()
+  "`claude-code-tools-get-point-info' should return buffer, line, and col."
+  (let ((buf (generate-new-buffer " *cc-tools-pt*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (insert "hello world\n"))
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (let ((result (claude-code-tools-get-point-info (buffer-name buf))))
+              (should (string-match-p "buffer:" result))
+              (should (string-match-p "line:" result))
+              (should (string-match-p "col:" result)))))
+      (kill-buffer buf))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-emacs-tools — get-debug-info
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-tools-get-debug-info-returns-string ()
+  "`claude-code-tools-get-debug-info' should return a non-empty string."
+  (let ((result (claude-code-tools-get-debug-info)))
+    (should (stringp result))
+    (should (> (length result) 0))
+    (should (string-match-p "Messages" result))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — grid operations
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-make-grid-dimensions ()
+  "`claude-code-fr--make-grid' should produce a grid of correct dimensions."
+  (let ((g (claude-code-fr--make-grid 10 5)))
+    (should (= 5 (length g)))
+    (should (= 10 (length (aref g 0))))))
+
+(ert-deftest claude-code-fr-make-grid-default-cell ()
+  "Every cell in a fresh grid should contain a space with empty SGR."
+  (let ((g (claude-code-fr--make-grid 3 2)))
+    (should (= ?\s (aref (aref (aref g 0) 0) 0)))
+    (should (equal "" (aref (aref (aref g 0) 0) 1)))))
+
+(ert-deftest claude-code-fr-gset-in-bounds ()
+  "`claude-code-fr--gset' should set a cell in bounds."
+  (let ((g (claude-code-fr--make-grid 5 3)))
+    (claude-code-fr--gset g 1 2 ?X "1")
+    (let ((cell (aref (aref g 1) 2)))
+      (should (= ?X (aref cell 0)))
+      (should (equal "1" (aref cell 1))))))
+
+(ert-deftest claude-code-fr-gset-out-of-bounds-no-error ()
+  "`claude-code-fr--gset' should silently ignore out-of-bounds writes."
+  (let ((g (claude-code-fr--make-grid 5 3)))
+    ;; These should not signal an error
+    (should (null (claude-code-fr--gset g 99 0 ?X "")))
+    (should (null (claude-code-fr--gset g 0 99 ?X "")))))
+
+(ert-deftest claude-code-fr-gput-text-basic ()
+  "`claude-code-fr--gput-text' should write characters into grid row."
+  (let ((g (claude-code-fr--make-grid 20 3)))
+    (claude-code-fr--gput-text g 1 0 "hello" "" 20)
+    (should (= ?h (aref (aref (aref g 1) 0) 0)))
+    (should (= ?e (aref (aref (aref g 1) 1) 0)))
+    (should (= ?l (aref (aref (aref g 1) 2) 0)))))
+
+(ert-deftest claude-code-fr-gput-text-respects-max-col ()
+  "`claude-code-fr--gput-text' should not write past max-col."
+  (let ((g (claude-code-fr--make-grid 5 1)))
+    (claude-code-fr--gput-text g 0 0 "hello world" "" 3)
+    ;; Positions 0,1,2 written; 3,4 should remain space
+    (should (= ?h (aref (aref (aref g 0) 0) 0)))
+    (should (= ?\s (aref (aref (aref g 0) 3) 0)))))
+
+(ert-deftest claude-code-fr-gput-text-returns-next-col ()
+  "`claude-code-fr--gput-text' should return the column after the last char."
+  (let ((g (claude-code-fr--make-grid 20 1)))
+    (let ((next (claude-code-fr--gput-text g 0 0 "abc" "" 20)))
+      (should (= 3 next)))))
+
+(ert-deftest claude-code-fr-gput-segs ()
+  "`claude-code-fr--gput-segs' should write segment list in order."
+  (let ((g (claude-code-fr--make-grid 20 1)))
+    (claude-code-fr--gput-segs g 0 0 20
+                               '(("hi" "") (" " "") ("there" "")))
+    (should (= ?h (aref (aref (aref g 0) 0) 0)))
+    (should (= ?i (aref (aref (aref g 0) 1) 0)))
+    (should (= ?\s (aref (aref (aref g 0) 2) 0)))
+    (should (= ?t (aref (aref (aref g 0) 3) 0)))))
+
+(ert-deftest claude-code-fr-grid-to-string-non-empty ()
+  "`claude-code-fr--grid-to-string' should produce a non-empty string."
+  (let ((g (claude-code-fr--make-grid 5 2)))
+    (claude-code-fr--gput-text g 0 0 "hello" "" 5)
+    (let ((s (claude-code-fr--grid-to-string g)))
+      (should (stringp s))
+      (should (> (length s) 0))
+      (should (string-match-p "hello" s)))))
+
+(ert-deftest claude-code-fr-grid-to-string-row-count ()
+  "`claude-code-fr--grid-to-string' should produce one line per grid row."
+  (let ((g (claude-code-fr--make-grid 4 3)))
+    (let* ((s (claude-code-fr--grid-to-string g))
+           ;; Strip ANSI escapes for line counting
+           (plain (replace-regexp-in-string "\033\\[[0-9;]*m" "" s))
+           (lines (split-string plain "\n" t)))
+      (should (= 3 (length lines))))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — face → SGR
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-face-to-sgr-empty-face ()
+  "nil face should produce an empty SGR string."
+  (should (equal "" (claude-code-fr--face-to-sgr nil))))
+
+(ert-deftest claude-code-fr-face-to-sgr-bold ()
+  "Bold weight should produce SGR '1'."
+  (let ((sgr (claude-code-fr--face-to-sgr '(:weight bold))))
+    (should (string-match-p "1" sgr))))
+
+(ert-deftest claude-code-fr-face-to-sgr-italic ()
+  "Italic slant should produce SGR '3'."
+  (let ((sgr (claude-code-fr--face-to-sgr '(:slant italic))))
+    (should (string-match-p "3" sgr))))
+
+(ert-deftest claude-code-fr-face-to-sgr-underline ()
+  "Underline should produce SGR '4'."
+  (let ((sgr (claude-code-fr--face-to-sgr '(:underline t))))
+    (should (string-match-p "4" sgr))))
+
+(ert-deftest claude-code-fr-face-to-sgr-strikethrough ()
+  "Strikethrough should produce SGR '9'."
+  (let ((sgr (claude-code-fr--face-to-sgr '(:strike-through t))))
+    (should (string-match-p "9" sgr))))
+
+(ert-deftest claude-code-fr-face-to-sgr-light ()
+  "Light weight should produce SGR '2'."
+  (let ((sgr (claude-code-fr--face-to-sgr '(:weight light))))
+    (should (string-match-p "2" sgr))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — face-attr lookup
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-face-attr-nil-face ()
+  "nil face should return nil for any attribute."
+  (should (null (claude-code-fr--face-attr nil :foreground)))
+  (should (null (claude-code-fr--face-attr nil :weight))))
+
+(ert-deftest claude-code-fr-face-attr-plist ()
+  "Plist face should return the matching keyword value."
+  (should (equal 'bold (claude-code-fr--face-attr '(:weight bold) :weight)))
+  (should (equal "red"  (claude-code-fr--face-attr '(:foreground "red") :foreground))))
+
+(ert-deftest claude-code-fr-face-attr-list-of-plists ()
+  "List of plist faces — first match wins."
+  (should (equal 'bold
+                 (claude-code-fr--face-attr
+                  '((:weight bold) (:weight light))
+                  :weight))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — check-parens edge cases via color helpers
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-color-fg-sgr-nil ()
+  "nil color should return nil."
+  (should (null (claude-code-fr--color-fg-sgr nil))))
+
+(ert-deftest claude-code-fr-color-fg-sgr-non-string ()
+  "Non-string color should return nil."
+  (should (null (claude-code-fr--color-fg-sgr 42))))
+
+(ert-deftest claude-code-fr-underline-sgr-bool ()
+  "Boolean t underline should produce '4'."
+  (should (member "4" (claude-code-fr--underline-sgr t))))
+
+(ert-deftest claude-code-fr-underline-sgr-nil ()
+  "nil underline should return empty list."
+  (should (null (claude-code-fr--underline-sgr nil))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — gput-box
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-gput-box-draws-borders ()
+  "`claude-code-fr--gput-box' should write box-drawing characters."
+  (let ((g (claude-code-fr--make-grid 20 6)))
+    (claude-code-fr--gput-box g 0 0 '("hello" "world"))
+    ;; Top-left corner
+    (should (= ?┌ (aref (aref (aref g 0) 0) 0)))
+    ;; Top-right corner — box-w = max(5,5) + 4 = 9, so col = box-w-1 = 8
+    (should (= ?┐ (aref (aref (aref g 0) 8) 0)))
+    ;; Bottom-left corner
+    (should (= ?└ (aref (aref (aref g 3) 0) 0)))
+    ;; Content: "hello" starts at column 2 of row 1
+    (should (= ?h (aref (aref (aref g 1) 2) 0)))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — action-name
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-action-name-symbol ()
+  "`claude-code-fr--action-name' should return the symbol name."
+  (should (equal "my-action" (claude-code-fr--action-name 'my-action nil))))
+
+(ert-deftest claude-code-fr-action-name-nil-nil ()
+  "`claude-code-fr--action-name' with nil action returns \"nil\" (nil is a symbol).
+`symbolp' returns t for nil, so `symbol-name' gives the string \"nil\"."
+  (should (equal "nil" (claude-code-fr--action-name nil nil))))
+
+;; ---------------------------------------------------------------------------
+;; claude-code-frame-render — render round-trip smoke test
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-fr-render-smoke ()
+  "`claude-code-frame-render' should return a non-empty string without error."
+  ;; This is a live Emacs test — it will render whatever frame is active.
+  (let ((result (claude-code-frame-render)))
+    (should (stringp result))
+    (should (> (length result) 0))
+    ;; Frame header must be present
+    (should (string-match-p "Frame:" result))
+    ;; Legend must be present
+    (should (string-match-p "legend:" result))))
+
+(ert-deftest claude-code-fr-render-contains-buffer-info ()
+  "`claude-code-frame-render' output should contain a buffer-info box."
+  (let ((result (claude-code-frame-render)))
+    (should (string-match-p "buffer:" result))
+    (should (string-match-p "mode:" result))))
+
+(ert-deftest claude-code-fr-render-to-file ()
+  "`claude-code-frame-render-to-file' should write a file and return its path."
+  (let ((tmpfile (make-temp-file "cc-fr-test-")))
+    (unwind-protect
+        (progn
+          (let ((returned (claude-code-frame-render-to-file tmpfile)))
+            (should (equal tmpfile returned))
+            (should (file-exists-p tmpfile))
+            (should (> (nth 7 (file-attributes tmpfile)) 0))))
+      (when (file-exists-p tmpfile) (delete-file tmpfile)))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

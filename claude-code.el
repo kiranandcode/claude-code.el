@@ -37,6 +37,8 @@
 (require 'claude-code-render)
 (require 'claude-code-commands)
 (require 'claude-code-git-graph)
+(require 'claude-code-frame-render)
+(require 'claude-code-emacs-tools)
 
 (provide 'claude-code)
 ;;; claude-code.el ends here

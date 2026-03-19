@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import sys
 import traceback
 from dataclasses import asdict, dataclass
@@ -17,6 +19,7 @@ from typing import Any, Literal, cast
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    McpSdkServerConfig,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
@@ -29,7 +32,9 @@ from claude_agent_sdk import (
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
+    create_sdk_mcp_server,
     query,
+    tool,
 )
 
 # ---------------------------------------------------------------------------
@@ -436,6 +441,439 @@ DEFAULT_TOOLS: list[str] = [
     "Read", "Write", "Edit", "Bash", "Glob", "Grep",
 ]
 
+# ---------------------------------------------------------------------------
+# Emacs MCP tools — call emacsclient rather than the raw Bash tool so that
+# all Emacs interaction is channelled through the official gateway.
+# ---------------------------------------------------------------------------
+
+# Names of the Emacs tools added to `allowed_tools` automatically.
+EMACS_TOOL_NAMES: list[str] = [
+    "EvalEmacs",
+    "EmacsRenderFrame",
+    "EmacsGetMessages",
+    "EmacsGetDebugInfo",
+    "EmacsGetBuffer",
+    "EmacsGetBufferRegion",
+    "EmacsListBuffers",
+    "EmacsSwitchBuffer",
+    "EmacsGetPointInfo",
+    "EmacsSearchForward",
+    "EmacsSearchBackward",
+    "EmacsGotoLine",
+]
+
+
+def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
+    """Run ELISP via emacsclient and return the stdout string.
+
+    Raises RuntimeError on non-zero exit or if emacsclient is not found.
+    """
+    ec = shutil.which("emacsclient")
+    if ec is None:
+        raise RuntimeError("emacsclient not found on PATH")
+    result = subprocess.run(
+        [ec, "--eval", elisp],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        raise RuntimeError(
+            f"emacsclient exited {result.returncode}"
+            + (f": {stderr}" if stderr else "")
+        )
+    # emacsclient wraps the printed Lisp value in quotes for strings;
+    # strip one level of outer quotes + unescape if present.
+    out = result.stdout.strip()
+    if out.startswith('"') and out.endswith('"'):
+        # Unescape standard Lisp string escapes
+        out = out[1:-1].replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+    return out
+
+
+def _tool_result(text: str, is_error: bool = False) -> dict[str, Any]:
+    """Build a standard MCP tool result dict."""
+    return {
+        "content": [{"type": "text", "text": text}],
+        **({"is_error": True} if is_error else {}),
+    }
+
+
+# ── EvalEmacs ─────────────────────────────────────────────────────────────
+
+@tool(
+    "EvalEmacs",
+    description=(
+        "Evaluate an Emacs Lisp expression in the running Emacs instance via "
+        "emacsclient.  Prefer this over `Bash(emacsclient --eval ...)` because "
+        "it validates parentheses before sending, surfaces Emacs errors clearly, "
+        "and keeps all Emacs interaction in one auditable channel.\n\n"
+        "Returns a string starting with 'ok: ' on success or 'error: ' on failure."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Emacs Lisp expression(s) to evaluate.",
+            },
+        },
+        "required": ["code"],
+    },
+)
+async def _emacs_eval(args: dict[str, Any]) -> dict[str, Any]:
+    code = args.get("code", "")
+    try:
+        # Delegate validation + eval to the Emacs-side helper
+        elisp = f'(claude-code-tools-eval {json.dumps(code)})'
+        out = _run_emacsclient(elisp)
+        is_error = out.startswith("error:")
+        return _tool_result(out, is_error=is_error)
+    except Exception as e:
+        return _tool_result(f"error: emacsclient failed — {e}", is_error=True)
+
+
+# ── EmacsRenderFrame ───────────────────────────────────────────────────────
+
+@tool(
+    "EmacsRenderFrame",
+    description=(
+        "Render the current Emacs frame as an ANSI-decorated ASCII snapshot. "
+        "Shows all windows, their buffer contents, modelines, cursor positions, "
+        "and clickable link citations.  Use this to 'see' what Emacs currently "
+        "displays before navigating or editing."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _emacs_render_frame(_args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        out = _run_emacsclient("(claude-code-tools-render-frame)", timeout=10)
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGetMessages ───────────────────────────────────────────────────────
+
+@tool(
+    "EmacsGetMessages",
+    description=(
+        "Return the tail of the Emacs *Messages* buffer (default: last 3000 "
+        "characters).  Use this to check for errors, warnings, or debug output "
+        "after running elisp or triggering Emacs commands."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "n_chars": {
+                "type": "integer",
+                "description": "How many characters to return from the end. Default 3000.",
+            },
+        },
+        "required": [],
+    },
+)
+async def _emacs_get_messages(args: dict[str, Any]) -> dict[str, Any]:
+    n = args.get("n_chars", 3000)
+    try:
+        out = _run_emacsclient(f"(claude-code-tools-get-messages {n})")
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGetDebugInfo ──────────────────────────────────────────────────────
+
+@tool(
+    "EmacsGetDebugInfo",
+    description=(
+        "Return a combined debug snapshot: the *Backtrace* buffer (if present) "
+        "followed by the last 2000 characters of *Messages*.  Call this whenever "
+        "an operation fails unexpectedly to understand the root cause."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _emacs_get_debug_info(_args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        out = _run_emacsclient("(claude-code-tools-get-debug-info)")
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGetBuffer ─────────────────────────────────────────────────────────
+
+@tool(
+    "EmacsGetBuffer",
+    description=(
+        "Return the full text contents of an Emacs buffer by name.  "
+        "Optionally include line numbers.  Use this to read file-visiting "
+        "buffers or special buffers (e.g. *scratch*, *Claude: ...*) without "
+        "going through the filesystem."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "buffer_name": {
+                "type": "string",
+                "description": "Exact buffer name (e.g. 'myfile.el' or '*Messages*').",
+            },
+            "with_line_numbers": {
+                "type": "boolean",
+                "description": "If true, prefix every line with its 1-based line number.",
+            },
+        },
+        "required": ["buffer_name"],
+    },
+)
+async def _emacs_get_buffer(args: dict[str, Any]) -> dict[str, Any]:
+    buf = args.get("buffer_name", "")
+    nums = "t" if args.get("with_line_numbers") else "nil"
+    try:
+        out = _run_emacsclient(
+            f"(claude-code-tools-get-buffer {json.dumps(buf)} {nums})"
+        )
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGetBufferRegion ───────────────────────────────────────────────────
+
+@tool(
+    "EmacsGetBufferRegion",
+    description=(
+        "Return a range of lines from an Emacs buffer, with line numbers. "
+        "More efficient than EmacsGetBuffer for inspecting a specific section."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "buffer_name": {"type": "string", "description": "Buffer name."},
+            "start_line":  {"type": "integer", "description": "First line (1-based)."},
+            "end_line":    {"type": "integer", "description": "Last line (inclusive)."},
+        },
+        "required": ["buffer_name", "start_line", "end_line"],
+    },
+)
+async def _emacs_get_buffer_region(args: dict[str, Any]) -> dict[str, Any]:
+    buf   = args.get("buffer_name", "")
+    start = args.get("start_line", 1)
+    end   = args.get("end_line", 1)
+    try:
+        out = _run_emacsclient(
+            f"(claude-code-tools-get-buffer-region {json.dumps(buf)} {start} {end})"
+        )
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsListBuffers ───────────────────────────────────────────────────────
+
+@tool(
+    "EmacsListBuffers",
+    description=(
+        "List all live Emacs buffers with their major mode and associated "
+        "file or directory.  Use this to discover what buffers exist before "
+        "calling EmacsGetBuffer or EmacsSwitchBuffer."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _emacs_list_buffers(_args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        out = _run_emacsclient("(claude-code-tools-list-buffers)")
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsSwitchBuffer ──────────────────────────────────────────────────────
+
+@tool(
+    "EmacsSwitchBuffer",
+    description=(
+        "Switch to a named Emacs buffer.  If the buffer is visible in a window "
+        "that window is selected; otherwise the current window's buffer is "
+        "changed.  This moves point so subsequent EmacsSearchForward / "
+        "EmacsGetPointInfo calls operate in the new buffer."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "buffer_name": {"type": "string", "description": "Buffer to switch to."},
+        },
+        "required": ["buffer_name"],
+    },
+)
+async def _emacs_switch_buffer(args: dict[str, Any]) -> dict[str, Any]:
+    buf = args.get("buffer_name", "")
+    try:
+        out = _run_emacsclient(f"(claude-code-tools-switch-buffer {json.dumps(buf)})")
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGetPointInfo ──────────────────────────────────────────────────────
+
+@tool(
+    "EmacsGetPointInfo",
+    description=(
+        "Return a description of the current cursor (point) position in a "
+        "buffer: line, column, character at point, and a short context snippet. "
+        "Use after EmacsSearchForward / EmacsGotoLine to confirm position."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "buffer_name": {
+                "type": "string",
+                "description": "Buffer to inspect.  Defaults to current buffer if omitted.",
+            },
+        },
+        "required": [],
+    },
+)
+async def _emacs_get_point_info(args: dict[str, Any]) -> dict[str, Any]:
+    buf = args.get("buffer_name")
+    elisp = (
+        f"(claude-code-tools-get-point-info {json.dumps(buf)})"
+        if buf
+        else "(claude-code-tools-get-point-info)"
+    )
+    try:
+        out = _run_emacsclient(elisp)
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsSearchForward ─────────────────────────────────────────────────────
+
+@tool(
+    "EmacsSearchForward",
+    description=(
+        "Search forward in a buffer for a regexp pattern, moving point to the "
+        "end of the match.  Returns the match location or 'not found'.  "
+        "Combine with EmacsGetPointInfo or EmacsRenderFrame to confirm context."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "pattern":     {"type": "string", "description": "Emacs regexp to search for."},
+            "buffer_name": {"type": "string", "description": "Buffer to search in (default: current)."},
+        },
+        "required": ["pattern"],
+    },
+)
+async def _emacs_search_forward(args: dict[str, Any]) -> dict[str, Any]:
+    pat = args.get("pattern", "")
+    buf = args.get("buffer_name")
+    buf_arg = json.dumps(buf) if buf else "nil"
+    try:
+        out = _run_emacsclient(
+            f"(claude-code-tools-search-forward {json.dumps(pat)} {buf_arg} t)"
+        )
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsSearchBackward ────────────────────────────────────────────────────
+
+@tool(
+    "EmacsSearchBackward",
+    description=(
+        "Search backward in a buffer for a regexp pattern, moving point to the "
+        "beginning of the match.  Returns the match location or 'not found'."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "pattern":     {"type": "string", "description": "Emacs regexp to search for."},
+            "buffer_name": {"type": "string", "description": "Buffer to search in (default: current)."},
+        },
+        "required": ["pattern"],
+    },
+)
+async def _emacs_search_backward(args: dict[str, Any]) -> dict[str, Any]:
+    pat = args.get("pattern", "")
+    buf = args.get("buffer_name")
+    buf_arg = json.dumps(buf) if buf else "nil"
+    try:
+        out = _run_emacsclient(
+            f"(claude-code-tools-search-backward {json.dumps(pat)} {buf_arg} t)"
+        )
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── EmacsGotoLine ──────────────────────────────────────────────────────────
+
+@tool(
+    "EmacsGotoLine",
+    description=(
+        "Move point to a specific line number in a buffer.  "
+        "Returns a point-info snippet so you can verify the new position."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "line_number":  {"type": "integer", "description": "1-based line number."},
+            "buffer_name":  {"type": "string", "description": "Buffer to navigate (default: current)."},
+        },
+        "required": ["line_number"],
+    },
+)
+async def _emacs_goto_line(args: dict[str, Any]) -> dict[str, Any]:
+    line = args.get("line_number", 1)
+    buf  = args.get("buffer_name")
+    buf_arg = json.dumps(buf) if buf else "nil"
+    try:
+        out = _run_emacsclient(
+            f"(claude-code-tools-goto-line {line} {buf_arg})"
+        )
+        return _tool_result(out)
+    except Exception as e:
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── Assemble MCP server ────────────────────────────────────────────────────
+
+_EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
+    name="emacs",
+    version="1.0.0",
+    tools=[
+        _emacs_eval,
+        _emacs_render_frame,
+        _emacs_get_messages,
+        _emacs_get_debug_info,
+        _emacs_get_buffer,
+        _emacs_get_buffer_region,
+        _emacs_list_buffers,
+        _emacs_switch_buffer,
+        _emacs_get_point_info,
+        _emacs_search_forward,
+        _emacs_search_backward,
+        _emacs_goto_line,
+    ],
+)
+
 
 def parse_command(raw: dict[str, Any]) -> Command:
     """Parse a raw JSON dict into a typed Command."""
@@ -505,10 +943,21 @@ def build_prompt(cmd: QueryCommand) -> Any:
 
 
 def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
-    """Build ClaudeAgentOptions from a QueryCommand."""
+    """Build ClaudeAgentOptions from a QueryCommand.
+
+    The Emacs MCP server is always attached so Claude has access to the
+    EvalEmacs / EmacsRenderFrame / EmacsGet* family of tools without needing
+    to route through the raw Bash tool.
+    """
+    base_tools = cmd.allowed_tools or DEFAULT_TOOLS
+    # Always include Emacs tools alongside whatever the session configured.
+    all_tools = list(base_tools) + [
+        t for t in EMACS_TOOL_NAMES if t not in base_tools
+    ]
     return ClaudeAgentOptions(
         cwd=cmd.cwd,
-        allowed_tools=cmd.allowed_tools or DEFAULT_TOOLS,
+        allowed_tools=all_tools,
+        mcp_servers={"emacs": _EMACS_MCP_SERVER},
         permission_mode=cmd.permission_mode,
         max_turns=cmd.max_turns,
         max_budget_usd=cmd.max_budget_usd,
