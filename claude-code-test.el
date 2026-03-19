@@ -119,6 +119,110 @@
     (let ((text (buffer-substring-no-properties (point-min) (point-max))))
       (should (string-match-p "Read" text)))))
 
+(ert-deftest claude-code-test-splice-heading-button ()
+  "`claude-code--splice-heading-button' inserts a clickable button in the heading."
+  (claude-code-test-with-buffer
+    ;; Build a minimal magit section with a heading, then splice a button.
+    (magit-insert-section (claude-tool-result nil t)
+      (magit-insert-heading "  ↳ Test heading")
+      (claude-code--splice-heading-button
+       "[go]" 'claude-code-file-link "test help"
+       (lambda (_btn) (insert "CLICKED")))
+      (insert "body\n"))
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      ;; Button label should appear in the heading line
+      (should (string-match-p "Test heading.*\\[go\\]" text)))
+    ;; Button must have a callable action
+    (save-excursion
+      (goto-char (point-min))
+      (re-search-forward "\\[go\\]" nil t)
+      (should (functionp (get-text-property (- (point) 1) 'action))))))
+
+(ert-deftest claude-code-test-view-button-pops-buffer ()
+  "`[view]' button on a rendered tool result opens a `view-mode' buffer."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "vbuf-1")
+                         (name . "Bash")
+                         (input . ((command . "echo hi"))))
+                        ((type . "tool_result")
+                         (tool_use_id . "vbuf-1")
+                         (content . "line-one\nline-two")
+                         (is_error . nil))]))
+          claude-code--messages)
+    (claude-code--render)
+    ;; Locate the [view] button and invoke its action
+    (save-excursion
+      (goto-char (point-min))
+      (re-search-forward "\\[view\\]" nil t)
+      (let ((action (get-text-property (- (point) 1) 'action)))
+        (should (functionp action))
+        (funcall action nil)))
+    ;; The pop-up buffer must exist and contain the tool output
+    (let ((buf (get-buffer "*Claude Tool result*")))
+      (unwind-protect
+          (progn
+            (should buf)
+            (should (with-current-buffer buf view-mode))
+            (should (string-match-p "line-one"
+                                    (with-current-buffer buf (buffer-string)))))
+        (when (buffer-live-p buf) (kill-buffer buf))))))
+
+(ert-deftest claude-code-test-render-tool-result-list-content ()
+  "MCP tools return content as a vector of {type,text} blocks; it must render."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "t2")
+                         (name . "mcp__emacs__EvalEmacs")
+                         (input . ((code . "(+ 1 1)"))))
+                        ((type . "tool_result")
+                         (tool_use_id . "t2")
+                         ;; MCP format: vector of content blocks
+                         (content . [((type . "text") (text . "ok: 2"))])
+                         (is_error . nil))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "EvalEmacs" text))
+      (should (string-match-p "ok: 2" text)))))
+
+(ert-deftest claude-code-test-render-mcp-tool-error-list-content ()
+  "MCP tool errors with list content must be shown with the error face heading."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "t3")
+                         (name . "mcp__emacs__EvalEmacs")
+                         (input . ((code . "(+ 1 1)"))))
+                        ((type . "tool_result")
+                         (tool_use_id . "t3")
+                         (content . [((type . "text")
+                                      (text . "MCP tool ran into issue: stream closed"))])
+                         (is_error . t))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Tool error" text))
+      (should (string-match-p "stream closed" text)))))
+
+(ert-deftest claude-code-test-tool-result-text-extraction ()
+  "`claude-code--tool-result-text' normalises both string and vector content."
+  ;; Plain string (built-in tools)
+  (should (equal "hello" (claude-code--tool-result-text "hello")))
+  ;; Vector of content blocks (MCP tools)
+  (should (equal "ok: 2"
+                 (claude-code--tool-result-text
+                  [((type . "text") (text . "ok: 2"))])))
+  ;; Multi-block vector → joined with newline
+  (should (equal "line1\nline2"
+                 (claude-code--tool-result-text
+                  [((type . "text") (text . "line1"))
+                   ((type . "text") (text . "line2"))])))
+  ;; nil content → nil
+  (should (null (claude-code--tool-result-text nil))))
+
 (ert-deftest claude-code-test-render-error-msg ()
   "Rendering an error message should not error."
   (claude-code-test-with-buffer
@@ -3189,6 +3293,23 @@ register both in the agents registry, run BODY, then clean up both buffers."
   (should (claude-code--mcp-tool-p "EmacsSearchBackward"))
   (should (claude-code--mcp-tool-p "EmacsGotoLine")))
 
+(ert-deftest claude-code-test-mcp-tool-p-prefixed-names ()
+  "`claude-code--mcp-tool-p' accepts the real mcp__emacs__* prefixed names."
+  (should (claude-code--mcp-tool-p "mcp__emacs__EvalEmacs"))
+  (should (claude-code--mcp-tool-p "mcp__emacs__EmacsRenderFrame"))
+  (should (claude-code--mcp-tool-p "mcp__emacs__EmacsGotoLine")))
+
+(ert-deftest claude-code-test-mcp-tool-short-name ()
+  "`claude-code--mcp-tool-short-name' strips the mcp__emacs__ prefix."
+  (should (equal "EvalEmacs"
+                 (claude-code--mcp-tool-short-name "mcp__emacs__EvalEmacs")))
+  (should (equal "EmacsGotoLine"
+                 (claude-code--mcp-tool-short-name "mcp__emacs__EmacsGotoLine")))
+  ;; Bare names are returned unchanged
+  (should (equal "EvalEmacs" (claude-code--mcp-tool-short-name "EvalEmacs")))
+  (should (equal "Read"      (claude-code--mcp-tool-short-name "Read")))
+  (should (null             (claude-code--mcp-tool-short-name nil))))
+
 (ert-deftest claude-code-test-mcp-tool-p-non-mcp-tools ()
   "`claude-code--mcp-tool-p' should return nil for regular SDK tools."
   (should (null (claude-code--mcp-tool-p "Read")))
@@ -3281,6 +3402,29 @@ register both in the agents registry, run BODY, then clean up both buffers."
     (let ((text (buffer-substring-no-properties (point-min) (point-max))))
       (should (string-match-p "EmacsRenderFrame" text))
       (should (string-match-p "\\[Emacs\\]" text)))))
+
+(ert-deftest claude-code-test-render-mcp-tool-prefixed-name-shows-short ()
+  "Prefixed MCP tool names (mcp__emacs__*) render as short names with [Emacs] badge."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "mcp-pref-1")
+                         (name . "mcp__emacs__EvalEmacs")
+                         (input . ((code . "(+ 1 2)"))))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      ;; Should show short name, not the full prefixed name
+      (should     (string-match-p "EvalEmacs" text))
+      (should     (string-match-p "\\[Emacs\\]" text))
+      (should-not (string-match-p "mcp__emacs__" text)))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-prefixed-name ()
+  "`claude-code--tool-summary' works when called with a prefixed MCP name."
+  (should (equal "*Messages*"
+                 (claude-code--tool-summary
+                  "mcp__emacs__EmacsGetBuffer"
+                  '((buffer_name . "*Messages*"))))))
 
 (ert-deftest claude-code-test-render-regular-tool-no-emacs-badge ()
   "Regular (non-MCP) tool-use blocks should NOT contain the [Emacs] badge."

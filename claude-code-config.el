@@ -238,11 +238,18 @@ To interact with your own conversation buffer via emacsclient, use that name."
                     notes)
             parts))
     (when-let ((dir-notes (claude-code--load-dir-notes)))
-      (push (format "The following context is specific to the current project \
-directory (%s):\n\n%s"
-                    (abbreviate-file-name claude-code--cwd)
-                    dir-notes)
-            parts))
+      (let ((notes-file (when-let ((node (claude-code--org-roam-find-project-notes-node
+                                         claude-code--cwd)))
+                          (org-roam-node-file node))))
+        (push (format "The following context is specific to the current project \
+directory (%s).%s\n\n%s"
+                      (abbreviate-file-name claude-code--cwd)
+                      (if notes-file
+                          (format "\nTo add/update project context notes, edit the \
+file: %s" notes-file)
+                        "")
+                      dir-notes)
+              parts)))
     (when-let ((dir-todos (claude-code--load-dir-todos)))
       (let ((todos-file (when-let ((node (claude-code--org-roam-find-project-todos-node
                                          claude-code--cwd)))

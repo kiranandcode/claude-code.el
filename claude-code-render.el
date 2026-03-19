@@ -103,6 +103,18 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
         (claude-code--render-streaming)
         ;; Pinned spawned-agents panel (below all output, above input)
         (claude-code--render-subagents-panel))
+      ;; Apply invisible overlays to all sections that were inserted with
+      ;; hide=t.  magit-insert-section sets the `hidden' slot but does NOT
+      ;; create the overlay — that only happens when magit-section-hide is
+      ;; called explicitly (normally by magit-refresh).  Since we drive
+      ;; rendering ourselves we must do this walk after the tree is built.
+      (when (and (boundp 'magit-root-section) magit-root-section)
+        (cl-labels ((apply-hide (sec)
+          (when (oref sec hidden)
+            (magit-section-hide sec))
+          (dolist (child (oref sec children))
+            (apply-hide child))))
+          (apply-hide magit-root-section)))
       ;; Thinking spinner overlay (cheap to update, sits at end of buffer)
       (when (eq claude-code--status 'working)
         (let ((ov (make-overlay (point-max) (point-max))))
@@ -246,29 +258,35 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
       ("error"     (claude-code--render-error-msg msg))
       ("info"      (claude-code--render-info-msg msg)))))
 
+(defun claude-code--splice-heading-button (text face help-echo action)
+  "Splice a button with TEXT into the current magit section heading.
+Must be called immediately after `magit-insert-heading' while point is
+at the start of the section body.  Inserts TEXT at the end of the
+preceding heading line (before its trailing newline) as a clickable
+button with FACE, HELP-ECHO, and ACTION.  This bypasses the magit
+section keymap that `magit-insert-heading' stamps onto heading text."
+  (save-excursion
+    (forward-line -1)
+    (end-of-line)
+    (insert "  ")
+    (let ((btn-start (point)))
+      (insert text)
+      (make-text-button btn-start (point)
+                        'action    action
+                        'help-echo help-echo
+                        'face      face
+                        'follow-link t))))
+
 (defun claude-code--render-user-msg (msg)
   "Render a user MSG."
   ;; Store MSG as the section value so `claude-code-fork' can retrieve it.
   (magit-insert-section (claude-user msg)
     (magit-insert-heading
       (propertize "▶ You" 'face 'claude-code-user-prompt))
-    ;; Append a fork button to the heading line (before its trailing newline).
-    ;; After magit-insert-heading, point is at the start of the section body
-    ;; one line below the heading, so we use save-excursion to reach the
-    ;; heading's end-of-line and splice the button in there.
-    (save-excursion
-      (forward-line -1)
-      (end-of-line)
-      (insert "  ")
-      (let ((btn-start (point)))
-        (insert "[fork]")
-        (make-text-button btn-start (point)
-                          'action (let ((m msg))
-                                    (lambda (_btn)
-                                      (claude-code--fork-at-msg m)))
-                          'help-echo "Fork conversation at this message"
-                          'face 'claude-code-action-button
-                          'follow-link t)))
+    (claude-code--splice-heading-button
+     "[fork]" 'claude-code-action-button
+     "Fork conversation at this message"
+     (lambda (_btn) (claude-code--fork-at-msg msg)))
     ;; Render attached images (full-width inline in GUI, text chips in terminal).
     (when-let ((images (alist-get 'images msg)))
       (dolist (img images)
@@ -333,16 +351,17 @@ grouped rendering; this entry point is kept for ad-hoc use."
 Emacs-native MCP tools (EvalEmacs, EmacsRenderFrame, etc.) are rendered
 with a distinct face and an [Emacs] badge so they are visually distinct
 from regular built-in tools."
-  (let* ((name    (alist-get 'name block))
-         (input   (alist-get 'input block))
-         (summary (claude-code--tool-summary name input))
-         (is-mcp  (claude-code--mcp-tool-p name))
+  (let* ((name      (alist-get 'name block))
+         (input     (alist-get 'input block))
+         (is-mcp    (claude-code--mcp-tool-p name))
+         (disp-name (if is-mcp (claude-code--mcp-tool-short-name name) name))
+         (summary   (claude-code--tool-summary name input))
          (name-face (if is-mcp 'claude-code-mcp-tool-name 'claude-code-tool-name)))
     (magit-insert-section (claude-tool-use nil
                                            (not claude-code-show-tool-details))
       (magit-insert-heading
         (concat "  "
-                (propertize (format "⚙ %s" name) 'face name-face)
+                (propertize (format "⚙ %s" disp-name) 'face name-face)
                 (when is-mcp
                   (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
                 (when summary
@@ -357,16 +376,52 @@ from regular built-in tools."
                  'face 'claude-code-tool-input))
         (insert "\n")))))
 
+(defun claude-code--tool-result-text (raw)
+  "Extract a plain string from a tool-result content value RAW.
+Built-in tools return a plain string; MCP tools return a vector of
+{type, text} content-block objects.  Both forms are normalised here."
+  (cond
+   ((null raw) nil)
+   ((stringp raw) raw)
+   ;; MCP / list format: [{type: "text", text: "..."}, ...]
+   ((or (vectorp raw) (listp raw))
+    (let* ((items (if (vectorp raw) (append raw nil) raw))
+           (texts (delq nil (mapcar (lambda (b) (alist-get 'text b)) items))))
+      (mapconcat #'identity texts "\n")))
+   (t nil)))
+
+(defun claude-code--pop-output-buffer (content label)
+  "Display CONTENT in a fresh `view-mode' buffer named after LABEL.
+`q' kills the buffer; it is not left lingering in the buffer list."
+  (let ((buf (generate-new-buffer (format "*Claude %s*" label))))
+    (with-current-buffer buf
+      (insert content)
+      (goto-char (point-min))
+      ;; Pass #'kill-buffer as exit-action so `q' kills rather than buries.
+      (view-mode-enter nil #'kill-buffer))
+    (pop-to-buffer buf)))
+
 (defun claude-code--render-tool-result (block)
-  "Render a tool result BLOCK."
-  (let ((content (alist-get 'content block))
-        (is-error (alist-get 'is_error block)))
-    (when (and content (stringp content) (not (string-empty-p content)))
-      (let ((face (if is-error 'claude-code-error 'shadow)))
+  "Render a tool result BLOCK.
+Content may be a plain string (built-in tools) or a vector of
+{type, text} content objects (MCP tools); both are handled via
+`claude-code--tool-result-text'.  A \\='[view]\\=' button in the heading
+opens the full output in a dedicated `view-mode' buffer even when the
+section is collapsed."
+  (let* ((raw      (alist-get 'content block))
+         (is-error (alist-get 'is_error block))
+         (content  (claude-code--tool-result-text raw)))
+    (when (and content (not (string-empty-p content)))
+      (let* ((face  (if is-error 'claude-code-error 'shadow))
+             (label (if is-error "Tool error" "Tool result")))
         (magit-insert-section (claude-tool-result nil t)
           (magit-insert-heading
             (propertize (if is-error "  ✗ Tool error" "  ↳ Tool result")
                         'face face))
+          (claude-code--splice-heading-button
+           "[view]" 'claude-code-file-link
+           (format "Open full output in *Claude %s*" label)
+           (lambda (_btn) (claude-code--pop-output-buffer content label)))
           (insert (propertize (claude-code--indent content 6) 'face face))
           (insert "\n"))))))
 
@@ -477,14 +532,24 @@ Shows one clickable link per subagent task, with its status and summary."
     "EmacsGotoLine")
   "Names of Emacs-native MCP tools registered by the Python backend.")
 
+(defun claude-code--mcp-tool-short-name (name)
+  "Return the short name for tool NAME, stripping any \"mcp__emacs__\" prefix.
+E.g. \"mcp__emacs__EvalEmacs\" -> \"EvalEmacs\", \"Read\" -> \"Read\"."
+  (if (and name (string-prefix-p "mcp__emacs__" name))
+      (substring name (length "mcp__emacs__"))
+    name))
+
 (defun claude-code--mcp-tool-p (name)
-  "Return non-nil if tool NAME is an Emacs-native MCP tool."
-  (and name (member name claude-code--mcp-tool-names)))
+  "Return non-nil if tool NAME is an Emacs-native MCP tool.
+Accepts both prefixed (\"mcp__emacs__EvalEmacs\") and bare (\"EvalEmacs\") forms."
+  (and name (member (claude-code--mcp-tool-short-name name)
+                    claude-code--mcp-tool-names)))
 
 (defun claude-code--tool-summary (name input)
-  "Generate a short summary for tool NAME with INPUT."
+  "Generate a short summary for tool NAME with INPUT.
+NAME may be a prefixed MCP name (\"mcp__emacs__EvalEmacs\") or bare."
   (when (listp input)
-    (pcase name
+    (pcase (claude-code--mcp-tool-short-name name)
       ;; Built-in tools
       ("Read"  (alist-get 'file_path input))
       ("Write" (alist-get 'file_path input))
