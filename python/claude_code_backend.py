@@ -463,10 +463,72 @@ EMACS_TOOL_NAMES: list[str] = [
 ]
 
 
+def _unescape_emacs_string(s: str) -> str:
+    """Unescape an Emacs Lisp prin1-encoded string (without outer quotes).
+
+    Handles all standard Lisp escape sequences including octal (\\NNN),
+    which Emacs uses to encode non-ASCII bytes when print-escape-multibyte
+    is set.  Octal sequences represent raw UTF-8 bytes, so they are
+    collected into a bytearray and decoded as UTF-8 at the end.
+    """
+    result: bytearray = bytearray()
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            nch = s[i + 1]
+            if nch == "n":
+                result.extend(b"\n"); i += 2
+            elif nch == "t":
+                result.extend(b"\t"); i += 2
+            elif nch == "r":
+                result.extend(b"\r"); i += 2
+            elif nch == '"':
+                result.extend(b'"'); i += 2
+            elif nch == "\\":
+                result.extend(b"\\"); i += 2
+            elif nch == "a":
+                result.extend(b"\x07"); i += 2
+            elif nch == "b":
+                result.extend(b"\x08"); i += 2
+            elif nch in "01234567":
+                # Octal escape: collect up to 3 octal digits
+                j = i + 1
+                while j < len(s) and j < i + 4 and s[j] in "01234567":
+                    j += 1
+                result.append(int(s[i + 1 : j], 8))
+                i = j
+            elif nch == "u" and i + 5 < len(s):
+                # Unicode \uXXXX (4 hex digits)
+                hex4 = s[i + 2 : i + 6]
+                if all(c in "0123456789abcdefABCDEF" for c in hex4):
+                    result.extend(chr(int(hex4, 16)).encode("utf-8"))
+                    i += 6
+                else:
+                    result.extend(nch.encode("utf-8")); i += 2
+            elif nch == "U" and i + 9 < len(s):
+                # Unicode \UXXXXXXXX (8 hex digits)
+                hex8 = s[i + 2 : i + 10]
+                if all(c in "0123456789abcdefABCDEF" for c in hex8):
+                    result.extend(chr(int(hex8, 16)).encode("utf-8"))
+                    i += 10
+                else:
+                    result.extend(nch.encode("utf-8")); i += 2
+            else:
+                result.extend(nch.encode("utf-8")); i += 2
+        else:
+            result.extend(ch.encode("utf-8"))
+            i += 1
+    return result.decode("utf-8", errors="replace")
+
+
 def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
     """Run ELISP via emacsclient and return the stdout string.
 
     Raises RuntimeError on non-zero exit or if emacsclient is not found.
+    Uses explicit UTF-8 decoding with replacement so that multibyte
+    characters in Emacs output (e.g. box-drawing chars in frame renders)
+    do not cause UnicodeDecodeError.
     """
     ec = shutil.which("emacsclient")
     if ec is None:
@@ -474,7 +536,8 @@ def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
     result = subprocess.run(
         [ec, "--eval", elisp],
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
     if result.returncode != 0:
@@ -484,11 +547,10 @@ def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
             + (f": {stderr}" if stderr else "")
         )
     # emacsclient wraps the printed Lisp value in quotes for strings;
-    # strip one level of outer quotes + unescape if present.
+    # strip one level of outer quotes and unescape Lisp escape sequences.
     out = result.stdout.strip()
     if out.startswith('"') and out.endswith('"'):
-        # Unescape standard Lisp string escapes
-        out = out[1:-1].replace('\\"', '"').replace("\\\\", "\\").replace("\\n", "\n")
+        out = _unescape_emacs_string(out[1:-1])
     return out
 
 

@@ -164,6 +164,18 @@ Example:
   "Tool names in tool-use blocks."
   :group 'claude-code)
 
+(defface claude-code-mcp-tool-name
+  '((t :inherit font-lock-builtin-face :weight bold))
+  "Tool names for Emacs-native MCP tools (EvalEmacs, EmacsRenderFrame, etc.).
+Rendered with a distinct colour and an [Emacs] badge to distinguish them
+from regular built-in tools (Read, Write, Bash, …)."
+  :group 'claude-code)
+
+(defface claude-code-mcp-badge
+  '((t :inherit (shadow) :height 0.85))
+  "The [Emacs] badge shown after MCP tool names."
+  :group 'claude-code)
+
 (defface claude-code-tool-input
   '((t :inherit font-lock-string-face))
   "Tool input details."

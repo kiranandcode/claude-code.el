@@ -3170,5 +3170,179 @@ register both in the agents registry, run BODY, then clean up both buffers."
             (should (> (nth 7 (file-attributes tmpfile)) 0))))
       (when (file-exists-p tmpfile) (delete-file tmpfile)))))
 
+;; ---------------------------------------------------------------------------
+;; MCP tool detection (claude-code--mcp-tool-p)
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-mcp-tool-p-emacs-tools ()
+  "`claude-code--mcp-tool-p' should return non-nil for all Emacs MCP tools."
+  (should (claude-code--mcp-tool-p "EvalEmacs"))
+  (should (claude-code--mcp-tool-p "EmacsRenderFrame"))
+  (should (claude-code--mcp-tool-p "EmacsGetMessages"))
+  (should (claude-code--mcp-tool-p "EmacsGetDebugInfo"))
+  (should (claude-code--mcp-tool-p "EmacsGetBuffer"))
+  (should (claude-code--mcp-tool-p "EmacsGetBufferRegion"))
+  (should (claude-code--mcp-tool-p "EmacsListBuffers"))
+  (should (claude-code--mcp-tool-p "EmacsSwitchBuffer"))
+  (should (claude-code--mcp-tool-p "EmacsGetPointInfo"))
+  (should (claude-code--mcp-tool-p "EmacsSearchForward"))
+  (should (claude-code--mcp-tool-p "EmacsSearchBackward"))
+  (should (claude-code--mcp-tool-p "EmacsGotoLine")))
+
+(ert-deftest claude-code-test-mcp-tool-p-non-mcp-tools ()
+  "`claude-code--mcp-tool-p' should return nil for regular SDK tools."
+  (should (null (claude-code--mcp-tool-p "Read")))
+  (should (null (claude-code--mcp-tool-p "Write")))
+  (should (null (claude-code--mcp-tool-p "Edit")))
+  (should (null (claude-code--mcp-tool-p "Bash")))
+  (should (null (claude-code--mcp-tool-p "Glob")))
+  (should (null (claude-code--mcp-tool-p "Grep")))
+  (should (null (claude-code--mcp-tool-p nil)))
+  (should (null (claude-code--mcp-tool-p ""))))
+
+;; ---------------------------------------------------------------------------
+;; MCP tool summaries
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-tool-summary-mcp-eval-emacs ()
+  "`claude-code--tool-summary' for EvalEmacs shows truncated code."
+  (let ((result (claude-code--tool-summary
+                 "EvalEmacs"
+                 '((code . "(+ 1 2)")))))
+    (should (stringp result))
+    (should (string-match-p "+" result))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-get-buffer ()
+  "`claude-code--tool-summary' for EmacsGetBuffer shows buffer name."
+  (should (equal "*Messages*"
+                 (claude-code--tool-summary
+                  "EmacsGetBuffer"
+                  '((buffer_name . "*Messages*"))))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-get-buffer-region ()
+  "`claude-code--tool-summary' for EmacsGetBufferRegion shows buffer:range."
+  (let ((result (claude-code--tool-summary
+                 "EmacsGetBufferRegion"
+                 '((buffer_name . "myfile.el")
+                   (start_line . 10)
+                   (end_line . 20)))))
+    (should (stringp result))
+    (should (string-match-p "myfile\\.el" result))
+    (should (string-match-p "10" result))
+    (should (string-match-p "20" result))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-search-forward ()
+  "`claude-code--tool-summary' for EmacsSearchForward shows pattern."
+  (should (equal "defun foo"
+                 (claude-code--tool-summary
+                  "EmacsSearchForward"
+                  '((pattern . "defun foo"))))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-goto-line ()
+  "`claude-code--tool-summary' for EmacsGotoLine shows line number."
+  (let ((result (claude-code--tool-summary
+                 "EmacsGotoLine"
+                 '((line_number . 42)))))
+    (should (stringp result))
+    (should (string-match-p "42" result))))
+
+(ert-deftest claude-code-test-tool-summary-mcp-render-frame-nil ()
+  "`claude-code--tool-summary' returns nil for EmacsRenderFrame (no params)."
+  (should (null (claude-code--tool-summary "EmacsRenderFrame" nil))))
+
+;; ---------------------------------------------------------------------------
+;; MCP tool rendering — [Emacs] badge and face
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-render-mcp-tool-shows-emacs-badge ()
+  "MCP tool-use blocks should contain the [Emacs] badge."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "mcp-1")
+                         (name . "EvalEmacs")
+                         (input . ((code . "(+ 1 2)"))))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "EvalEmacs" text))
+      (should (string-match-p "\\[Emacs\\]" text)))))
+
+(ert-deftest claude-code-test-render-mcp-tool-render-frame-badge ()
+  "EmacsRenderFrame tool-use blocks should contain the [Emacs] badge."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "mcp-2")
+                         (name . "EmacsRenderFrame")
+                         (input . nil))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "EmacsRenderFrame" text))
+      (should (string-match-p "\\[Emacs\\]" text)))))
+
+(ert-deftest claude-code-test-render-regular-tool-no-emacs-badge ()
+  "Regular (non-MCP) tool-use blocks should NOT contain the [Emacs] badge."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "t-1")
+                         (name . "Read")
+                         (input . ((file_path . "/tmp/foo.el"))))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Read" text))
+      (should (not (string-match-p "\\[Emacs\\]" text))))))
+
+(ert-deftest claude-code-test-render-mcp-tool-has-mcp-face ()
+  "MCP tool name should use `claude-code-mcp-tool-name' face."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "mcp-3")
+                         (name . "EmacsGetBuffer")
+                         (input . ((buffer_name . "*Messages*"))))]))
+          claude-code--messages)
+    (claude-code--render)
+    ;; Find the tool name in the buffer and check its face
+    (goto-char (point-min))
+    (when (re-search-forward "EmacsGetBuffer" nil t)
+      (let ((face (get-text-property (match-beginning 0) 'face)))
+        (should (or (eq face 'claude-code-mcp-tool-name)
+                    (and (listp face)
+                         (memq 'claude-code-mcp-tool-name face))))))))
+
+(ert-deftest claude-code-test-render-regular-tool-has-tool-face ()
+  "Regular tool name should use `claude-code-tool-name' face (not MCP face)."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "t-2")
+                         (name . "Grep")
+                         (input . ((pattern . "defun"))))]))
+          claude-code--messages)
+    (claude-code--render)
+    (goto-char (point-min))
+    (when (re-search-forward "Grep" nil t)
+      (let ((face (get-text-property (match-beginning 0) 'face)))
+        ;; Should have tool-name face, NOT mcp-tool-name face
+        (should (not (eq face 'claude-code-mcp-tool-name)))
+        (should (not (and (listp face)
+                          (memq 'claude-code-mcp-tool-name face))))))))
+
+;; ---------------------------------------------------------------------------
+;; MCP tool name constant completeness
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-mcp-tool-names-constant ()
+  "`claude-code--mcp-tool-names' should contain all 12 expected Emacs tools."
+  (should (= 12 (length claude-code--mcp-tool-names)))
+  ;; Spot-check a few
+  (should (member "EvalEmacs" claude-code--mcp-tool-names))
+  (should (member "EmacsRenderFrame" claude-code--mcp-tool-names))
+  (should (member "EmacsGotoLine" claude-code--mcp-tool-names)))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

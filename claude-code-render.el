@@ -329,16 +329,22 @@ grouped rendering; this entry point is kept for ad-hoc use."
       (insert "\n"))))
 
 (defun claude-code--render-tool-use (block)
-  "Render a collapsible tool-use BLOCK."
-  (let* ((name (alist-get 'name block))
-         (input (alist-get 'input block))
-         (summary (claude-code--tool-summary name input)))
+  "Render a collapsible tool-use BLOCK.
+Emacs-native MCP tools (EvalEmacs, EmacsRenderFrame, etc.) are rendered
+with a distinct face and an [Emacs] badge so they are visually distinct
+from regular built-in tools."
+  (let* ((name    (alist-get 'name block))
+         (input   (alist-get 'input block))
+         (summary (claude-code--tool-summary name input))
+         (is-mcp  (claude-code--mcp-tool-p name))
+         (name-face (if is-mcp 'claude-code-mcp-tool-name 'claude-code-tool-name)))
     (magit-insert-section (claude-tool-use nil
                                            (not claude-code-show-tool-details))
       (magit-insert-heading
         (concat "  "
-                (propertize (format "⚙ %s" name)
-                            'face 'claude-code-tool-name)
+                (propertize (format "⚙ %s" name) 'face name-face)
+                (when is-mcp
+                  (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
                 (when summary
                   (concat " " (propertize summary 'face 'shadow)))))
       (when input
@@ -452,10 +458,34 @@ Shows one clickable link per subagent task, with its status and summary."
   (let ((prefix (make-string n ?\s)))
     (replace-regexp-in-string "^" prefix text)))
 
+;;;; MCP Tool Helpers
+
+;; Names of the Emacs-native MCP tools exposed by the Python backend.
+;; Keep in sync with EMACS_TOOL_NAMES in claude_code_backend.py.
+(defconst claude-code--mcp-tool-names
+  '("EvalEmacs"
+    "EmacsRenderFrame"
+    "EmacsGetMessages"
+    "EmacsGetDebugInfo"
+    "EmacsGetBuffer"
+    "EmacsGetBufferRegion"
+    "EmacsListBuffers"
+    "EmacsSwitchBuffer"
+    "EmacsGetPointInfo"
+    "EmacsSearchForward"
+    "EmacsSearchBackward"
+    "EmacsGotoLine")
+  "Names of Emacs-native MCP tools registered by the Python backend.")
+
+(defun claude-code--mcp-tool-p (name)
+  "Return non-nil if tool NAME is an Emacs-native MCP tool."
+  (and name (member name claude-code--mcp-tool-names)))
+
 (defun claude-code--tool-summary (name input)
   "Generate a short summary for tool NAME with INPUT."
   (when (listp input)
     (pcase name
+      ;; Built-in tools
       ("Read"  (alist-get 'file_path input))
       ("Write" (alist-get 'file_path input))
       ("Edit"  (alist-get 'file_path input))
@@ -463,6 +493,23 @@ Shows one clickable link per subagent task, with its status and summary."
                  (truncate-string-to-width cmd 60)))
       ("Glob"  (alist-get 'pattern input))
       ("Grep"  (alist-get 'pattern input))
+      ;; Emacs MCP tools
+      ("EvalEmacs"
+       (when-let ((code (alist-get 'code input)))
+         (truncate-string-to-width
+          (replace-regexp-in-string "\n" " " code) 50)))
+      ("EmacsGetBuffer"       (alist-get 'buffer_name input))
+      ("EmacsGetBufferRegion"
+       (when-let ((buf (alist-get 'buffer_name input)))
+         (format "%s:%s-%s" buf
+                 (alist-get 'start_line input)
+                 (alist-get 'end_line input))))
+      ("EmacsSwitchBuffer"    (alist-get 'buffer_name input))
+      ("EmacsSearchForward"   (alist-get 'pattern input))
+      ("EmacsSearchBackward"  (alist-get 'pattern input))
+      ("EmacsGotoLine"
+       (when-let ((line (alist-get 'line_number input)))
+         (format "line %d" line)))
       (_       nil))))
 
 (defun claude-code--insert-linkified (text)
