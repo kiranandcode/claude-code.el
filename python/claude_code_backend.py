@@ -462,13 +462,14 @@ EMACS_TOOL_NAMES: list[str] = [
 ]
 
 
-def _unescape_emacs_string(s: str) -> str:
+def _unescape_emacs_string(s: str) -> str:  # kept for reference; no longer called
     """Unescape an Emacs Lisp prin1-encoded string (without outer quotes).
 
-    Handles all standard Lisp escape sequences including octal (\\NNN),
-    which Emacs uses to encode non-ASCII bytes when print-escape-multibyte
-    is set.  Octal sequences represent raw UTF-8 bytes, so they are
-    collected into a bytearray and decoded as UTF-8 at the end.
+    Replaced by the json-encode/json.loads round-trip in _run_emacsclient,
+    which delegates encoding to Emacs's own json.el and decoding to Python's
+    stdlib — eliminating a hand-rolled escape parser that missed edge cases
+    such as \\xHH hex sequences.  Left here temporarily in case git-blame
+    readers want the history; will be removed in a follow-up.
     """
     result: bytearray = bytearray()
     i = 0
@@ -522,23 +523,29 @@ def _unescape_emacs_string(s: str) -> str:
 
 
 async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
-    """Run ELISP via emacsclient and return the stdout string.
+    """Evaluate ELISP in the running Emacs and return the result as a string.
 
     Async so it never blocks the asyncio event loop.  Blocking the event
     loop (with subprocess.run) while the claude CLI is streaming tokens
     causes the OS pipe buffer to fill, stalling the CLI, which then times
     out and reports "Stream closed" for in-flight MCP tool calls.
 
+    Output encoding: wraps ELISP in (json-encode ...) so Emacs itself
+    produces well-formed JSON.  Python's json.loads then decodes it — no
+    hand-rolled Lisp escape parsing needed.  Non-string return values
+    (nil, t, numbers) are serialised back to their JSON representation so
+    callers always receive a plain string.
+
     Raises RuntimeError on non-zero exit or if emacsclient is not found.
-    Uses explicit UTF-8 decoding with replacement so that multibyte
-    characters in Emacs output (e.g. box-drawing chars in frame renders)
-    do not cause UnicodeDecodeError.
     """
     ec = shutil.which("emacsclient")
     if ec is None:
         raise RuntimeError("emacsclient not found on PATH")
+    # Wrap in json-encode so Emacs handles all escaping; princ writes the
+    # raw JSON to stdout (no extra Lisp-level quoting on top).
+    wrapped = f"(progn (require 'json) (princ (json-encode {elisp})))"
     proc = await asyncio.create_subprocess_exec(
-        ec, "--eval", elisp,
+        ec, "--eval", wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -556,12 +563,11 @@ async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
             f"emacsclient exited {proc.returncode}"
             + (f": {stderr}" if stderr else "")
         )
-    # emacsclient wraps the printed Lisp value in quotes for strings;
-    # strip one level of outer quotes and unescape Lisp escape sequences.
-    out = stdout_bytes.decode("utf-8", errors="replace").strip()
-    if out.startswith('"') and out.endswith('"'):
-        out = _unescape_emacs_string(out[1:-1])
-    return out
+    raw = stdout_bytes.decode("utf-8", errors="replace").strip()
+    parsed = json.loads(raw)
+    # All callers expect a string; for non-string values (nil → null,
+    # t → true, numbers, lists) serialise back to a terse representation.
+    return parsed if isinstance(parsed, str) else json.dumps(parsed)
 
 
 def _tool_result(text: str, is_error: bool = False) -> dict[str, Any]:
