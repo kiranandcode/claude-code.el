@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
-import subprocess
 import sys
 import traceback
 from dataclasses import asdict, dataclass
@@ -522,8 +521,13 @@ def _unescape_emacs_string(s: str) -> str:
     return result.decode("utf-8", errors="replace")
 
 
-def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
+async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
     """Run ELISP via emacsclient and return the stdout string.
+
+    Async so it never blocks the asyncio event loop.  Blocking the event
+    loop (with subprocess.run) while the claude CLI is streaming tokens
+    causes the OS pipe buffer to fill, stalling the CLI, which then times
+    out and reports "Stream closed" for in-flight MCP tool calls.
 
     Raises RuntimeError on non-zero exit or if emacsclient is not found.
     Uses explicit UTF-8 decoding with replacement so that multibyte
@@ -533,22 +537,28 @@ def _run_emacsclient(elisp: str, timeout: int = 15) -> str:
     ec = shutil.which("emacsclient")
     if ec is None:
         raise RuntimeError("emacsclient not found on PATH")
-    result = subprocess.run(
-        [ec, "--eval", elisp],
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
+    proc = await asyncio.create_subprocess_exec(
+        ec, "--eval", elisp,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        raise RuntimeError(f"emacsclient timed out after {timeout:.0f}s")
+    if proc.returncode != 0:
+        stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
         raise RuntimeError(
-            f"emacsclient exited {result.returncode}"
+            f"emacsclient exited {proc.returncode}"
             + (f": {stderr}" if stderr else "")
         )
     # emacsclient wraps the printed Lisp value in quotes for strings;
     # strip one level of outer quotes and unescape Lisp escape sequences.
-    out = result.stdout.strip()
+    out = stdout_bytes.decode("utf-8", errors="replace").strip()
     if out.startswith('"') and out.endswith('"'):
         out = _unescape_emacs_string(out[1:-1])
     return out
@@ -589,7 +599,7 @@ async def _emacs_eval(args: dict[str, Any]) -> dict[str, Any]:
     try:
         # Delegate validation + eval to the Emacs-side helper
         elisp = f'(claude-code-tools-eval {json.dumps(code)})'
-        out = _run_emacsclient(elisp)
+        out = await _run_emacsclient(elisp)
         is_error = out.startswith("error:")
         return _tool_result(out, is_error=is_error)
     except Exception as e:
@@ -614,7 +624,7 @@ async def _emacs_eval(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def _emacs_render_frame(_args: dict[str, Any]) -> dict[str, Any]:
     try:
-        out = _run_emacsclient("(claude-code-tools-render-frame)", timeout=10)
+        out = await _run_emacsclient("(claude-code-tools-render-frame)", timeout=10)
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -643,7 +653,7 @@ async def _emacs_render_frame(_args: dict[str, Any]) -> dict[str, Any]:
 async def _emacs_get_messages(args: dict[str, Any]) -> dict[str, Any]:
     n = args.get("n_chars", 3000)
     try:
-        out = _run_emacsclient(f"(claude-code-tools-get-messages {n})")
+        out = await _run_emacsclient(f"(claude-code-tools-get-messages {n})")
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -666,7 +676,7 @@ async def _emacs_get_messages(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def _emacs_get_debug_info(_args: dict[str, Any]) -> dict[str, Any]:
     try:
-        out = _run_emacsclient("(claude-code-tools-get-debug-info)")
+        out = await _run_emacsclient("(claude-code-tools-get-debug-info)")
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -701,7 +711,7 @@ async def _emacs_get_buffer(args: dict[str, Any]) -> dict[str, Any]:
     buf = args.get("buffer_name", "")
     nums = "t" if args.get("with_line_numbers") else "nil"
     try:
-        out = _run_emacsclient(
+        out = await _run_emacsclient(
             f"(claude-code-tools-get-buffer {json.dumps(buf)} {nums})"
         )
         return _tool_result(out)
@@ -732,7 +742,7 @@ async def _emacs_get_buffer_region(args: dict[str, Any]) -> dict[str, Any]:
     start = args.get("start_line", 1)
     end   = args.get("end_line", 1)
     try:
-        out = _run_emacsclient(
+        out = await _run_emacsclient(
             f"(claude-code-tools-get-buffer-region {json.dumps(buf)} {start} {end})"
         )
         return _tool_result(out)
@@ -757,7 +767,7 @@ async def _emacs_get_buffer_region(args: dict[str, Any]) -> dict[str, Any]:
 )
 async def _emacs_list_buffers(_args: dict[str, Any]) -> dict[str, Any]:
     try:
-        out = _run_emacsclient("(claude-code-tools-list-buffers)")
+        out = await _run_emacsclient("(claude-code-tools-list-buffers)")
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -784,7 +794,7 @@ async def _emacs_list_buffers(_args: dict[str, Any]) -> dict[str, Any]:
 async def _emacs_switch_buffer(args: dict[str, Any]) -> dict[str, Any]:
     buf = args.get("buffer_name", "")
     try:
-        out = _run_emacsclient(f"(claude-code-tools-switch-buffer {json.dumps(buf)})")
+        out = await _run_emacsclient(f"(claude-code-tools-switch-buffer {json.dumps(buf)})")
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -818,7 +828,7 @@ async def _emacs_get_point_info(args: dict[str, Any]) -> dict[str, Any]:
         else "(claude-code-tools-get-point-info)"
     )
     try:
-        out = _run_emacsclient(elisp)
+        out = await _run_emacsclient(elisp)
         return _tool_result(out)
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
@@ -847,7 +857,7 @@ async def _emacs_search_forward(args: dict[str, Any]) -> dict[str, Any]:
     buf = args.get("buffer_name")
     buf_arg = json.dumps(buf) if buf else "nil"
     try:
-        out = _run_emacsclient(
+        out = await _run_emacsclient(
             f"(claude-code-tools-search-forward {json.dumps(pat)} {buf_arg} t)"
         )
         return _tool_result(out)
@@ -877,7 +887,7 @@ async def _emacs_search_backward(args: dict[str, Any]) -> dict[str, Any]:
     buf = args.get("buffer_name")
     buf_arg = json.dumps(buf) if buf else "nil"
     try:
-        out = _run_emacsclient(
+        out = await _run_emacsclient(
             f"(claude-code-tools-search-backward {json.dumps(pat)} {buf_arg} t)"
         )
         return _tool_result(out)
@@ -907,7 +917,7 @@ async def _emacs_goto_line(args: dict[str, Any]) -> dict[str, Any]:
     buf  = args.get("buffer_name")
     buf_arg = json.dumps(buf) if buf else "nil"
     try:
-        out = _run_emacsclient(
+        out = await _run_emacsclient(
             f"(claude-code-tools-goto-line {line} {buf_arg})"
         )
         return _tool_result(out)
