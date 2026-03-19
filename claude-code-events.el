@@ -40,7 +40,7 @@
       ("task_started"
        (let ((task-id (alist-get 'task_id event))
              (desc (alist-get 'description event))
-             (parent-key (or claude-code--session-key claude-code--cwd)))
+             (parent-key (claude-code--effective-session-key)))
          (when task-id
            (claude-code--agent-register
             task-id
@@ -91,7 +91,8 @@
 
 (defun claude-code--handle-status-event (event)
   "Handle a status EVENT."
-  (let ((status (alist-get 'status event)))
+  (let ((status    (alist-get 'status event))
+        (agent-key (claude-code--effective-session-key)))
     (pcase status
       ("ready"
        (setq claude-code--status 'ready)
@@ -105,8 +106,8 @@
          (let ((queued (car claude-code--input-queued)))
            (setq claude-code--input-queued (cdr claude-code--input-queued))
            (claude-code--dispatch-input queued)))
-       (when claude-code--cwd
-         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'ready)))
+       (when agent-key
+         (claude-code--agent-update agent-key :status 'ready)))
       ("working"
        (setq claude-code--status 'working)
        (setq claude-code--query-start-time (float-time)
@@ -114,8 +115,8 @@
              claude-code--thinking-elapsed-sec 0.0
              claude-code--thinking-block-start-time nil)
        (claude-code--start-thinking)
-       (when claude-code--cwd
-         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'working))
+       (when agent-key
+         (claude-code--agent-update agent-key :status 'working))
        ;; Mark that this subagent has actually started doing real work
        (when claude-code--subagent-task-id
          (setq claude-code--subagent-has-worked t)))
@@ -127,8 +128,8 @@
              claude-code--thinking-block-start-time nil
              claude-code--input-queued nil
              claude-code--queue-edit-index nil)
-       (when claude-code--cwd
-         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'ready))
+       (when agent-key
+         (claude-code--agent-update agent-key :status 'ready))
        (push '((type . "info") (text . "Cancelled."))
              claude-code--messages))
       ("error"
@@ -136,8 +137,8 @@
        (claude-code--stop-thinking)
        (setq claude-code--query-start-time nil
              claude-code--thinking-block-start-time nil)
-       (when claude-code--cwd
-         (claude-code--agent-update (or claude-code--session-key claude-code--cwd) :status 'error))))
+       (when agent-key
+         (claude-code--agent-update agent-key :status 'error))))
     (claude-code--schedule-render)))
 
 (defun claude-code--handle-system-event (event)

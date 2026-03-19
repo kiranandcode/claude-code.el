@@ -470,7 +470,7 @@ section is collapsed."
 (defun claude-code--render-subagents-panel ()
   "Render a pinned Spawned Agents panel after all messages.
 Shows one clickable link per subagent task, with its status and summary."
-  (when-let* ((session-key (or claude-code--session-key claude-code--cwd))
+  (when-let* ((session-key (claude-code--effective-session-key))
               (parent (gethash session-key claude-code--agents))
               (children (plist-get parent :children)))
     (when children

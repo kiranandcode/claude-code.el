@@ -78,7 +78,7 @@ Agent plist keys:
 (defun claude-code--agent-unregister-self ()
   "Unregister the agent for the current buffer.
 Intended for use in `kill-buffer-hook' within `claude-code-mode' buffers."
-  (let ((key (or claude-code--session-key claude-code--cwd)))
+  (let ((key (claude-code--effective-session-key)))
     (when key
       (claude-code--agent-unregister key)
       (when (eq (gethash claude-code--cwd claude-code--buffers) (current-buffer))

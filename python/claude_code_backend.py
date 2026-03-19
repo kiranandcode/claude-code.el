@@ -420,6 +420,19 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 task_id=task_id, status=status, summary=summary
             )
 
+        case UserMessage(content=content) if isinstance(content, list):
+            # Tool-result messages arrive as UserMessage with a list of content
+            # blocks (ToolResultBlock entries).  Emit them as an AssistantEvent
+            # so the Elisp renderer can display "↳ Tool result" sections.
+            result_blocks = [
+                convert_content_block(b)
+                for b in content
+                if isinstance(b, ToolResultBlock)
+            ]
+            if result_blocks:
+                return AssistantEvent(content=result_blocks)
+            return None
+
         case UserMessage():
             return None
 
@@ -444,6 +457,11 @@ DEFAULT_TOOLS: list[str] = [
 # Emacs MCP tools — call emacsclient rather than the raw Bash tool so that
 # all Emacs interaction is channelled through the official gateway.
 # ---------------------------------------------------------------------------
+
+# Resolved once at import time — emacsclient location cannot change during
+# the process lifetime without a restart, so caching avoids repeated PATH
+# traversal on every MCP tool invocation.
+_EMACSCLIENT: str | None = shutil.which("emacsclient")
 
 # Names of the Emacs tools added to `allowed_tools` automatically.
 EMACS_TOOL_NAMES: list[str] = [
@@ -538,14 +556,13 @@ async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
 
     Raises RuntimeError on non-zero exit or if emacsclient is not found.
     """
-    ec = shutil.which("emacsclient")
-    if ec is None:
+    if _EMACSCLIENT is None:
         raise RuntimeError("emacsclient not found on PATH")
     # Wrap in json-encode so Emacs handles all escaping; princ writes the
     # raw JSON to stdout (no extra Lisp-level quoting on top).
     wrapped = f"(progn (require 'json) (princ (json-encode {elisp})))"
     proc = await asyncio.create_subprocess_exec(
-        ec, "--eval", wrapped,
+        _EMACSCLIENT, "--eval", wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

@@ -178,7 +178,7 @@ SOURCE is either a file path string or the symbol `clipboard'."
   "Kill the Claude session and buffer."
   (interactive)
   (claude-code--stop-process)
-  (let ((key (or claude-code--session-key claude-code--cwd)))
+  (let ((key (claude-code--effective-session-key)))
     (when key
       (claude-code--agent-unregister key)
       ;; Only remove from the primary-session hash when this buffer owns that slot.
@@ -213,11 +213,11 @@ truly blank slate.  Prompts for confirmation since the operation is irreversible
   (when (yes-or-no-p "Reset conversation? All messages will be cleared and the backend restarted. ")
     ;; Clear subagents from registry (same as claude-code-clear).
     (when claude-code--cwd
-      (when-let ((agent (gethash (or claude-code--session-key claude-code--cwd)
+      (when-let ((agent (gethash (claude-code--effective-session-key)
                                  claude-code--agents)))
         (dolist (child-id (plist-get agent :children))
           (remhash child-id claude-code--agents))
-        (puthash (or claude-code--session-key claude-code--cwd)
+        (puthash (claude-code--effective-session-key)
                  (plist-put agent :children nil)
                  claude-code--agents)
         (run-hooks 'claude-code-agents-update-hook)))
@@ -1003,7 +1003,7 @@ PROMPT           full task instructions sent as the subagent's first message."
                          (error "spawn-subagent: parent buffer %S not found"
                                 parent-buf-name)))
          (parent-key (with-current-buffer parent-buf
-                       (or claude-code--session-key claude-code--cwd)))
+                       (claude-code--effective-session-key)))
          (cwd        (with-current-buffer parent-buf claude-code--cwd))
          (task-id    (format "emacs-task-%s" (format-time-string "%s%N")))
          (buf-name   (generate-new-buffer-name

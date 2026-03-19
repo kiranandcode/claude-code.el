@@ -13,8 +13,9 @@
 
 Features a magit-section conversation buffer with streaming output, collapsible
 thinking/tool blocks, per-project configuration, org-roam context integration,
-slash commands, message queuing, and a treemacs-style agent sidebar for
-monitoring sessions and subagents.
+slash commands, message queuing, inline image rendering (vision), a stats
+dashboard, an Emacs-native MCP tool layer for deep Emacs introspection, and a
+treemacs-style agent sidebar for monitoring sessions and subagents.
 
 ## Architecture
 
@@ -36,6 +37,7 @@ monitoring sessions and subagents.
 │  ├── asyncio main loop (stdin reader)                   │
 │  ├── typed protocol (dataclasses)                       │
 │  ├── SDK message → protocol event conversion            │
+│  ├── in-process MCP server (12 Emacs tools)             │
 │  └── query dispatch + cancellation                      │
 │           │                                             │
 │           │ Claude Agent SDK                            │
@@ -223,6 +225,7 @@ Type `/` in the input area to trigger slash commands with auto-complete (via
 | `/notes` | Open the global notes file |
 | `/project-notes` | Open or create project context notes |
 | `/todos` | Open or create project TODO list |
+| `/stats` | Show per-session token/cost statistics |
 | `/inspect` | Show session state |
 | `/help` | Show the transient command menu |
 
@@ -359,6 +362,32 @@ The spinner now shows live stats while the agent works:
 - **↓ N chars** — characters streamed so far (rough output size)
 - **thought Xs** — time spent in thinking blocks
 
+### Usage Statistics
+
+`M-x claude-code-stats` (or `/stats` in the input area) opens a `*Claude Stats*`
+buffer with a visual summary of all completed queries in the current Emacs session:
+
+```
+Claude Code — Usage Statistics
+══════════════════════════════════════
+
+  Queries completed: 14
+  Total cost:        $0.2341
+  Total turns:       47
+
+  Cost per query (USD)
+
+  0.042 ┤                             ██
+  0.035 ┤              ██    ██       ██
+  0.028 ┤     ██       ██    ██   ██  ██
+  0.021 ┤     ██   ██  ██    ██   ██  ██  ██
+  0.014 ┤  ██ ██   ██  ██ ██ ██   ██  ██  ██  ██
+  0.007 ┤  ██ ██   ██  ██ ██ ██   ██  ██  ██  ██  ██
+         Q1  Q2   Q3  Q4 Q5 Q6   Q7  Q8  Q9 Q10 …
+```
+
+Stats are accumulated in memory and reset on Emacs restart.  Press `q` to close.
+
 ### Agent Sidebar
 
 Press `a` in the Claude buffer (or `M-x claude-code-agents-toggle`) to open a
@@ -388,10 +417,14 @@ Claude Agents
 - **`⎘ buffer-name`** shows the Emacs buffer each agent lives in
 - `RET` / click on a session node → jump to its conversation buffer
 - `RET` / click on a task node → jump to its dedicated task progress buffer
-- `k` kill agent, `g` refresh, `q` close
+- `k` kill agent (on task nodes: cancels the whole parent session), `g` refresh, `q` close
 
 The sidebar auto-updates as agents start, make progress, and complete.
 Sessions resume their conversation context across `claude-code-reload`.
+
+Task progress buffers (`claude-code-task-mode`) also show a `[Cancel]` button in their
+header and bind `c` / `C-c C-c` to cancel the parent session — so you can interrupt
+a running subagent without opening the sidebar.
 
 #### Emacs-Native Subagents
 
@@ -416,6 +449,32 @@ The call:
 This differs from the SDK's built-in sidechain subagents: each Emacs-native
 subagent is a **first-class, inspectable Emacs buffer** — you can click into
 it in the sidebar, read its conversation, and even interact with it directly.
+
+#### Emacs-Native MCP Tools
+
+The Python backend registers an **in-process MCP server** that exposes 12
+Emacs-introspection tools to Claude at query time.  These are automatically
+available in every session — no configuration required.
+
+| Tool | What it lets Claude do |
+|------|------------------------|
+| `EvalEmacs` | Evaluate arbitrary Emacs Lisp (with paren validation) |
+| `EmacsRenderFrame` | Capture an ANSI screenshot of the current Emacs frame |
+| `EmacsGetMessages` | Read the `*Messages*` buffer (for errors/debug output) |
+| `EmacsGetDebugInfo` | Get a combined `*Backtrace*` + `*Messages*` snapshot |
+| `EmacsGetBuffer` | Read any buffer's text content |
+| `EmacsGetBufferRegion` | Read a specific line range from a buffer |
+| `EmacsListBuffers` | List all live buffers with mode and file info |
+| `EmacsSwitchBuffer` | Switch the active buffer |
+| `EmacsGetPointInfo` | Get cursor position + surrounding context |
+| `EmacsSearchForward` | Regexp search forward (moves point) |
+| `EmacsSearchBackward` | Regexp search backward (moves point) |
+| `EmacsGotoLine` | Jump to a specific line number |
+
+MCP tool calls appear in the conversation with an `[Emacs]` badge and a
+`claude-code-mcp-tool-name` face to distinguish them from built-in SDK tools
+(e.g. `Read`, `Bash`).  The `[view]` button on their result headings pops the
+full output in a read-only buffer.
 
 ### Git Graph
 
@@ -669,8 +728,9 @@ Claude Code  [working]  ~/projects/myapp
 
 ◀ Assistant
   ◆ Thinking                                              [TAB to expand]
-  ⚙ Read src/auth.py                                      [TAB to expand]
-  ⚙ Grep pattern=verify_token                              [TAB to expand]
+  ⚙ Read src/auth.py                                      [TAB to expand] [view]
+  ⚙ Grep pattern=verify_token                              [TAB to expand] [view]
+  [Emacs] ⚙ EvalEmacs (require 'cl-lib)                   [TAB to expand] [view]
 
   The authentication module handles JWT verification...
 
@@ -689,7 +749,8 @@ Claude Code  [working]  ~/projects/myapp
 - **Header buttons** — `[Cancel]` (while working), `[Reset]`, and `[New Session]` are clickable; click or press `RET` to activate
 - **`[fork]` button** — appears on every `▶ You` heading; forks the conversation at that message
 - **Thinking blocks** — collapsed by default, toggle with `TAB`
-- **Tool-use blocks** — collapsed, heading shows tool name + summary (file path, grep pattern, etc.)
+- **Tool-use blocks** — collapsed; heading shows tool name + summary (file path, grep pattern, etc.); `[view]` button pops the full tool result in a read-only buffer (press `q` to close)
+- **`[Emacs]` badge** — Emacs-native MCP tool calls (e.g. `EvalEmacs`, `EmacsRenderFrame`) are highlighted with a distinct `[Emacs]` badge so they stand out from built-in SDK tools
 - **Streaming** — text appears token-by-token; thinking spinner animates via overlay
 - **Links** — URLs open in browser; absolute file paths open in Emacs
 

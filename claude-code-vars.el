@@ -313,6 +313,12 @@ Cleared after each send.")
 For primary sessions this equals `claude-code--cwd'; for secondary or
 forked sessions it is a unique string so the primary entry is not clobbered.")
 
+(defsubst claude-code--effective-session-key ()
+  "Return the agent-registry key for the current session.
+Uses `claude-code--session-key' when set (fork / new-session buffers),
+falling back to `claude-code--cwd' for primary sessions."
+  (or claude-code--session-key claude-code--cwd))
+
 (defvar-local claude-code--input-marker nil
   "Marker for the start of the user-editable input area at the buffer bottom.")
 
