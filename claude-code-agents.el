@@ -8,6 +8,10 @@
 (require 'claude-code-vars)
 (require 'magit-section)
 
+(declare-function claude-code--schedule-render "claude-code-commands")
+(declare-function claude-code-cancel "claude-code-commands")
+(declare-function claude-code-kill "claude-code-commands")
+
 ;;;; Agent Tracking
 
 (defvar claude-code--agents (make-hash-table :test 'equal)

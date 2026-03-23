@@ -11,7 +11,18 @@
 (require 'claude-code-vars)
 (require 'claude-code-config)
 (require 'claude-code-agents)
+(require 'claude-code-diff)
 (require 'magit-section)
+
+(declare-function claude-code--schedule-render "claude-code-commands")
+(declare-function claude-code--fork-at-msg "claude-code-commands")
+(declare-function claude-code-new-session "claude-code-commands")
+(declare-function claude-code-reset "claude-code-commands")
+(declare-function claude-code-cancel "claude-code-commands")
+(declare-function claude-code-save-project-config "claude-code-commands")
+(declare-function claude-code-set-permission-mode "claude-code-commands")
+(declare-function claude-code-set-effort "claude-code-commands")
+(declare-function claude-code-set-model "claude-code-commands")
 
 ;;;; Image Rendering Helpers
 
@@ -307,6 +318,15 @@ section keymap that `magit-insert-heading' stamps onto heading text."
           (setq content (append content nil)))
         (dolist (block content)
           (claude-code--render-content-block block))))
+    ;; Append a "✎ Modified:" summary line for any Edit/Write tools used.
+    (when claude-code-show-edit-diff
+      (let ((edited-files
+             (cl-loop for msg in msgs
+                      for content = (alist-get 'content msg)
+                      when content
+                      append (claude-code--collect-edit-files content))))
+        (when edited-files
+          (claude-code--render-edit-summary (delete-dups edited-files)))))
     (insert "\n")))
 
 (defun claude-code--render-assistant-msg (msg)
@@ -348,6 +368,8 @@ grouped rendering; this entry point is kept for ad-hoc use."
 
 (defun claude-code--render-tool-use (block)
   "Render a collapsible tool-use BLOCK.
+Edit and Write tool blocks are rendered as inline diff sections (see
+`claude-code-diff.el') when `claude-code-show-edit-diff' is non-nil.
 Emacs-native MCP tools (EvalEmacs, EmacsRenderFrame, etc.) are rendered
 with a distinct face and an [Emacs] badge so they are visually distinct
 from regular built-in tools."
@@ -357,24 +379,37 @@ from regular built-in tools."
          (disp-name (if is-mcp (claude-code--mcp-tool-short-name name) name))
          (summary   (claude-code--tool-summary name input))
          (name-face (if is-mcp 'claude-code-mcp-tool-name 'claude-code-tool-name)))
-    (magit-insert-section (claude-tool-use nil
-                                           (not claude-code-show-tool-details))
-      (magit-insert-heading
-        (concat "  "
-                (propertize (format "⚙ %s" disp-name) 'face name-face)
-                (when is-mcp
-                  (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
-                (when summary
-                  (concat " " (propertize summary 'face 'shadow)))))
-      (when input
-        (insert (propertize
-                 (claude-code--indent
-                  (if (stringp input)
-                      input
-                    (json-encode input))
-                  6)
-                 'face 'claude-code-tool-input))
-        (insert "\n")))))
+    (cond
+     ;; Edit tool with diff rendering
+     ((and (equal name "Edit")
+           (listp input)
+           claude-code-show-edit-diff)
+      (claude-code--render-edit-diff-section block))
+     ;; Write tool with content preview
+     ((and (equal name "Write")
+           (listp input)
+           claude-code-show-edit-diff)
+      (claude-code--render-write-diff-section block))
+     ;; All other tools: default collapsible JSON view
+     (t
+      (magit-insert-section (claude-tool-use nil
+                                             (not claude-code-show-tool-details))
+        (magit-insert-heading
+          (concat "  "
+                  (propertize (format "⚙ %s" disp-name) 'face name-face)
+                  (when is-mcp
+                    (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
+                  (when summary
+                    (concat " " (propertize summary 'face 'shadow)))))
+        (when input
+          (insert (propertize
+                   (claude-code--indent
+                    (if (stringp input)
+                        input
+                      (json-encode input))
+                    6)
+                   'face 'claude-code-tool-input))
+          (insert "\n")))))))
 
 (defun claude-code--tool-result-text (raw)
   "Extract a plain string from a tool-result content value RAW.

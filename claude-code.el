@@ -35,6 +35,7 @@
 (require 'claude-code-config)
 (require 'claude-code-stats)
 (require 'claude-code-events)
+(require 'claude-code-diff)
 (require 'claude-code-render)
 (require 'claude-code-commands)
 (require 'claude-code-git-graph)

@@ -11,6 +11,11 @@
 (require 'claude-code-agents)
 (require 'claude-code-stats)
 
+(declare-function claude-code--render "claude-code-render")
+(declare-function claude-code--start-thinking "claude-code-commands")
+(declare-function claude-code--stop-thinking "claude-code-commands")
+(declare-function claude-code--dispatch-input "claude-code-commands")
+
 ;;;; Event Handling
 
 (defun claude-code--handle-event (event)

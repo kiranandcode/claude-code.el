@@ -9,6 +9,14 @@
 
 (require 'claude-code-vars)
 
+(declare-function org-roam-node-list "ext:org-roam")
+(declare-function org-roam-node-properties "ext:org-roam")
+(declare-function org-roam-node-title "ext:org-roam")
+(declare-function org-roam-node-file "ext:org-roam")
+(declare-function org-roam-db-update-file "ext:org-roam")
+(declare-function org-roam-db-sync "ext:org-roam")
+(declare-function org-id-new "org-id")
+
 (defun claude-code--session-config ()
   "Return the merged config alist for the current session.
 Merge order: defaults < project config < session overrides."

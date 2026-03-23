@@ -9,6 +9,11 @@
 
 (require 'claude-code-vars)
 
+(declare-function claude-code--handle-event "claude-code-events")
+(declare-function claude-code--agent-update "claude-code-agents")
+(declare-function claude-code--schedule-render "claude-code-commands")
+(declare-function claude-code--stop-thinking "claude-code-commands")
+
 (defun claude-code--python-dir ()
   "Return the path to the python/ subdirectory."
   (expand-file-name "python/" claude-code--package-dir))
