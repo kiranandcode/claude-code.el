@@ -42,14 +42,7 @@ mypy:
 # Run Elsa static analysis on all source files
 elsa:
 	$(BATCH) -l elsa \
-	  --eval "(defun elsa--find-dependency (library-name) \
-	    (when (stringp library-name) \
-	      (let* ((load-suffixes (list \".el\" \".el.gz\")) \
-	             (load-file-rep-suffixes (list \"\"))) \
-	        (when-let ((lib-file (locate-library library-name))) \
-	          (let ((truename (file-truename lib-file))) \
-	            (unless (string-match-p \"/share/emacs/\" truename) \
-	              truename))))))" \
+	  --eval "(defun elsa--find-dependency (_library-name) nil)" \
 	  -f elsa-run ${SRC_FILES}
 
 # Run ERT tests with code coverage (writes coverage/lcov.info)

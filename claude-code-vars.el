@@ -114,8 +114,8 @@ CONFIG-ALIST entries override `claude-code-defaults'.  Valid keys:
 
   model            - string or nil (e.g. \"claude-opus-4-6\")
   effort           - nil, \"low\", \"medium\", \"high\", \"max\"
-  permission-mode  - \"default\", \"plan\",
-                     \"acceptEdits\", \"bypassPermissions\"
+  permission-mode  - \"default\", \"plan\", \"acceptEdits\",
+                     \"bypassPermissions\", \"askConfirmation\"
   max-turns        - integer
   max-budget-usd   - float or nil
   allowed-tools    - list of tool name strings
@@ -131,6 +131,27 @@ Example:
                 :value-type (alist :key-type symbol
                                    :value-type sexp))
   :group 'claude-code)
+
+;;;; Permission Confirmation Mode
+
+;; Per-session "don't ask again" patterns.  Each entry is a plist:
+;;   (:tool-name TOOL :pattern REGEXP)
+;; where REGEXP is matched against the serialised tool input.
+(defvar-local claude-code--permission-patterns nil
+  "List of approved-forever patterns for the askConfirmation mode.
+Each entry is a plist (:tool-name NAME :pattern REGEXP).")
+
+;; The currently pending permission request (or nil).
+;; Set when a `permission_request' event arrives; cleared when the user
+;; responds or when the status transitions away from `working'.
+(defvar-local claude-code--pending-permission nil
+  "Pending permission request from the backend, or nil.
+When non-nil this is an alist from `json-parse-string' with keys:
+  type       = \"permission_request\"
+  request_id = unique string
+  tool_name  = e.g. \"Bash\", \"Read\", \"Edit\"
+  tool_input = alist of tool arguments (may be nil)
+  description= short human-readable description (may be nil)")
 
 ;;;; Faces
 
@@ -214,6 +235,43 @@ from regular built-in tools (Read, Write, Bash, …)."
 (defface claude-code-config-button
   '((t :inherit (font-lock-variable-name-face button) :underline nil))
   "Clickable config value buttons (model, effort, permission mode) in the header."
+  :group 'claude-code)
+
+;;;; Permission Confirmation Faces
+
+(defface claude-code-confirm-heading
+  '((t :inherit warning :weight bold))
+  "Heading line of the permission confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-tool
+  '((t :inherit font-lock-type-face :weight bold))
+  "Tool name in the permission confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-command
+  '((t :inherit font-lock-string-face))
+  "Command/input text in the permission confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-description
+  '((t :inherit font-lock-comment-face :slant italic))
+  "Description text in the permission confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-option-selected
+  '((t :inherit success :weight bold))
+  "The highlighted (cursor) option in the confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-option
+  '((t :inherit shadow))
+  "Non-selected option in the confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-confirm-separator
+  '((t :inherit claude-code-separator))
+  "Separator lines around the confirmation widget."
   :group 'claude-code)
 
 ;;;; Internal State

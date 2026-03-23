@@ -1170,8 +1170,10 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
     (makunbound 'claude-code-mode-map)
     (makunbound 'claude-code-agents-mode-map)
     (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
-                       "claude-code-config" "claude-code-events" "claude-code-diff"
-                       "claude-code-render" "claude-code-commands" "claude-code-git-graph"))
+                       "claude-code-config" "claude-code-stats" "claude-code-events"
+                       "claude-code-diff" "claude-code-render" "claude-code-commands"
+                       "claude-code-git-graph" "claude-code-frame-render"
+                       "claude-code-emacs-tools"))
       (load (expand-file-name (concat subfile ".el") claude-code--package-dir) nil t))
     ;; Restore each buffer with saved state
     (dolist (state saved-states)
