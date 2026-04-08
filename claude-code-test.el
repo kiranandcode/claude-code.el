@@ -1069,6 +1069,217 @@ trigger `scroll-down-command'."
                  (claude-code--tool-summary "Glob" '((pattern . "*.el"))))))
 
 ;; ---------------------------------------------------------------------------
+;; Edit / MultiEdit diff rendering
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-diff-strings-detects-change ()
+  "`claude-code--diff-strings' returns a string containing diff markers."
+  (let ((result (claude-code--diff-strings "hello\n" "world\n")))
+    (should (stringp result))
+    (should (string-match-p "^-hello" result))
+    (should (string-match-p "^+world" result))))
+
+(ert-deftest claude-code-test-diff-strings-identical ()
+  "`claude-code--diff-strings' returns a string (possibly empty) for equal inputs."
+  (let ((result (claude-code--diff-strings "same\n" "same\n")))
+    ;; diff exits 0 on identical input; we get an empty string, not nil
+    (should (stringp result))))
+
+(ert-deftest claude-code-test-diff-strings-nil-on-non-string ()
+  "`claude-code--diff-strings' returns nil when given non-string arguments."
+  (should (null (claude-code--diff-strings nil "new")))
+  (should (null (claude-code--diff-strings "old" nil)))
+  (should (null (claude-code--diff-strings nil nil))))
+
+(ert-deftest claude-code-test-insert-diff-lines-faces ()
+  "`claude-code--insert-diff-lines' applies diff-mode faces to -, +, @@ lines."
+  (with-temp-buffer
+    (claude-code--insert-diff-lines
+     "--- before\n+++ after\n@@ -1 +1 @@\n-old line\n+new line\n context\n")
+    (let ((text (buffer-string)))
+      ;; All lines present
+      (should (string-match-p "old line" text))
+      (should (string-match-p "new line" text))
+      (should (string-match-p "context"  text)))
+    ;; Spot-check faces: find "+new line" and confirm face is diff-added
+    (goto-char (point-min))
+    (re-search-forward "new line")
+    (let ((face (get-text-property (match-beginning 0) 'face)))
+      (should (eq face 'diff-added)))
+    ;; Find "-old line" and confirm face is diff-removed
+    (goto-char (point-min))
+    (re-search-forward "old line")
+    (let ((face (get-text-property (match-beginning 0) 'face)))
+      (should (eq face 'diff-removed)))))
+
+(ert-deftest claude-code-test-render-edit-tool-shows-diff ()
+  "Rendering an Edit tool call should show diff markers in the buffer."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "edit-1")
+                         (name . "Edit")
+                         (input . ((file_path  . "/tmp/foo.el")
+                                   (old_string . "hello\n")
+                                   (new_string . "world\n"))))]))
+          claude-code--messages)
+    ;; Expand all tool-use sections so body text is visible
+    (let ((claude-code-show-tool-details t))
+      (claude-code--render))
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Edit"    text))
+      (should (string-match-p "hello"   text))
+      (should (string-match-p "world"   text)))))
+
+(ert-deftest claude-code-test-render-edit-tool-fallback-to-json ()
+  "Edit tool call missing old/new strings falls back to JSON display."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "edit-nostr")
+                         (name . "Edit")
+                         (input . ((file_path . "/tmp/bar.el"))))]))
+          claude-code--messages)
+    (let ((claude-code-show-tool-details t))
+      (claude-code--render))
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Edit"     text))
+      ;; Falls back to JSON, which includes the key name
+      (should (string-match-p "file_path" text)))))
+
+(ert-deftest claude-code-test-render-multiedit-shows-diffs ()
+  "MultiEdit renders a diff block for each edit in the edits array."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "tool_use")
+                         (id . "medit-1")
+                         (name . "MultiEdit")
+                         (input . ((file_path . "/tmp/multi.el")
+                                   (edits . [((old_string . "foo\n")
+                                              (new_string . "bar\n"))
+                                             ((old_string . "baz\n")
+                                              (new_string . "qux\n"))]))))]))
+          claude-code--messages)
+    (let ((claude-code-show-tool-details t))
+      (claude-code--render))
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "MultiEdit" text))
+      (should (string-match-p "foo"       text))
+      (should (string-match-p "bar"       text))
+      (should (string-match-p "baz"       text))
+      (should (string-match-p "qux"       text))
+      ;; Section separator labels should appear for multiple edits
+      (should (string-match-p "Edit 1/2" text)))))
+
+;; ---------------------------------------------------------------------------
+;; Code-block syntax highlighting
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-parse-text-blocks-prose-only ()
+  "`claude-code--parse-text-blocks' returns a single text segment for plain prose."
+  (let ((result (claude-code--parse-text-blocks "hello\nworld\n")))
+    (should (= 1 (length result)))
+    (should (eq 'text (caar result)))
+    (should (string-match-p "hello" (cdar result)))))
+
+(ert-deftest claude-code-test-parse-text-blocks-single-code ()
+  "A single fenced code block is parsed into prose + code + prose segments."
+  (let* ((text "Before\n```python\nprint('hi')\n```\nAfter\n")
+         (result (claude-code--parse-text-blocks text)))
+    ;; Expect: text("Before"), code(python . "print('hi')"), text("After")
+    (should (= 3 (length result)))
+    (should (eq 'text (car (nth 0 result))))
+    (should (eq 'code (car (nth 1 result))))
+    (should (eq 'text (car (nth 2 result))))
+    (let ((code-seg (cdr (nth 1 result))))
+      (should (equal "python" (car code-seg)))
+      (should (string-match-p "print" (cdr code-seg))))))
+
+(ert-deftest claude-code-test-parse-text-blocks-no-lang ()
+  "A fenced block with no language tag is parsed with an empty lang string."
+  (let* ((text "```\nsome code\n```\n")
+         (result (claude-code--parse-text-blocks text)))
+    (let ((code-seg (cdr (assq 'code result))))
+      (should code-seg)
+      (should (string-empty-p (car code-seg)))
+      (should (string-match-p "some code" (cdr code-seg))))))
+
+(ert-deftest claude-code-test-parse-text-blocks-multiple-code ()
+  "Multiple fenced blocks produce multiple code segments."
+  (let* ((text "```elisp\n(+ 1 2)\n```\n```python\npass\n```\n")
+         (result (claude-code--parse-text-blocks text)))
+    (let ((code-segs (cl-remove-if-not (lambda (s) (eq 'code (car s))) result)))
+      (should (= 2 (length code-segs)))
+      (should (equal "elisp"  (cadr (nth 0 code-segs))))
+      (should (equal "python" (cadr (nth 1 code-segs)))))))
+
+(ert-deftest claude-code-test-parse-text-blocks-unclosed-fence ()
+  "An unclosed fence is treated as prose rather than a code block."
+  (let* ((text "intro\n```python\ndef foo():\n    pass\n")
+         (result (claude-code--parse-text-blocks text)))
+    ;; All segments should be text; no code segment
+    (should (cl-every (lambda (s) (eq 'text (car s))) result))
+    ;; The fence header must appear somewhere in the prose
+    (let ((all-prose (mapconcat #'cdr result "\n")))
+      (should (string-match-p "python" all-prose)))))
+
+(ert-deftest claude-code-test-mode-for-lang-known ()
+  "`claude-code--mode-for-lang' returns mode functions for common languages."
+  (should (eq #'emacs-lisp-mode (claude-code--mode-for-lang "elisp")))
+  (should (eq #'emacs-lisp-mode (claude-code--mode-for-lang "emacs-lisp")))
+  (should (eq #'python-mode     (claude-code--mode-for-lang "python")))
+  (should (eq #'python-mode     (claude-code--mode-for-lang "py")))
+  (should (eq #'js-mode         (claude-code--mode-for-lang "javascript")))
+  (should (eq #'sh-mode         (claude-code--mode-for-lang "bash")))
+  (should (eq #'sh-mode         (claude-code--mode-for-lang "sh"))))
+
+(ert-deftest claude-code-test-mode-for-lang-unknown ()
+  "`claude-code--mode-for-lang' returns nil for unrecognised languages."
+  (should (null (claude-code--mode-for-lang "brainfuck")))
+  (should (null (claude-code--mode-for-lang "")))
+  (should (null (claude-code--mode-for-lang nil))))
+
+(ert-deftest claude-code-test-fontify-code-elisp ()
+  "`claude-code--fontify-code' returns a string with text properties for elisp."
+  (let* ((code "(defun foo () nil)")
+         (result (claude-code--fontify-code code #'emacs-lisp-mode)))
+    (should (stringp result))
+    ;; The content should be preserved
+    (should (string-match-p "defun" result))
+    ;; At least some text properties should be present (font-lock applied)
+    (should (text-property-not-all 0 (length result) 'face nil result))))
+
+(ert-deftest claude-code-test-fontify-code-nil-mode ()
+  "`claude-code--fontify-code' returns code unchanged when mode is nil."
+  (let ((code "some plain text"))
+    (should (equal code (claude-code--fontify-code code nil)))))
+
+(ert-deftest claude-code-test-render-text-with-code-block ()
+  "Rendering a text block with a code fence shows the fence markers."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "text")
+                         (text . "Here is some code:\n```python\nprint('hello')\n```\nDone."))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Here is some code" text))
+      (should (string-match-p "python"            text))
+      (should (string-match-p "print"             text))
+      (should (string-match-p "Done"              text)))))
+
+(ert-deftest claude-code-test-render-text-no-code-unchanged ()
+  "Rendering plain prose (no fences) works as before."
+  (claude-code-test-with-buffer
+    (push `((type . "assistant")
+            (content . [((type . "text")
+                         (text . "Just plain text here."))]))
+          claude-code--messages)
+    (claude-code--render)
+    (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+      (should (string-match-p "Just plain text here" text)))))
+
+;; ---------------------------------------------------------------------------
 ;; Process recovery
 ;; ---------------------------------------------------------------------------
 

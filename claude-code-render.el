@@ -363,13 +363,130 @@ grouped rendering; this entry point is kept for ad-hoc use."
       ("tool_result"
        (claude-code--render-tool-result block)))))
 
+;;;; Code-block syntax highlighting
+
+(defun claude-code--mode-for-lang (lang)
+  "Return a major mode function for LANG string, or nil if unrecognised.
+Optional third-party modes are guarded with `fboundp' so the function
+returns nil gracefully when those packages are not installed."
+  (pcase (downcase (or lang ""))
+    ((or "elisp" "emacs-lisp" "el") #'emacs-lisp-mode)
+    ((or "python" "py")             #'python-mode)
+    ((or "javascript" "js")         #'js-mode)
+    ((or "typescript" "ts")
+     (and (fboundp 'typescript-mode) #'typescript-mode))
+    ((or "rust" "rs")
+     (and (fboundp 'rust-mode) #'rust-mode))
+    ("go"
+     (and (fboundp 'go-mode) #'go-mode))
+    ((or "bash" "sh" "shell" "zsh") #'sh-mode)
+    ("ruby"                         #'ruby-mode)
+    ("java"                         #'java-mode)
+    ("c"                            #'c-mode)
+    ((or "cpp" "c++" "cxx")         #'c++-mode)
+    ("sql"                          #'sql-mode)
+    ("json"                         #'js-mode)
+    ((or "yaml" "yml")
+     (and (fboundp 'yaml-mode) #'yaml-mode))
+    ("html"                         #'html-mode)
+    ("css"                          #'css-mode)
+    ((or "markdown" "md")
+     (and (fboundp 'markdown-mode) #'markdown-mode))
+    (_                              nil)))
+
+(defun claude-code--fontify-code (code mode-fn)
+  "Return CODE with font-lock text properties applied by MODE-FN.
+If MODE-FN is nil or not a function, CODE is returned unchanged."
+  (if (and mode-fn (fboundp mode-fn))
+      (with-temp-buffer
+        (insert code)
+        (ignore-errors
+          (funcall mode-fn)
+          (font-lock-ensure))
+        (buffer-string))
+    code))
+
+(defun claude-code--parse-text-blocks (text)
+  "Parse TEXT into a list of segments.
+Each segment is either (text . PROSE-STRING) or (code . (LANG . CODE-STRING)).
+Fenced code blocks delimited by lines matching \\=`^```[lang]\\=' and \\=`^```\\='
+are extracted as code segments; everything else is prose."
+  (let ((lines (split-string text "\n" nil))
+        segments prose-lines code-lines in-code code-lang)
+    (dolist (line lines)
+      (cond
+       ;; Closing fence (only when inside a code block)
+       ((and in-code (string-match-p "^```[ \t]*$" line))
+        (push (cons 'code (cons (or code-lang "")
+                                (mapconcat #'identity
+                                           (nreverse code-lines) "\n")))
+              segments)
+        (setq in-code nil code-lang nil code-lines nil))
+       ;; Opening fence (only outside a code block)
+       ((and (not in-code) (string-match "^```\\(.*\\)$" line))
+        (when prose-lines
+          (push (cons 'text (mapconcat #'identity
+                                       (nreverse prose-lines) "\n"))
+                segments)
+          (setq prose-lines nil))
+        (setq in-code t
+              code-lang (string-trim (match-string 1 line))
+              code-lines nil))
+       ;; Inside a code block
+       (in-code
+        (push line code-lines))
+       ;; Prose line
+       (t
+        (push line prose-lines))))
+    ;; Flush remaining content
+    (if in-code
+        ;; Unclosed fence → treat everything from the fence as prose
+        (let ((dangling (concat "```" code-lang "\n"
+                                (mapconcat #'identity
+                                           (nreverse code-lines) "\n"))))
+          (push (cons 'text (concat
+                              (when prose-lines
+                                (concat (mapconcat #'identity
+                                                   (nreverse prose-lines) "\n")
+                                        "\n"))
+                              dangling))
+                segments))
+      (when prose-lines
+        (push (cons 'text (mapconcat #'identity (nreverse prose-lines) "\n"))
+              segments)))
+    (nreverse segments)))
+
+(defun claude-code--insert-code-block (lang code)
+  "Insert a syntax-highlighted fenced code block for LANG with CODE text.
+The opening and closing ``` fence lines are rendered in the `shadow' face.
+The code body is fontified using the major mode for LANG when available."
+  (let* ((mode-fn    (claude-code--mode-for-lang lang))
+         (label      (if (and lang (not (string-empty-p lang)))
+                         (format "```%s" lang)
+                       "```"))
+         (fontified  (claude-code--fontify-code code mode-fn)))
+    ;; Opening fence
+    (insert (propertize (concat "  " label "\n") 'face 'shadow))
+    ;; Fontified code body
+    (dolist (line (split-string fontified "\n" nil))
+      (insert "  " line "\n"))
+    ;; Closing fence
+    (insert (propertize "  ```\n" 'face 'shadow))))
+
 (defun claude-code--render-text (text)
-  "Render a TEXT content block."
+  "Render a TEXT content block.
+Fenced code blocks are syntax-highlighted using the language's major mode;
+prose lines are linkified as before."
   (when (and text (not (string-empty-p text)))
-    (dolist (line (split-string text "\n"))
-      (insert "  ")
-      (claude-code--insert-linkified line)
-      (insert "\n"))))
+    (dolist (segment (claude-code--parse-text-blocks text))
+      (pcase segment
+        (`(text . ,prose)
+         (dolist (line (split-string prose "\n" nil))
+           (insert "  ")
+           (claude-code--insert-linkified line)
+           (insert "\n")))
+        (`(code . (,lang . ,code))
+         (claude-code--insert-code-block lang code))))))
 
 (defun claude-code--render-thinking (text)
   "Render a collapsible thinking TEXT block."
@@ -403,14 +520,109 @@ from regular built-in tools."
                 (when summary
                   (concat " " (propertize summary 'face 'shadow)))))
       (when input
-        (insert (propertize
-                 (claude-code--indent
-                  (if (stringp input)
-                      input
-                    (json-encode input))
-                  6)
-                 'face 'claude-code-tool-input))
-        (insert "\n")))))
+        (pcase (claude-code--mcp-tool-short-name name)
+          ("Edit"
+           (claude-code--render-edit-input input)
+           (insert "\n"))
+          ("MultiEdit"
+           (claude-code--render-multiedit-input input)
+           (insert "\n"))
+          (_
+           (insert (propertize
+                    (claude-code--indent
+                     (if (stringp input)
+                         input
+                       (json-encode input))
+                     6)
+                    'face 'claude-code-tool-input))
+           (insert "\n")))))))
+
+;;;; Edit / MultiEdit diff rendering
+
+(defun claude-code--diff-strings (old new)
+  "Return a unified diff string OLD → NEW, or nil on failure.
+Writes two temp files and invokes the external `diff -u' command.
+Exit codes 0 (identical) and 1 (differences found) are both treated as
+success; exit code 2 or higher indicates an error and nil is returned."
+  (when (and (stringp old) (stringp new))
+    (let ((old-file (make-temp-file "claude-edit-old"))
+          (new-file (make-temp-file "claude-edit-new")))
+      (unwind-protect
+          (progn
+            (with-temp-file old-file (insert old))
+            (with-temp-file new-file (insert new))
+            (with-temp-buffer
+              (let ((rc (call-process "diff" nil t nil "-u"
+                                      "--label" "before"
+                                      "--label" "after"
+                                      old-file new-file)))
+                (when (< rc 2)
+                  (buffer-string)))))
+        (ignore-errors (delete-file old-file))
+        (ignore-errors (delete-file new-file))))))
+
+(defun claude-code--insert-diff-lines (diff-str)
+  "Insert DIFF-STR with diff-mode-like face coloring, indented 6 spaces.
+Lines are colored by prefix:
+  `---' / `+++' → `diff-file-header'
+  `@@'           → `diff-hunk-header'
+  `-'            → `diff-removed'
+  `+'            → `diff-added'
+  context lines  → shadow"
+  (require 'diff-mode)
+  (dolist (line (split-string diff-str "\n" t))
+    (let ((face (cond
+                 ((string-prefix-p "---" line) 'diff-file-header)
+                 ((string-prefix-p "+++" line) 'diff-file-header)
+                 ((string-prefix-p "@@" line)  'diff-hunk-header)
+                 ((string-prefix-p "-" line)   'diff-removed)
+                 ((string-prefix-p "+" line)   'diff-added)
+                 (t 'shadow))))
+      (insert (propertize (concat "      " line) 'face face))
+      (insert "\n"))))
+
+(defun claude-code--render-edit-input (input)
+  "Render INPUT for an Edit tool call as a unified diff.
+Falls back to raw JSON if `diff' is unavailable or INPUT lacks the
+expected `old_string' / `new_string' keys."
+  (let* ((old  (alist-get 'old_string input))
+         (new  (alist-get 'new_string input))
+         (diff (and old new (claude-code--diff-strings old new))))
+    (if diff
+        (claude-code--insert-diff-lines diff)
+      (insert (propertize
+               (claude-code--indent (json-encode input) 6)
+               'face 'claude-code-tool-input)))))
+
+(defun claude-code--render-multiedit-input (input)
+  "Render INPUT for a MultiEdit tool call as per-edit unified diffs.
+Each entry in the `edits' vector is rendered as a separate diff block
+labelled \"Edit N/M\" when there are multiple edits.  Falls back to raw
+JSON display when `diff' is unavailable."
+  (let* ((edits (alist-get 'edits input))
+         (edit-list (cond ((vectorp edits) (append edits nil))
+                          ((listp edits)   edits))))
+    (if edit-list
+        (let ((n   (length edit-list))
+              (idx 0))
+          (dolist (edit edit-list)
+            (cl-incf idx)
+            (when (> n 1)
+              (require 'diff-mode)
+              (insert (propertize (format "      ── Edit %d/%d ──\n" idx n)
+                                  'face 'diff-hunk-header)))
+            (let* ((old  (alist-get 'old_string edit))
+                   (new  (alist-get 'new_string edit))
+                   (diff (and old new (claude-code--diff-strings old new))))
+              (if diff
+                  (claude-code--insert-diff-lines diff)
+                (insert (propertize
+                         (claude-code--indent (json-encode edit) 6)
+                         'face 'claude-code-tool-input))))))
+      ;; Fallback: edits key absent or malformed
+      (insert (propertize
+               (claude-code--indent (json-encode input) 6)
+               'face 'claude-code-tool-input)))))
 
 (defun claude-code--tool-result-text (raw)
   "Extract a plain string from a tool-result content value RAW.

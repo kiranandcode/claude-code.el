@@ -1291,6 +1291,9 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
               ;; buffer-locals we need to preserve.  Instead just refresh the
               ;; keymap in-place so new bindings take effect.
               (use-local-map claude-code-mode-map)
+              ;; Re-apply the highlight fix that claude-code-mode normally does.
+              (remove-hook 'redisplay--update-region-highlight-functions
+                           #'magit-section--highlight-region t)
               ;; Re-register in the agent table (status stays working).
               (claude-code--agent-register
                dir

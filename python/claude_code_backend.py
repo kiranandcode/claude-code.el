@@ -1047,56 +1047,68 @@ _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
 _pending_permission_requests: dict[str, asyncio.Event] = {}
 # Maps request_id → decision string ("allow" | "deny" | "always_allow").
 _permission_decisions: dict[str, str] = {}
-# Tool names the user has approved with "always allow" for this process run.
-_always_allowed_tools: set[str] = set()
 
 # Timeout (seconds) waiting for the user to approve/deny a permission prompt.
 _PERMISSION_TIMEOUT = 60.0
 
 
-async def _can_use_tool_callback(
-    tool_name: str,
-    tool_input: dict[str, Any],
-    _context: ToolPermissionContext,
-) -> PermissionResultAllow | PermissionResultDeny:
-    """Async callback that asks Emacs before executing each tool call.
+def _make_can_use_tool_callback() -> (
+    "Callable[[str, dict[str, Any], ToolPermissionContext], Awaitable[PermissionResultAllow | PermissionResultDeny]]"
+):
+    """Return a fresh can_use_tool callback with its own always-allowed set.
 
-    Emits a ``permission_request`` event and blocks until Emacs sends a
-    ``permission_response`` command with the matching ``request_id``.
-    Times out after ``_PERMISSION_TIMEOUT`` seconds and auto-denies.
+    The set is scoped to a single query (i.e. one user message and all its
+    agentic turns).  "Always allow" means "don't ask again during this
+    response" — it is NOT persisted across separate user messages so that
+    the user retains full control each time they send a new prompt.
     """
-    if tool_name in _always_allowed_tools:
-        return PermissionResultAllow()
+    always_allowed: set[str] = set()
 
-    request_id = f"perm_{os.urandom(6).hex()}"
-    event = asyncio.Event()
-    _pending_permission_requests[request_id] = event
+    async def _callback(
+        tool_name: str,
+        tool_input: dict[str, Any],
+        _context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Async callback that asks Emacs before executing each tool call.
 
-    emit(PermissionRequestEvent(
-        request_id=request_id,
-        tool_name=tool_name,
-        tool_input=tool_input,
-    ))
+        Emits a ``permission_request`` event and blocks until Emacs sends a
+        ``permission_response`` command with the matching ``request_id``.
+        Times out after ``_PERMISSION_TIMEOUT`` seconds and auto-denies.
+        """
+        if tool_name in always_allowed:
+            return PermissionResultAllow()
 
-    try:
-        await asyncio.wait_for(event.wait(), timeout=_PERMISSION_TIMEOUT)
-    except asyncio.TimeoutError:
+        request_id = f"perm_{os.urandom(6).hex()}"
+        event = asyncio.Event()
+        _pending_permission_requests[request_id] = event
+
+        emit(PermissionRequestEvent(
+            request_id=request_id,
+            tool_name=tool_name,
+            tool_input=tool_input,
+        ))
+
+        try:
+            await asyncio.wait_for(event.wait(), timeout=_PERMISSION_TIMEOUT)
+        except asyncio.TimeoutError:
+            _pending_permission_requests.pop(request_id, None)
+            _permission_decisions.pop(request_id, None)
+            return PermissionResultDeny(
+                message=f"Permission request timed out after {_PERMISSION_TIMEOUT:.0f}s"
+            )
+
+        decision = _permission_decisions.pop(request_id, "deny")
         _pending_permission_requests.pop(request_id, None)
-        _permission_decisions.pop(request_id, None)
-        return PermissionResultDeny(
-            message=f"Permission request timed out after {_PERMISSION_TIMEOUT:.0f}s"
-        )
 
-    decision = _permission_decisions.pop(request_id, "deny")
-    _pending_permission_requests.pop(request_id, None)
+        if decision == "always_allow":
+            always_allowed.add(tool_name)
+            return PermissionResultAllow()
+        elif decision == "allow":
+            return PermissionResultAllow()
+        else:
+            return PermissionResultDeny(message="Denied by user")
 
-    if decision == "always_allow":
-        _always_allowed_tools.add(tool_name)
-        return PermissionResultAllow()
-    elif decision == "allow":
-        return PermissionResultAllow()
-    else:
-        return PermissionResultDeny(message="Denied by user")
+    return _callback
 
 
 def parse_command(raw: dict[str, Any]) -> Command:
@@ -1203,6 +1215,10 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
     ask_tools = set(cmd.ask_permission_tools or [])
     use_permission_callback = bool(ask_tools)
 
+    # Create a fresh callback with its own always-allowed set so that
+    # "always allow" decisions are scoped to this query only.
+    _raw_callback = _make_can_use_tool_callback() if use_permission_callback else None
+
     # Intercept only for the tools the user wants to confirm; let the SDK
     # run everything else without interruption.
     async def _filtered_callback(
@@ -1210,8 +1226,8 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
         tool_input: dict[str, Any],
         context: ToolPermissionContext,
     ) -> PermissionResultAllow | PermissionResultDeny:
-        if tool_name in ask_tools:
-            return await _can_use_tool_callback(tool_name, tool_input, context)
+        if tool_name in ask_tools and _raw_callback is not None:
+            return await _raw_callback(tool_name, tool_input, context)
         return PermissionResultAllow()
 
     # bypassPermissions makes the SDK skip all can_use_tool calls entirely, so
