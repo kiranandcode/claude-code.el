@@ -12,13 +12,13 @@
 ;; org-roam and org-id are optional; declare their symbols to suppress
 ;; byte-compiler warnings when those packages are not yet loaded.
 (defvar org-roam-directory)
-(declare-function org-roam-node-list "org-roam-node")
-(declare-function org-roam-node-properties "org-roam-node")
-(declare-function org-roam-node-title "org-roam-node")
-(declare-function org-roam-node-file "org-roam-node")
+(declare-function org-roam-node-list "ext:org-roam")
+(declare-function org-roam-node-properties "ext:org-roam")
+(declare-function org-roam-node-title "ext:org-roam")
+(declare-function org-roam-node-file "ext:org-roam")
+(declare-function org-roam-db-update-file "ext:org-roam")
+(declare-function org-roam-db-sync "ext:org-roam")
 (declare-function org-id-new "org-id")
-(declare-function org-roam-db-update-file "org-roam-db")
-(declare-function org-roam-db-sync "org-roam-db")
 
 (defun claude-code--session-config ()
   "Return the merged config alist for the current session.

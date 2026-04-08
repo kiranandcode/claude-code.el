@@ -47,6 +47,12 @@
                   (unless (or (member dep seen)
                               (member dep builtins))
                     (push dep queue))))))))))
+  ;; Fallback: add package.el elpa subdirs for packages not managed by straight
+  (let ((elpa-dir (expand-file-name "elpa/" user-emacs-directory)))
+    (when (file-directory-p elpa-dir)
+      (dolist (entry (directory-files elpa-dir t "\\`[^.]"))
+        (when (file-directory-p entry)
+          (add-to-list 'load-path entry)))))
   ;; Add the project root
   (add-to-list 'load-path project-dir))
 

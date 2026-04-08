@@ -4,7 +4,7 @@ BATCH := ./emacs-batch.sh
 # Run all checks by default.
 MATCH ?=
 
-.PHONY: test clean mypy all checkdoc compile pytest
+.PHONY: test clean mypy all checkdoc compile pytest elsa coverage
 
 default: all
 
@@ -42,5 +42,16 @@ pytest:
 # Type-check Python backend
 mypy:
 	cd python && uv run mypy --strict claude_code_backend.py
+
+# Run Elsa static analysis on all source files
+elsa:
+	$(BATCH) -l elsa \
+	  --eval "(defun elsa--find-dependency (_library-name) nil)" \
+	  -f elsa-run ${SRC_FILES}
+
+# Run ERT tests with code coverage (writes coverage/lcov.info)
+coverage:
+	mkdir -p coverage
+	$(BATCH) -l dev/coverage.el -l claude-code-test.el -f ert-run-tests-batch-and-exit
 
 all: checkdoc compile test pytest mypy

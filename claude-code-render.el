@@ -11,6 +11,7 @@
 (require 'claude-code-vars)
 (require 'claude-code-config)
 (require 'claude-code-agents)
+(require 'claude-code-diff)
 (require 'magit-section)
 
 ;; Forward declarations for functions defined in claude-code-events.el and
@@ -501,6 +502,8 @@ prose lines are linkified as before."
 
 (defun claude-code--render-tool-use (block)
   "Render a collapsible tool-use BLOCK.
+Edit and Write tool blocks are rendered as inline diff sections (see
+`claude-code-diff.el') when `claude-code-show-edit-diff' is non-nil.
 Emacs-native MCP tools (EvalEmacs, EmacsRenderFrame, etc.) are rendered
 with a distinct face and an [Emacs] badge so they are visually distinct
 from regular built-in tools."

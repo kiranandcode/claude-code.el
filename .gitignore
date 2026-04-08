@@ -16,3 +16,4 @@
 sockets-mcp/
 
 python/__pycache__/*
+.elsa/

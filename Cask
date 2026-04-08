@@ -6,3 +6,7 @@
 (depends-on "emacs" "30.0")
 (depends-on "magit-section" "4.0.0")
 (depends-on "transient" "0.9.3")
+
+(development
+  (depends-on "elsa")
+  (depends-on "undercover"))

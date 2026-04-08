@@ -13,6 +13,10 @@
 (require 'claude-code-process)
 (require 'claude-code-config)
 (require 'claude-code-events)
+
+(declare-function org-roam-node-file "ext:org-roam")
+(declare-function org-roam-node-visit "ext:org-roam")
+(declare-function org-roam-db-update-file "ext:org-roam")
 (require 'claude-code-render)
 (require 'magit-section)
 (require 'transient)
@@ -797,12 +801,31 @@ input.  Edits to queued slots are saved back before moving on."
            (nth new-index claude-code--input-history))))))))
 
 (defun claude-code-return ()
-  "Submit the input if point is in the input area; otherwise toggle section."
+  "Submit input, open ediff for edit diffs, or toggle section.
+
+In the input area: submit the prompt.
+On a `claude-edit-diff' section: open a side-by-side ediff comparison
+  in a new tab (identical to clicking the [ediff] button).
+On a `claude-edit-diff' section that is a Write (no old-string): open
+  the file directly.
+Elsewhere: toggle the magit section at point."
   (interactive)
-  (if (and claude-code--input-marker
-           (>= (point) (marker-position claude-code--input-marker)))
-      (claude-code-submit-input)
-    (call-interactively #'magit-section-toggle)))
+  (cond
+   ;; Input area → submit
+   ((and claude-code--input-marker
+         (>= (point) (marker-position claude-code--input-marker)))
+    (claude-code-submit-input))
+   ;; Edit/Write diff section → open ediff (or file for Write)
+   ((when-let* ((sec (magit-current-section))
+                (_ (eq (oref sec type) 'claude-edit-diff))
+                (val (oref sec value)))
+      (claude-code--open-ediff (plist-get val :file-path)
+                               (plist-get val :old-string)
+                               (plist-get val :new-string))
+      t))
+   ;; Default → toggle section
+   (t
+    (call-interactively #'magit-section-toggle))))
 
 ;;;; Session Config Commands
 
@@ -1265,8 +1288,9 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
       (makunbound 'claude-code-agents-mode-map)
       (condition-case err
           (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
-                             "claude-code-config" "claude-code-events" "claude-code-render"
-                             "claude-code-commands" "claude-code-git-graph"
+                             "claude-code-config" "claude-code-stats" "claude-code-events"
+                             "claude-code-diff" "claude-code-render" "claude-code-commands"
+                             "claude-code-git-graph" "claude-code-frame-render"
                              "claude-code-emacs-tools"))
             (load (expand-file-name (concat subfile ".el") claude-code--package-dir) nil t))
         (error
