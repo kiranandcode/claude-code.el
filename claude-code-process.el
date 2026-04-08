@@ -9,6 +9,12 @@
 
 (require 'claude-code-vars)
 
+;; Forward declarations for functions defined in files loaded after this one.
+(declare-function claude-code--handle-event "claude-code-events")
+(declare-function claude-code--schedule-render "claude-code-events")
+(declare-function claude-code--agent-update "claude-code-agents")
+(declare-function claude-code--stop-thinking "claude-code-render")
+
 (defun claude-code--python-dir ()
   "Return the path to the python/ subdirectory."
   (expand-file-name "python/" claude-code--package-dir))
@@ -144,7 +150,7 @@ If the process is dead, restart it automatically before sending."
                          (substring line 0 (min 200 (length line))))
               (condition-case err
                   (claude-code--handle-event
-                   (json-parse-string line :object-type 'alist))
+                   (json-parse-string line :object-type 'alist :false-object nil))
                 (error
                  (message "Claude SDK: parse error on: %S — %s"
                           (substring line 0 (min 200 (length line)))

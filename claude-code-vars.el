@@ -216,6 +216,21 @@ from regular built-in tools (Read, Write, Bash, …)."
   "Clickable config value buttons (model, effort, permission mode) in the header."
   :group 'claude-code)
 
+(defface claude-code-permission-prompt
+  '((t :inherit warning :weight bold))
+  "Face for the tool-approval prompt header."
+  :group 'claude-code)
+
+(defface claude-code-permission-allow
+  '((t :inherit success :weight bold))
+  "Face for Allow / Always-Allow buttons in the tool-approval prompt."
+  :group 'claude-code)
+
+(defface claude-code-permission-deny
+  '((t :inherit error :weight bold))
+  "Face for Deny buttons in the tool-approval prompt."
+  :group 'claude-code)
+
 ;;;; Internal State
 
 (defvar claude-code--package-dir nil
@@ -407,6 +422,40 @@ are written back to that slot before moving to the next.")
 (defvar-local claude-code--streaming-char-count 0
   "Total characters received from text/thinking deltas this query.
 Used as a rough token-count approximation in the thinking spinner.")
+
+;;;; Tool-Call Permission State
+
+(defcustom claude-code-ask-permission-tools
+  '("Bash" "Write" "Edit" "MultiEdit")
+  "Tool names for which Emacs should prompt for approval before execution.
+Each tool call for a listed tool will pause and show an inline approval
+widget before Claude can proceed.  Set to nil to never prompt (equivalent
+to `bypassPermissions' behaviour).
+
+Note: this only takes effect when `permission-mode' is not
+\"bypassPermissions\".  With bypassPermissions the SDK skips all permission
+checks; the Emacs-side ask-permission feature overrides this to \"default\"
+for the listed tools automatically."
+  :type '(repeat string)
+  :group 'claude-code)
+
+(defvar-local claude-code--pending-permission nil
+  "Alist describing the current pending permission request, or nil.
+Keys: request-id, tool-name, tool-input.
+Present between receipt of a `permission_request' event and the user's
+response; cleared after the user approves or denies.")
+
+(defvar-local claude-code--always-allowed-tools nil
+  "List of tool names always-allowed in this session (Emacs-side mirror).
+Used to display an indicator in the header.  The Python backend maintains
+its own set which governs actual enforcement.")
+
+(defvar-local claude-code--ask-permission-override 'unset
+  "Buffer-local on/off override for the ask-permission feature.
+`unset' means follow the global `claude-code-ask-permission-tools':
+  non-nil list → on; nil list → off.
+`t'   forces the feature ON for this session.
+`nil' forces the feature OFF for this session.")
 
 ;;;; Emacs-Native Subagent State
 

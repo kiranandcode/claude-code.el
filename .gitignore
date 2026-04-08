@@ -14,3 +14,5 @@
 
 # Experimental sockets/MCP directory
 sockets-mcp/
+
+python/__pycache__/*

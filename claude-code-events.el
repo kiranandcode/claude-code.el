@@ -11,6 +11,12 @@
 (require 'claude-code-agents)
 (require 'claude-code-stats)
 
+;; Forward declarations for functions defined in files loaded after this one.
+(declare-function claude-code--render "claude-code-render")
+(declare-function claude-code--start-thinking "claude-code-render")
+(declare-function claude-code--stop-thinking "claude-code-render")
+(declare-function claude-code--dispatch-input "claude-code-commands")
+
 ;;;; Event Handling
 
 (defun claude-code--handle-event (event)
@@ -86,6 +92,8 @@
                  (text . ,(format "Subagent %s: %s" status summary)))
                claude-code--messages)
          (claude-code--schedule-render)))
+      ("permission_request"
+       (claude-code--handle-permission-request event))
       ;; input_json_delta, rate_limit — ignored for now
       )))
 
@@ -127,7 +135,8 @@
        (setq claude-code--query-start-time nil
              claude-code--thinking-block-start-time nil
              claude-code--input-queued nil
-             claude-code--queue-edit-index nil)
+             claude-code--queue-edit-index nil
+             claude-code--pending-permission nil)
        (when agent-key
          (claude-code--agent-update agent-key :status 'ready))
        (push '((type . "info") (text . "Cancelled."))
@@ -140,6 +149,21 @@
        (when agent-key
          (claude-code--agent-update agent-key :status 'error))))
     (claude-code--schedule-render)))
+
+(defun claude-code--handle-permission-request (event)
+  "Handle a permission_request EVENT from the backend.
+Stores the request in `claude-code--pending-permission' and triggers a
+render so the approval widget appears inline above the input area."
+  (let ((request-id (alist-get 'request_id event))
+        (tool-name  (alist-get 'tool_name event))
+        (tool-input (alist-get 'tool_input event)))
+    (setq claude-code--pending-permission
+          `((request-id . ,request-id)
+            (tool-name  . ,tool-name)
+            (tool-input . ,tool-input)))
+    (claude-code--schedule-render)
+    (message "claude-code: approval needed for %s — press y/Y/n in the Claude buffer"
+             tool-name)))
 
 (defun claude-code--handle-system-event (event)
   "Handle a system EVENT."

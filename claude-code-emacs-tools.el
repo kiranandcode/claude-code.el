@@ -95,6 +95,12 @@ Handles strings, characters, and line comments correctly."
 
 ;;;; Messages log
 
+(defun claude-code-tools--sanitize-string (str)
+  "Remove control characters from STR that would break JSON encoding.
+Keeps tab (\\t), newline (\\n), and carriage return (\\r) but strips all
+other C0 control characters (U+0000–U+001F) and DEL (U+007F)."
+  (replace-regexp-in-string "[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]" "" str))
+
 (defun claude-code-tools-get-messages (&optional n-chars)
   "Return the last N-CHARS characters from the *Messages* buffer.
 Defaults to 3000 characters.  Returns a plain string."
@@ -103,7 +109,8 @@ Defaults to 3000 characters.  Returns a plain string."
         (with-current-buffer "*Messages*"
           (let* ((end (point-max))
                  (start (max (point-min) (- end n))))
-            (buffer-substring-no-properties start end)))
+            (claude-code-tools--sanitize-string
+             (buffer-substring-no-properties start end))))
       "(no *Messages* buffer)")))
 
 ;;;; Debug info (backtrace + messages)
@@ -135,7 +142,8 @@ Returns an error string if the buffer does not exist."
     (if (not buf)
         (format "error: no buffer named %S" buffer-name)
       (with-current-buffer buf
-        (let ((text (buffer-substring-no-properties (point-min) (point-max))))
+        (let ((text (claude-code-tools--sanitize-string
+                     (buffer-substring-no-properties (point-min) (point-max)))))
           (if with-line-numbers
               (let ((lines (split-string text "\n"))
                     (n 1)
@@ -156,8 +164,9 @@ buffer does not exist or the range is invalid."
       (with-current-buffer buf
         (save-excursion
           (goto-char (point-min))
-          (let ((lines (split-string (buffer-substring-no-properties
-                                      (point-min) (point-max))
+          (let ((lines (split-string (claude-code-tools--sanitize-string
+                                      (buffer-substring-no-properties
+                                       (point-min) (point-max)))
                                      "\n"))
                 result)
             (let ((total (length lines)))

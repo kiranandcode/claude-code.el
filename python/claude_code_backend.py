@@ -7,8 +7,10 @@ Uses the Claude Agent SDK to run an AI agent with tool access.
 
 from __future__ import annotations
 
+import anyio
 import asyncio
 import json
+import os
 import shutil
 import sys
 import traceback
@@ -19,6 +21,8 @@ from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
     McpSdkServerConfig,
+    PermissionResultAllow,
+    PermissionResultDeny,
     RateLimitEvent,
     ResultMessage,
     StreamEvent,
@@ -28,6 +32,7 @@ from claude_agent_sdk import (
     TaskStartedMessage,
     TextBlock,
     ThinkingBlock,
+    ToolPermissionContext,
     ToolResultBlock,
     ToolUseBlock,
     UserMessage,
@@ -69,6 +74,7 @@ class QueryCommand:
     betas: list[str] | None = None
     resume: str | None = None
     images: list[ImageAttachment] | None = None
+    ask_permission_tools: list[str] | None = None
 
 
 @dataclass
@@ -85,7 +91,16 @@ class QuitCommand:
     type: Literal["quit"]
 
 
-type Command = QueryCommand | CancelCommand | QuitCommand
+@dataclass
+class PermissionResponseCommand:
+    """User's approval decision for a pending tool-call permission request."""
+
+    type: Literal["permission_response"]
+    request_id: str
+    decision: Literal["allow", "deny", "always_allow"]
+
+
+type Command = QueryCommand | CancelCommand | QuitCommand | PermissionResponseCommand
 
 # ---------------------------------------------------------------------------
 # Protocol types: Python -> Emacs (events)
@@ -266,6 +281,20 @@ class RateLimitInfoEvent:
     message: str = ""
 
 
+@dataclass
+class PermissionRequestEvent:
+    """Ask Emacs whether Claude may use a particular tool.
+
+    The backend emits this and then blocks until Emacs sends a
+    PermissionResponseCommand with the matching request_id.
+    """
+
+    type: Literal["permission_request"] = "permission_request"
+    request_id: str = ""
+    tool_name: str = ""
+    tool_input: dict[str, Any] | None = None
+
+
 type EmitEvent = (
     StatusEvent
     | ErrorEvent
@@ -281,6 +310,7 @@ type EmitEvent = (
     | ThinkingDeltaEvent
     | InputJsonDeltaEvent
     | ContentBlockStopEvent
+    | PermissionRequestEvent
 )
 
 # ---------------------------------------------------------------------------
@@ -371,6 +401,30 @@ def convert_stream_event(event: dict[str, Any]) -> EmitEvent | None:
 def convert_message(message: SDKMessage) -> EmitEvent | None:
     """Convert an SDK message to a protocol event, or None to skip."""
     match message:
+        # Task* subclasses of SystemMessage must be matched before
+        # the generic SystemMessage arm, otherwise isinstance-based
+        # pattern matching resolves them as plain SystemMessage.
+        case TaskProgressMessage(
+            task_id=task_id,
+            description=description,
+            last_tool_name=last_tool_name,
+        ):
+            return TaskProgressEvent(
+                task_id=task_id,
+                description=description,
+                last_tool_name=last_tool_name,
+            )
+
+        case TaskStartedMessage(task_id=task_id, description=description):
+            return TaskStartedEvent(task_id=task_id, description=description)
+
+        case TaskNotificationMessage(
+            task_id=task_id, status=status, summary=summary
+        ):
+            return TaskNotificationEvent(
+                task_id=task_id, status=status, summary=summary,
+            )
+
         case SystemMessage(subtype=subtype, data=data):
             return SystemEvent(subtype=subtype, data=data)
 
@@ -397,27 +451,6 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 total_cost_usd=total_cost_usd,
                 duration_ms=duration_ms,
                 session_id=session_id,
-            )
-
-        case TaskProgressMessage(
-            task_id=task_id,
-            description=description,
-            last_tool_name=last_tool_name,
-        ):
-            return TaskProgressEvent(
-                task_id=task_id,
-                description=description,
-                last_tool_name=last_tool_name,
-            )
-
-        case TaskStartedMessage(task_id=task_id, description=description):
-            return TaskStartedEvent(task_id=task_id, description=description)
-
-        case TaskNotificationMessage(
-            task_id=task_id, status=status, summary=summary
-        ):
-            return TaskNotificationEvent(
-                task_id=task_id, status=status, summary=summary
             )
 
         case UserMessage(content=content) if isinstance(content, list):
@@ -462,6 +495,14 @@ DEFAULT_TOOLS: list[str] = [
 # the process lifetime without a restart, so caching avoids repeated PATH
 # traversal on every MCP tool invocation.
 _EMACSCLIENT: str | None = shutil.which("emacsclient")
+
+
+class EmacsclientNotFoundError(RuntimeError):
+    """Raised when emacsclient is not on PATH.
+
+    Distinguished from general RuntimeError so tool handlers can re-raise
+    it rather than silently converting it to an is_error tool result.
+    """
 
 # Names of the Emacs tools added to `allowed_tools` automatically.
 EMACS_TOOL_NAMES: list[str] = [
@@ -557,7 +598,7 @@ async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
     Raises RuntimeError on non-zero exit or if emacsclient is not found.
     """
     if _EMACSCLIENT is None:
-        raise RuntimeError("emacsclient not found on PATH")
+        raise EmacsclientNotFoundError("emacsclient not found on PATH")
     # Wrap in json-encode so Emacs handles all escaping; princ writes the
     # raw JSON to stdout (no extra Lisp-level quoting on top).
     wrapped = f"(progn (require 'json) (princ (json-encode {elisp})))"
@@ -567,10 +608,14 @@ async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout
-        )
-    except asyncio.TimeoutError:
+        # Use anyio.fail_after rather than asyncio.wait_for: the Claude SDK
+        # runs the event loop under anyio, and mixing anyio cancel scopes with
+        # asyncio.wait_for's internal cancel scope causes:
+        #   RuntimeError: Attempted to exit cancel scope in a different task
+        # anyio.fail_after is cancel-scope-safe in this context.
+        with anyio.fail_after(timeout):
+            stdout_bytes, stderr_bytes = await proc.communicate()
+    except TimeoutError:
         proc.kill()
         await proc.communicate()
         raise RuntimeError(f"emacsclient timed out after {timeout:.0f}s")
@@ -625,6 +670,8 @@ async def _emacs_eval(args: dict[str, Any]) -> dict[str, Any]:
         out = await _run_emacsclient(elisp)
         is_error = out.startswith("error:")
         return _tool_result(out, is_error=is_error)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: emacsclient failed — {e}", is_error=True)
 
@@ -649,6 +696,8 @@ async def _emacs_render_frame(_args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient("(claude-code-tools-render-frame)", timeout=10)
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -678,6 +727,8 @@ async def _emacs_get_messages(args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient(f"(claude-code-tools-get-messages {n})")
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -701,6 +752,8 @@ async def _emacs_get_debug_info(_args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient("(claude-code-tools-get-debug-info)")
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -738,6 +791,8 @@ async def _emacs_get_buffer(args: dict[str, Any]) -> dict[str, Any]:
             f"(claude-code-tools-get-buffer {json.dumps(buf)} {nums})"
         )
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -769,6 +824,8 @@ async def _emacs_get_buffer_region(args: dict[str, Any]) -> dict[str, Any]:
             f"(claude-code-tools-get-buffer-region {json.dumps(buf)} {start} {end})"
         )
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -792,6 +849,8 @@ async def _emacs_list_buffers(_args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient("(claude-code-tools-list-buffers)")
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -819,6 +878,8 @@ async def _emacs_switch_buffer(args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient(f"(claude-code-tools-switch-buffer {json.dumps(buf)})")
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -853,6 +914,8 @@ async def _emacs_get_point_info(args: dict[str, Any]) -> dict[str, Any]:
     try:
         out = await _run_emacsclient(elisp)
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -884,6 +947,8 @@ async def _emacs_search_forward(args: dict[str, Any]) -> dict[str, Any]:
             f"(claude-code-tools-search-forward {json.dumps(pat)} {buf_arg} t)"
         )
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -914,6 +979,8 @@ async def _emacs_search_backward(args: dict[str, Any]) -> dict[str, Any]:
             f"(claude-code-tools-search-backward {json.dumps(pat)} {buf_arg} t)"
         )
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -944,6 +1011,8 @@ async def _emacs_goto_line(args: dict[str, Any]) -> dict[str, Any]:
             f"(claude-code-tools-goto-line {line} {buf_arg})"
         )
         return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
     except Exception as e:
         return _tool_result(f"error: {e}", is_error=True)
 
@@ -968,6 +1037,66 @@ _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
         _emacs_goto_line,
     ],
 )
+
+
+# ---------------------------------------------------------------------------
+# Permission callback state
+# ---------------------------------------------------------------------------
+
+# Maps request_id → asyncio.Event; set when Emacs responds.
+_pending_permission_requests: dict[str, asyncio.Event] = {}
+# Maps request_id → decision string ("allow" | "deny" | "always_allow").
+_permission_decisions: dict[str, str] = {}
+# Tool names the user has approved with "always allow" for this process run.
+_always_allowed_tools: set[str] = set()
+
+# Timeout (seconds) waiting for the user to approve/deny a permission prompt.
+_PERMISSION_TIMEOUT = 60.0
+
+
+async def _can_use_tool_callback(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    _context: ToolPermissionContext,
+) -> PermissionResultAllow | PermissionResultDeny:
+    """Async callback that asks Emacs before executing each tool call.
+
+    Emits a ``permission_request`` event and blocks until Emacs sends a
+    ``permission_response`` command with the matching ``request_id``.
+    Times out after ``_PERMISSION_TIMEOUT`` seconds and auto-denies.
+    """
+    if tool_name in _always_allowed_tools:
+        return PermissionResultAllow()
+
+    request_id = f"perm_{os.urandom(6).hex()}"
+    event = asyncio.Event()
+    _pending_permission_requests[request_id] = event
+
+    emit(PermissionRequestEvent(
+        request_id=request_id,
+        tool_name=tool_name,
+        tool_input=tool_input,
+    ))
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=_PERMISSION_TIMEOUT)
+    except asyncio.TimeoutError:
+        _pending_permission_requests.pop(request_id, None)
+        _permission_decisions.pop(request_id, None)
+        return PermissionResultDeny(
+            message=f"Permission request timed out after {_PERMISSION_TIMEOUT:.0f}s"
+        )
+
+    decision = _permission_decisions.pop(request_id, "deny")
+    _pending_permission_requests.pop(request_id, None)
+
+    if decision == "always_allow":
+        _always_allowed_tools.add(tool_name)
+        return PermissionResultAllow()
+    elif decision == "allow":
+        return PermissionResultAllow()
+    else:
+        return PermissionResultDeny(message="Denied by user")
 
 
 def parse_command(raw: dict[str, Any]) -> Command:
@@ -995,45 +1124,62 @@ def parse_command(raw: dict[str, Any]) -> Command:
                 betas=raw.get("betas"),
                 resume=raw.get("resume"),
                 images=images,
+                ask_permission_tools=raw.get("ask_permission_tools"),
             )
         case "cancel":
             return CancelCommand(type="cancel")
         case "quit":
             return QuitCommand(type="quit")
+        case "permission_response":
+            return PermissionResponseCommand(
+                type="permission_response",
+                request_id=raw["request_id"],
+                decision=raw["decision"],
+            )
         case _:
             raise ValueError(f"Unknown command type: {cmd_type}")
 
 
-async def _prompt_with_images(
-    prompt: str, images: list[ImageAttachment]
+async def _prompt_as_streaming(
+    prompt: str, images: list[ImageAttachment] | None = None,
 ) -> Any:
-    """Yield a single user message dict containing image + text content blocks.
+    """Yield a single user message in the SDK streaming-mode format.
 
-    The SDK accepts ``AsyncIterable[dict]`` as an alternative to a plain
-    string prompt.  Each dict must be an Anthropic API-format message.
+    The SDK's ``AsyncIterable`` streaming mode requires each dict to have:
+      ``{"type": "user", "message": {"role": "user", "content": ...}}``
+    (NOT plain ``{"role": "user", ...}``).  Used when ``can_use_tool``
+    is registered, since the SDK only supports that callback in streaming
+    mode.
     """
-    content: list[dict[str, Any]] = []
-    for img in images:
-        content.append({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": img.media_type,
-                "data": img.data,
-            },
-        })
-    content.append({"type": "text", "text": prompt})
-    yield {"role": "user", "content": content}
+    if images:
+        content: list[dict[str, Any]] = []
+        for img in images:
+            content.append({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": img.media_type,
+                    "data": img.data,
+                },
+            })
+        content.append({"type": "text", "text": prompt})
+    else:
+        content = prompt  # type: ignore[assignment]
+    yield {
+        "type": "user",
+        "message": {"role": "user", "content": content},
+    }
 
 
-def build_prompt(cmd: QueryCommand) -> Any:
+def build_prompt(cmd: QueryCommand, *, streaming: bool = False) -> Any:
     """Return the prompt value to pass to ``query()``.
 
-    Returns a plain string when there are no image attachments, or an
-    async generator of message dicts when images are present.
+    Returns a plain string when *streaming* is False (the common case),
+    or an async generator of SDK streaming-format dicts when True.
+    Streaming mode is required when ``can_use_tool`` is registered.
     """
-    if cmd.images:
-        return _prompt_with_images(cmd.prompt, cmd.images)
+    if streaming or cmd.images:
+        return _prompt_as_streaming(cmd.prompt, cmd.images or None)
     return cmd.prompt
 
 
@@ -1043,17 +1189,42 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
     The Emacs MCP server is always attached so Claude has access to the
     EvalEmacs / EmacsRenderFrame / EmacsGet* family of tools without needing
     to route through the raw Bash tool.
+
+    When ``ask_permission_tools`` is non-empty, the permission callback is
+    registered and ``permission_mode`` is forced to ``"default"`` so the SDK
+    actually sends ``can_use_tool`` events (bypassPermissions skips them).
     """
     base_tools = cmd.allowed_tools or DEFAULT_TOOLS
     # Always include Emacs tools alongside whatever the session configured.
     all_tools = list(base_tools) + [
         t for t in EMACS_TOOL_NAMES if t not in base_tools
     ]
+
+    ask_tools = set(cmd.ask_permission_tools or [])
+    use_permission_callback = bool(ask_tools)
+
+    # Intercept only for the tools the user wants to confirm; let the SDK
+    # run everything else without interruption.
+    async def _filtered_callback(
+        tool_name: str,
+        tool_input: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        if tool_name in ask_tools:
+            return await _can_use_tool_callback(tool_name, tool_input, context)
+        return PermissionResultAllow()
+
+    # bypassPermissions makes the SDK skip all can_use_tool calls entirely, so
+    # override to "default" whenever the permission callback is active.
+    effective_perm_mode = cmd.permission_mode
+    if use_permission_callback and effective_perm_mode == "bypassPermissions":
+        effective_perm_mode = "default"
+
     return ClaudeAgentOptions(
         cwd=cmd.cwd,
         allowed_tools=all_tools,
         mcp_servers={"emacs": _EMACS_MCP_SERVER},
-        permission_mode=cmd.permission_mode,
+        permission_mode=effective_perm_mode,
         max_turns=cmd.max_turns,
         max_budget_usd=cmd.max_budget_usd,
         system_prompt=cmd.system_prompt,
@@ -1061,6 +1232,7 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
         effort=cmd.effort,
         betas=cast(list[Literal["context-1m-2025-08-07"]], cmd.betas or []),
         resume=cmd.resume,
+        can_use_tool=_filtered_callback if use_permission_callback else None,
     )
 
 
@@ -1072,11 +1244,15 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
 async def handle_query(cmd: QueryCommand) -> None:
     """Process a query command from Emacs."""
     options = build_options(cmd)
+    needs_streaming = options.can_use_tool is not None
 
     emit(StatusEvent(status="working"))
 
     try:
-        async for message in query(prompt=build_prompt(cmd), options=options):
+        async for message in query(
+            prompt=build_prompt(cmd, streaming=needs_streaming),
+            options=options,
+        ):
             event = convert_message(message)
             if event is not None:
                 emit(event)
@@ -1091,8 +1267,12 @@ async def handle_query(cmd: QueryCommand) -> None:
             ))
             cmd.resume = None
             options = build_options(cmd)
+            needs_streaming = options.can_use_tool is not None
             try:
-                async for message in query(prompt=build_prompt(cmd), options=options):
+                async for message in query(
+                    prompt=build_prompt(cmd, streaming=needs_streaming),
+                    options=options,
+                ):
                     event = convert_message(message)
                     if event is not None:
                         emit(event)
@@ -1128,6 +1308,15 @@ async def cancel_task(task: asyncio.Task[None]) -> None:
 
 async def main() -> None:
     """Read JSON commands from stdin, dispatch them."""
+    if _EMACSCLIENT is None:
+        emit(ErrorEvent(
+            message=(
+                "emacsclient not found on PATH — Emacs MCP tools (EvalEmacs, "
+                "EmacsRenderFrame, etc.) will not work.  Add the directory "
+                "containing emacsclient to exec-path and PATH before starting "
+                "claude-code, then restart with M-x claude-code-reset."
+            )
+        ))
     emit(StatusEvent(status="ready"))
 
     loop = asyncio.get_event_loop()
@@ -1174,6 +1363,13 @@ async def main() -> None:
                     if current_task is not None and not current_task.done():
                         await cancel_task(current_task)
                     break
+
+                case PermissionResponseCommand() as prsp:
+                    # Unblock the _can_use_tool_callback awaiting this request.
+                    ev = _pending_permission_requests.get(prsp.request_id)
+                    if ev is not None:
+                        _permission_decisions[prsp.request_id] = prsp.decision
+                        ev.set()
 
         except Exception as e:
             emit(ErrorEvent(message=f"Main loop error: {e}"))

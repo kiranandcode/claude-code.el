@@ -61,7 +61,7 @@ FILL-CHAR defaults to ?█, EMPTY-CHAR defaults to ?░."
 Each string is one row; returns rows top-to-bottom.
 VALUES is a list of numbers; HEIGHT is number of rows."
   (let* ((max-val (apply #'max (cons 0.0 values)))
-         (n       (length values))
+         (_n      (length values))
          (rows    '()))
     (dotimes (row height)
       (let* ((level (- height 1 row))   ; 0 = bottom row, height-1 = top
@@ -339,10 +339,10 @@ VALUES is a list of numbers; HEIGHT is number of rows."
         (let* ((max-turn (apply #'max turns))
                (bar-w4   28)
                (buckets  (append
-                          (mapcar (lambda (t)
+                          (mapcar (lambda (turn-n)
                                     (cons (format "%d turn%s"
-                                                  t (if (= t 1) "" "s"))
-                                          t))
+                                                  turn-n (if (= turn-n 1) "" "s"))
+                                          turn-n))
                                   (number-sequence 1 (min max-turn 5)))
                           (when (> max-turn 5)
                             (list (cons "6+ turns" 'many))))))

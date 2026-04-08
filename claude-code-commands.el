@@ -17,6 +17,11 @@
 (require 'magit-section)
 (require 'transient)
 
+;; org-roam is optional; declare its symbols to suppress byte-compiler warnings.
+(declare-function org-roam-node-file "org-roam-node")
+(declare-function org-roam-node-visit "org-roam")
+(declare-function org-roam-db-update-file "org-roam-db")
+
 ;;;; Interactive Commands
 
 ;;;###autoload
@@ -36,7 +41,10 @@
                    (cwd . ,cwd)
                    (allowed_tools . ,(vconcat (alist-get 'allowed-tools cfg)))
                    (permission_mode . ,(alist-get 'permission-mode cfg))
-                   (max_turns . ,(alist-get 'max-turns cfg)))))
+                   (max_turns . ,(alist-get 'max-turns cfg))
+                   ,@(when (claude-code--ask-permission-active-p)
+                       `((ask_permission_tools
+                          . ,(vconcat claude-code-ask-permission-tools)))))))
     ;; Record in local message history (images stored for inline rendering).
     (push `((type . "user") (prompt . ,prompt) (images . ,images))
           claude-code--messages)
@@ -206,9 +214,9 @@ Use this when the backend crashes or stops responding."
   (message "claude-code: backend restarted"))
 
 (defun claude-code-reset ()
-  "Hard-reset the current conversation: clear all messages and restart the backend.
+  "Hard-reset: clear all messages and restart the backend.
 Unlike `claude-code-clear', this also restarts the Python process so you get a
-truly blank slate.  Prompts for confirmation since the operation is irreversible."
+truly blank slate.  Prompts for confirmation; the operation is irreversible."
   (interactive)
   (when (yes-or-no-p "Reset conversation? All messages will be cleared and the backend restarted. ")
     ;; Clear subagents from registry (same as claude-code-clear).
@@ -525,6 +533,59 @@ User prompts (newest first):
            (if claude-code-show-tool-details "visible" "hidden"))
   (claude-code--schedule-render))
 
+;;;; Tool-Call Permission Commands
+
+(defun claude-code--ask-permission-active-p ()
+  "Return non-nil if ask-permission is on for the current session.
+Checks the buffer-local override first, then falls back to whether
+`claude-code-ask-permission-tools' is non-nil."
+  (pcase claude-code--ask-permission-override
+    ('unset (not (null claude-code-ask-permission-tools)))
+    (v      v)))
+
+(defun claude-code-toggle-ask-permission ()
+  "Toggle ask-permission on/off for the current session.
+When toggled off the backend bypasses approval prompts for this session;
+when toggled on it asks before running any tool in
+`claude-code-ask-permission-tools'."
+  (interactive)
+  (setq claude-code--ask-permission-override
+        (not (claude-code--ask-permission-active-p)))
+  (message "claude-code: ask-permission %s"
+           (if claude-code--ask-permission-override "on" "off"))
+  (claude-code--schedule-render))
+
+(defun claude-code--respond-to-permission (decision)
+  "Send DECISION to the backend for the pending tool permission request.
+DECISION is one of \"allow\", \"deny\", or \"always_allow\".
+Clears `claude-code--pending-permission' and re-renders."
+  (unless claude-code--pending-permission
+    (user-error "No pending permission request"))
+  (let* ((req-id    (alist-get 'request-id claude-code--pending-permission))
+         (tool-name (alist-get 'tool-name  claude-code--pending-permission)))
+    (when (equal decision "always_allow")
+      (cl-pushnew tool-name claude-code--always-allowed-tools :test #'equal))
+    (setq claude-code--pending-permission nil)
+    (claude-code--send-json `((type       . "permission_response")
+                              (request_id . ,req-id)
+                              (decision   . ,decision)))
+    (claude-code--schedule-render)))
+
+(defun claude-code-approve-tool ()
+  "Approve the pending tool call (allow once)."
+  (interactive)
+  (claude-code--respond-to-permission "allow"))
+
+(defun claude-code-always-allow-tool ()
+  "Approve the pending tool call and always allow this tool in the session."
+  (interactive)
+  (claude-code--respond-to-permission "always_allow"))
+
+(defun claude-code-deny-tool ()
+  "Deny the pending tool call."
+  (interactive)
+  (claude-code--respond-to-permission "deny"))
+
 ;;;; Slash Command Dispatch
 
 (defun claude-code--dispatch-input (text)
@@ -807,6 +868,11 @@ persists the change via `customize-save-variable'."
    ("r" "Send region" claude-code-send-region)
    ("f" "Send file context" claude-code-send-buffer-file)
    ("i" "Attach image (clipboard or file)" claude-code-attach-image)]
+  ["Permission"
+   :if (lambda () (not (null claude-code--pending-permission)))
+   ("y" "Allow tool call" claude-code-approve-tool)
+   ("Y" "Always allow tool" claude-code-always-allow-tool)
+   ("n" "Deny tool call" claude-code-deny-tool)]
   ["Control"
    ("c" "Cancel" claude-code-cancel)
    ("C" "Clear conversation" claude-code-clear)
@@ -819,6 +885,7 @@ persists the change via `customize-save-variable'."
    ("m" "Set model" claude-code-set-model)
    ("e" "Set effort" claude-code-set-effort)
    ("p" "Set permission mode" claude-code-set-permission-mode)
+   ("A" "Toggle ask-permission" claude-code-toggle-ask-permission)
    ("P" "Save as project default" claude-code-save-project-config)]
   ["View"
    ("t" "Toggle thinking" claude-code-toggle-thinking)
@@ -864,6 +931,19 @@ persists the change via `customize-save-variable'."
   #'quit-window "Quit or self-insert.")
 (claude-code--def-key-command claude-code-key-render
   #'claude-code--render "Re-render or self-insert.")
+(claude-code--def-key-command claude-code-key-approve-tool
+  #'claude-code-approve-tool "Approve pending tool call or self-insert.")
+(claude-code--def-key-command claude-code-key-always-allow-tool
+  #'claude-code-always-allow-tool "Always-allow pending tool or self-insert.")
+
+(defun claude-code-key-deny-or-notes ()
+  "Deny a pending tool call if one is pending; open notes otherwise.
+Self-inserts in the input area."
+  (interactive)
+  (cond
+   ((claude-code--input-area-p) (call-interactively #'self-insert-command))
+   (claude-code--pending-permission (claude-code-deny-tool))
+   (t (call-interactively #'claude-code-open-notes))))
 
 (defun claude-code-key-space ()
   "Self-insert in input area, scroll up in conversation."
@@ -893,7 +973,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "C"   #'claude-code-key-clear
   "k"   #'claude-code-key-kill
   "R"   #'claude-code-key-restart
-  "n"   #'claude-code-key-open-notes
+  "n"   #'claude-code-key-deny-or-notes
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
   "a"   #'claude-code-key-agents-toggle
@@ -901,6 +981,8 @@ Prevents S-SPC from triggering scroll-down while typing."
   "?"   #'claude-code-key-menu
   "q"   #'claude-code-key-quit
   "G"   #'claude-code-key-render
+  "y"     #'claude-code-key-approve-tool
+  "Y"     #'claude-code-key-always-allow-tool
   "SPC"   #'claude-code-key-space
   "S-SPC" #'claude-code-key-shift-space
   "RET" #'claude-code-return
@@ -909,7 +991,25 @@ Prevents S-SPC from triggering scroll-down while typing."
   "TAB" #'claude-code-key-tab
   "M-p" #'claude-code-previous-input
   "M-n" #'claude-code-next-input
-  "C-c i" #'claude-code-attach-image)
+  "C-c i" #'claude-code-attach-image
+  "C-w" #'claude-code-kill-region-or-copy)
+
+(defun claude-code-kill-region-or-copy (beg end &optional yank-handler)
+  "Copy or kill the region, depending on where it falls.
+If the region is entirely within the editable input area (at or after
+`claude-code--input-marker'), perform a normal `kill-region' so the user can
+cut text they are composing.  Otherwise the region overlaps the read-only
+conversation area, so fall back to `kill-ring-save' (copy without cutting)
+and briefly message the user."
+  (interactive "r")
+  (let ((input-start (and (markerp claude-code--input-marker)
+                          (marker-position claude-code--input-marker))))
+    (if (and input-start (>= beg input-start))
+        ;; Entirely in the editable input area — normal kill.
+        (kill-region beg end yank-handler)
+      ;; Overlaps read-only conversation content — copy only.
+      (kill-ring-save beg end)
+      (message "Conversation is read-only; copied to kill ring"))))
 
 (defun claude-code-key-delete-backward ()
   "Delete backward in input area, scroll down elsewhere."
@@ -980,7 +1080,17 @@ Outside the input area, toggle the magit section at point."
   ;; Unregister the agent automatically when the buffer is killed via any
   ;; path (C-x k, kill-buffer, etc.) — not just via `claude-code-kill'.
   (add-hook 'kill-buffer-hook
-            #'claude-code--agent-unregister-self nil t))
+            #'claude-code--agent-unregister-self nil t)
+  ;; magit-section-mode adds `magit-section--highlight-region' to
+  ;; `redisplay--update-region-highlight-functions' to support multi-section
+  ;; selection (e.g. staging git hunks).  In claude-code buffers the input
+  ;; area is inserted outside the root magit-section, so
+  ;; `magit-current-section' returns nil there.  When the user selects a
+  ;; region that includes the input area, magit's hook crashes with
+  ;; (wrong-type-argument … nil) inside `magit-section-siblings'.  Remove
+  ;; the hook locally; normal Emacs region highlighting still works fine.
+  (remove-hook 'redisplay--update-region-highlight-functions
+               #'magit-section--highlight-region t))
 
 ;;;; Emacs-Native Subagent Spawning
 
@@ -1148,12 +1258,24 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
     ;; Re-evaluate all source files.  Unbind keymap variables first so that
     ;; `defvar-keymap' (which, like `defvar', skips re-initialization when the
     ;; variable is already bound) always rebuilds them from the source.
-    (makunbound 'claude-code-mode-map)
-    (makunbound 'claude-code-agents-mode-map)
-    (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
-                       "claude-code-config" "claude-code-events" "claude-code-render"
-                       "claude-code-commands" "claude-code-git-graph"))
-      (load (expand-file-name (concat subfile ".el") claude-code--package-dir) nil t))
+    ;; Save old values so we can restore them if loading fails partway.
+    (let ((old-mode-map (and (boundp 'claude-code-mode-map) claude-code-mode-map))
+          (old-agents-map (and (boundp 'claude-code-agents-mode-map) claude-code-agents-mode-map)))
+      (makunbound 'claude-code-mode-map)
+      (makunbound 'claude-code-agents-mode-map)
+      (condition-case err
+          (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
+                             "claude-code-config" "claude-code-events" "claude-code-render"
+                             "claude-code-commands" "claude-code-git-graph"
+                             "claude-code-emacs-tools"))
+            (load (expand-file-name (concat subfile ".el") claude-code--package-dir) nil t))
+        (error
+         ;; Restore keymaps so the mode remains functional.
+         (unless (boundp 'claude-code-mode-map)
+           (setq claude-code-mode-map old-mode-map))
+         (unless (boundp 'claude-code-agents-mode-map)
+           (setq claude-code-agents-mode-map old-agents-map))
+         (message "claude-code-reload: load error: %s" (error-message-string err)))))
     ;; Restore each buffer with saved state
     (dolist (state saved-states)
       (let* ((dir (plist-get state :dir))

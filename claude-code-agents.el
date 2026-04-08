@@ -8,6 +8,11 @@
 (require 'claude-code-vars)
 (require 'magit-section)
 
+;; Forward declarations for functions defined in files loaded after this one.
+(declare-function claude-code--schedule-render "claude-code-events")
+(declare-function claude-code-cancel "claude-code-commands")
+(declare-function claude-code-kill "claude-code-commands")
+
 ;;;; Agent Tracking
 
 (defvar claude-code--agents (make-hash-table :test 'equal)
@@ -447,7 +452,8 @@ PARENT-BUF is the parent session buffer."
     buf))
 
 (defun claude-code--task-buffer-append-tool (buf tool-name)
-  "Append TOOL-NAME as a step to task BUF, deduplicating consecutive identical calls."
+  "Append TOOL-NAME as a step to task BUF.
+Deduplicates consecutive identical calls."
   (when (and buf (buffer-live-p buf))
     (with-current-buffer buf
       (unless (equal tool-name claude-code--task-last-tool)

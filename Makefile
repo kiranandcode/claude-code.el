@@ -4,7 +4,7 @@ BATCH := ./emacs-batch.sh
 # Run all checks by default.
 MATCH ?=
 
-.PHONY: test clean mypy all checkdoc compile
+.PHONY: test clean mypy all checkdoc compile pytest
 
 default: all
 
@@ -35,8 +35,12 @@ compile: clean
 test:
 	$(BATCH) -l claude-code-test.el -f ert-run-tests-batch-and-exit
 
+# Python unit tests
+pytest:
+	cd python && uv run pytest -v
+
 # Type-check Python backend
 mypy:
 	cd python && uv run mypy --strict claude_code_backend.py
 
-all: checkdoc compile test mypy
+all: checkdoc compile test pytest mypy

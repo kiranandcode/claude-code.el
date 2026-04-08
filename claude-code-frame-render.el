@@ -133,7 +133,7 @@ Returns the next column after the written text."
   "Draw a labelled box at ROW, COL containing LINES of text."
   (let* ((max-w (apply #'max (mapcar #'string-width lines)))
          (box-w (+ max-w 4))
-         (gcols (length (aref g 0)))
+         (_gcols (length (aref g 0)))
          (grows (length g))
          (sgr "2"))  ; dim for box chrome
     ;; Top border
@@ -466,7 +466,7 @@ Returns a multi-line string suitable for writing to a terminal or file."
     ;; ── Windows ──
     (dolist (win (window-list nil 'no-minibuf))
       (let* ((edges (window-edges win))
-             (wl (nth 0 edges)) (wt (nth 1 edges))
+             (wl (nth 0 edges)) (_wt (nth 1 edges))
              (wr (nth 2 edges)) (wb (nth 3 edges))
              (inside (window-inside-edges win))
              (bl (nth 0 inside)) (bt (nth 1 inside))

@@ -11,6 +11,9 @@
 (require 'ert)
 (require 'claude-code)
 
+;; Suppress byte-compiler free-variable warnings for optional minor modes.
+(defvar hl-line-mode)
+
 ;; ---------------------------------------------------------------------------
 ;; Helpers
 ;; ---------------------------------------------------------------------------
@@ -2173,7 +2176,7 @@ up the spawned agent buffer.  start-process and schedule-render are mocked."
 
 (ert-deftest claude-code-test-spawn-subagent-returns-task-id ()
   "`claude-code--spawn-subagent' should return an \"emacs-task-\" prefixed string."
-  (claude-code-test-with-spawned-subagent _parent task-id "count words" "Count words."
+  (claude-code-test-with-spawned-subagent parent task-id "count words" "Count words."
     (should (stringp task-id))
     (should (string-prefix-p "emacs-task-" task-id))))
 
@@ -2202,7 +2205,7 @@ up the spawned agent buffer.  start-process and schedule-render are mocked."
 
 (ert-deftest claude-code-test-spawn-subagent-queues-prompt ()
   "The spawned buffer should pre-queue the prompt for auto-send on ready."
-  (claude-code-test-with-spawned-subagent _p task-id "analyse logs" "Look at logs."
+  (claude-code-test-with-spawned-subagent p task-id "analyse logs" "Look at logs."
     (let* ((child (gethash task-id claude-code--agents))
            (agent-buf (plist-get child :buffer)))
       (with-current-buffer agent-buf
@@ -2272,7 +2275,7 @@ register both in the agents registry, run BODY, then clean up both buffers."
 
 (ert-deftest claude-code-test-subagent-notify-sets-summary ()
   "`claude-code--subagent-notify-parent' should extract and store first-line summary."
-  (claude-code-test-with-subagent-pair _p agent-buf
+  (claude-code-test-with-subagent-pair p agent-buf
     (with-current-buffer agent-buf
       (claude-code--subagent-notify-parent))
     (let ((task (gethash "cc-sub-task-99" claude-code--agents)))
@@ -2292,7 +2295,7 @@ register both in the agents registry, run BODY, then clean up both buffers."
 
 (ert-deftest claude-code-test-subagent-notify-clears-task-id ()
   "`claude-code--subagent-notify-parent' should nil out `claude-code--subagent-task-id'."
-  (claude-code-test-with-subagent-pair _p agent-buf
+  (claude-code-test-with-subagent-pair p agent-buf
     (with-current-buffer agent-buf
       (claude-code--subagent-notify-parent)
       (should (null claude-code--subagent-task-id)))))
@@ -2303,7 +2306,7 @@ register both in the agents registry, run BODY, then clean up both buffers."
 
 (ert-deftest claude-code-test-result-event-fires-notify-when-worked ()
   "A result event in a worked subagent session should call notify-parent."
-  (claude-code-test-with-subagent-pair _parent agent-buf
+  (claude-code-test-with-subagent-pair parent agent-buf
     (let ((notify-called nil))
       (cl-letf (((symbol-function 'claude-code--subagent-notify-parent)
                  (lambda () (setq notify-called t)))
@@ -2317,7 +2320,7 @@ register both in the agents registry, run BODY, then clean up both buffers."
 
 (ert-deftest claude-code-test-result-event-no-notify-when-not-worked ()
   "A result event before the subagent has worked should NOT call notify-parent."
-  (claude-code-test-with-subagent-pair _parent agent-buf
+  (claude-code-test-with-subagent-pair parent agent-buf
     (let ((notify-called nil))
       (cl-letf (((symbol-function 'claude-code--subagent-notify-parent)
                  (lambda () (setq notify-called t)))
@@ -2332,7 +2335,7 @@ register both in the agents registry, run BODY, then clean up both buffers."
 
 (ert-deftest claude-code-test-working-event-sets-has-worked ()
   "A `working' status event should set `claude-code--subagent-has-worked' to t."
-  (claude-code-test-with-subagent-pair _parent agent-buf
+  (claude-code-test-with-subagent-pair parent agent-buf
     (cl-letf (((symbol-function 'claude-code--start-thinking)    #'ignore)
               ((symbol-function 'claude-code--schedule-render)   #'ignore)
               ((symbol-function 'claude-code--agent-update)      #'ignore))
@@ -3487,6 +3490,106 @@ register both in the agents registry, run BODY, then clean up both buffers."
   (should (member "EvalEmacs" claude-code--mcp-tool-names))
   (should (member "EmacsRenderFrame" claude-code--mcp-tool-names))
   (should (member "EmacsGotoLine" claude-code--mcp-tool-names)))
+
+;;;; Tool result is_error classification tests
+
+(ert-deftest claude-code-test-tool-result-null-is-error-not-error ()
+  "A tool_result block with is_error=null (`:null') must render as success.
+The SDK sends JSON null for successful built-in tool results; `:null' is
+truthy in Emacs Lisp so a bare truthiness check would misclassify it."
+  (claude-code-test-with-buffer
+    (let* ((block '((type . "tool_result")
+                    (tool_use_id . "toolu_test")
+                    (content . "file contents here")
+                    (is_error . :null)))
+           ;; Render into buffer and check the heading text
+           (rendered
+            (progn
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (magit-insert-section (root)
+                  (claude-code--render-tool-result block)))
+              (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (string-match-p "↳ Tool result" rendered))
+      (should-not (string-match-p "Tool error" rendered)))))
+
+(ert-deftest claude-code-test-tool-result-false-is-error-not-error ()
+  "A tool_result block with is_error=:json-false must render as success."
+  (claude-code-test-with-buffer
+    (let* ((block '((type . "tool_result")
+                    (tool_use_id . "toolu_test")
+                    (content . "ok output")
+                    (is_error . :json-false)))
+           (rendered
+            (progn
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (magit-insert-section (root)
+                  (claude-code--render-tool-result block)))
+              (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (string-match-p "↳ Tool result" rendered))
+      (should-not (string-match-p "Tool error" rendered)))))
+
+(ert-deftest claude-code-test-tool-result-true-is-error ()
+  "A tool_result block with is_error=t must render as an error."
+  (claude-code-test-with-buffer
+    (let* ((block '((type . "tool_result")
+                    (tool_use_id . "toolu_test")
+                    (content . "something broke")
+                    (is_error . t)))
+           (rendered
+            (progn
+              (let ((inhibit-read-only t))
+                (erase-buffer)
+                (magit-insert-section (root)
+                  (claude-code--render-tool-result block)))
+              (buffer-substring-no-properties (point-min) (point-max)))))
+      (should (string-match-p "✗ Tool error" rendered))
+      (should-not (string-match-p "↳ Tool result" rendered)))))
+
+;;;; C-w / copy-region tests
+
+(ert-deftest claude-code-test-cw-in-input-area-kills ()
+  "C-w inside the input area performs a real kill (removes text)."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    ;; Type something in the input area
+    (goto-char (marker-position claude-code--input-marker))
+    (insert "hello world")
+    (let ((beg (marker-position claude-code--input-marker))
+          (end (point-max)))
+      (claude-code-kill-region-or-copy beg end)
+      ;; Text should be gone from the buffer
+      (should (string= "" (buffer-substring-no-properties
+                           (marker-position claude-code--input-marker)
+                           (point-max))))
+      ;; And in the kill ring
+      (should (string= "hello world" (car kill-ring))))))
+
+(ert-deftest claude-code-test-cw-in-conversation-copies-not-kills ()
+  "C-w overlapping the read-only conversation area copies but does not delete."
+  (claude-code-test-with-buffer
+    (claude-code--render)
+    ;; The region spans from point-min into the read-only content
+    (let* ((beg (point-min))
+           (end (min (+ beg 5) (point-max)))
+           (original-text (buffer-substring-no-properties beg end)))
+      (claude-code-kill-region-or-copy beg end)
+      ;; Buffer text must be unchanged (no deletion)
+      (should (string= original-text
+                       (buffer-substring-no-properties beg end)))
+      ;; But the text is now in the kill ring
+      (should (string= original-text (car kill-ring))))))
+
+(ert-deftest claude-code-test-highlight-region-hook-removed ()
+  "`magit-section--highlight-region' must not be on the redisplay hook
+in claude-code-mode buffers, to prevent crashes when selecting text that
+extends into the input area (which has no magit section)."
+  (claude-code-test-with-buffer
+    (should-not
+     (and (boundp 'redisplay--update-region-highlight-functions)
+          (memq 'magit-section--highlight-region
+                redisplay--update-region-highlight-functions)))))
 
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

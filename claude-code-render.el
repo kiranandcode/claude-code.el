@@ -13,6 +13,23 @@
 (require 'claude-code-agents)
 (require 'magit-section)
 
+;; Forward declarations for functions defined in claude-code-events.el and
+;; claude-code-commands.el (loaded after this file to avoid circular deps).
+(declare-function claude-code--schedule-render "claude-code-events")
+(declare-function claude-code-set-model "claude-code-commands")
+(declare-function claude-code-set-effort "claude-code-commands")
+(declare-function claude-code-set-permission-mode "claude-code-commands")
+(declare-function claude-code-save-project-config "claude-code-commands")
+(declare-function claude-code-cancel "claude-code-commands")
+(declare-function claude-code-reset "claude-code-commands")
+(declare-function claude-code-new-session "claude-code-commands")
+(declare-function claude-code--fork-at-msg "claude-code-commands")
+(declare-function claude-code-approve-tool "claude-code-commands")
+(declare-function claude-code-always-allow-tool "claude-code-commands")
+(declare-function claude-code-deny-tool "claude-code-commands")
+(declare-function claude-code-toggle-ask-permission "claude-code-commands")
+(declare-function claude-code--ask-permission-active-p "claude-code-commands")
+
 ;;;; Image Rendering Helpers
 
 (defun claude-code--image-type-from-media-type (media-type)
@@ -25,7 +42,8 @@
 
 (defun claude-code--insert-image (img &optional max-width)
   "Insert IMG (a pending-image plist) inline if running in a GUI frame.
-MAX-WIDTH caps the display width in pixels (default: `claude-code-inline-image-max-width').
+MAX-WIDTH caps the display width in pixels (default:
+`claude-code-inline-image-max-width').
 Falls back to a text chip when not in GUI mode or image display is disabled."
   (let* ((max-w   (or max-width claude-code-inline-image-max-width))
          (raw     (plist-get img :raw-data))
@@ -101,6 +119,8 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
              (nreverse pending-assistant))))
         ;; Show in-progress streaming content
         (claude-code--render-streaming)
+        ;; Inline tool-approval widget (shown when a permission request is pending)
+        (claude-code--render-permission-request)
         ;; Pinned spawned-agents panel (below all output, above input)
         (claude-code--render-subagents-panel))
       ;; Apply invisible overlays to all sections that were inserted with
@@ -217,6 +237,20 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
                      'face 'claude-code-config-button
                      'follow-link t)
       (insert "  ")
+      (let ((ask-on (claude-code--ask-permission-active-p)))
+        (insert (propertize "ask:" 'face 'shadow))
+        (insert " ")
+        (insert-button (if ask-on "[on]" "[off]")
+                       'action (lambda (_btn)
+                                 (call-interactively #'claude-code-toggle-ask-permission))
+                       'help-echo (if ask-on
+                                      "Ask for approval before tool calls (click to disable)"
+                                    "Tool calls run without approval (click to enable)")
+                       'face (if ask-on
+                                 'claude-code-permission-allow
+                               'claude-code-config-button)
+                       'follow-link t))
+      (insert "  ")
       (insert-button "[↓ Save as Project Default]"
                      'action (lambda (_btn)
                                (call-interactively #'claude-code-save-project-config))
@@ -302,11 +336,13 @@ section keymap that `magit-insert-heading' stamps onto heading text."
       (propertize "◀ Assistant" 'face 'claude-code-assistant-label))
     (dolist (msg msgs)
       (let ((content (alist-get 'content msg)))
-        ;; json-parse-string returns vectors for arrays
+        ;; json-parse-string returns vectors for arrays; JSON null
+        ;; becomes the keyword :null which is non-nil but not iterable.
         (when (vectorp content)
           (setq content (append content nil)))
-        (dolist (block content)
-          (claude-code--render-content-block block))))
+        (when (listp content)
+          (dolist (block content)
+            (claude-code--render-content-block block)))))
     (insert "\n")))
 
 (defun claude-code--render-assistant-msg (msg)
@@ -409,7 +445,12 @@ Content may be a plain string (built-in tools) or a vector of
 opens the full output in a dedicated `view-mode' buffer even when the
 section is collapsed."
   (let* ((raw      (alist-get 'content block))
-         (is-error (alist-get 'is_error block))
+         ;; Use `eq t' rather than plain truthiness: the SDK sends
+         ;; "is_error": null for successful tool results, which JSON-decodes
+         ;; to `:null' in Emacs Lisp.  `:null' is truthy (only nil is falsy),
+         ;; so a bare `(if is-error …)' would incorrectly flag every
+         ;; successful built-in tool result as an error.
+         (is-error (eq t (alist-get 'is_error block)))
          (content  (claude-code--tool-result-text raw)))
     (when (and content (not (string-empty-p content)))
       (let* ((face  (if is-error 'claude-code-error 'shadow))
@@ -464,6 +505,69 @@ section is collapsed."
         (insert "\n")))
     (when (not (string-empty-p claude-code--streaming-text))
       (claude-code--render-text claude-code--streaming-text))))
+
+;;;; Tool-Call Permission Widget
+
+(defun claude-code--permission-tool-summary (tool-name tool-input)
+  "Return a short one-line summary of TOOL-INPUT for TOOL-NAME, or nil."
+  (when (and tool-input (not (eq tool-input :null)))
+    (let ((input (if (listp tool-input) tool-input
+                   ;; JSON object decoded as hash-table
+                   (when (hash-table-p tool-input)
+                     (let (pairs)
+                       (maphash (lambda (k v) (push (cons k v) pairs))
+                                tool-input)
+                       pairs)))))
+      (pcase tool-name
+        ("Bash"
+         (when-let ((cmd (or (alist-get 'command input)
+                             (alist-get "command" input nil nil #'equal))))
+           (truncate-string-to-width (format "%s" cmd) 72 nil nil "…")))
+        ((or "Write" "Edit" "MultiEdit")
+         (when-let ((path (or (alist-get 'path input)
+                              (alist-get "path" input nil nil #'equal))))
+           (abbreviate-file-name (format "%s" path))))
+        (_
+         ;; Generic: show first key=value pair
+         (when-let ((pair (car input)))
+           (truncate-string-to-width
+            (format "%s=%s" (car pair) (cdr pair)) 72 nil nil "…")))))))
+
+(defun claude-code--render-permission-request ()
+  "Render the inline tool-approval widget when a permission request is pending.
+Shows the tool name, a short input summary, and Allow / Always Allow / Deny
+buttons that call the corresponding commands.
+Wrapped in a magit-insert-section so the section tree stays consistent and
+magit's region-highlight hook never sees a nil section."
+  (when claude-code--pending-permission
+    (let* ((tool-name (alist-get 'tool-name claude-code--pending-permission))
+           (tool-input (alist-get 'tool-input claude-code--pending-permission))
+           (summary (claude-code--permission-tool-summary tool-name tool-input)))
+      (magit-insert-section (claude-permission)
+        (magit-insert-heading
+          (concat (propertize "  ⚠ Approval Required" 'face 'claude-code-permission-prompt)
+                  (propertize (format "  — %s" tool-name) 'face 'claude-code-tool-name)))
+        (when summary
+          (insert (propertize (format "  Args: %s\n" summary) 'face 'shadow)))
+        (insert "  ")
+        (insert-button "[y] Allow"
+                       'action (lambda (_btn) (claude-code-approve-tool))
+                       'help-echo "Allow this tool call once (key: y)"
+                       'face 'claude-code-permission-allow
+                       'follow-link t)
+        (insert "  ")
+        (insert-button "[Y] Always Allow"
+                       'action (lambda (_btn) (claude-code-always-allow-tool))
+                       'help-echo "Allow and never ask again for this tool (key: Y)"
+                       'face 'claude-code-permission-allow
+                       'follow-link t)
+        (insert "  ")
+        (insert-button "[n] Deny"
+                       'action (lambda (_btn) (claude-code-deny-tool))
+                       'help-echo "Deny this tool call (key: n)"
+                       'face 'claude-code-permission-deny
+                       'follow-link t)
+        (insert "\n")))))
 
 ;;;; Spawned Agents Panel
 
