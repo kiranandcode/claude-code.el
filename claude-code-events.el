@@ -98,6 +98,13 @@
          (claude-code--schedule-render)))
       ("permission_request"
        (claude-code--handle-permission-request event))
+      ("token_usage"
+       ;; Emitted from message_start stream events; reflects the full
+       ;; context-window usage (entire conversation history + system prompt)
+       ;; for the current API call.  Update immediately so the header-line
+       ;; ctx bar fills up as soon as the first response token arrives.
+       (when-let ((in (alist-get 'input_tokens event)))
+         (setq claude-code--last-input-tokens in)))
       ;; input_json_delta, rate_limit — ignored for now
       )))
 

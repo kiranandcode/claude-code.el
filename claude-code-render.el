@@ -94,6 +94,10 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
                                 (marker-position claude-code--input-marker))))
          (at-end (or was-in-input (>= (point) (point-max))))
          (old-point (point)))
+    ;; Ensure the sticky window header-line is initialised (may be nil if the
+    ;; buffer was reloaded via the keep-process path without re-running the mode).
+    (unless header-line-format
+      (setq-local header-line-format '(:eval (claude-code--build-header-line))))
     ;; Remove all thinking overlays (including any orphaned ones from previous
     ;; renders that may have escaped cleanup via the tracked variable).
     (remove-overlays (point-min) (point-max) 'claude-code-spinner t)
@@ -194,6 +198,63 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
     (when-let ((win (get-buffer-window (current-buffer))))
       (when at-end
         (set-window-point win (point-max))))))
+
+;;;; Sticky window header-line
+
+(defun claude-code--header-line-prop (label action help-text)
+  "Return LABEL as a propertized clickable string for `header-line-format'.
+ACTION is a zero-argument function called on mouse-1.  HELP-TEXT is the tooltip."
+  (let ((map (make-sparse-keymap)))
+    (define-key map [header-line mouse-1]
+      (lambda (_event) (interactive "e") (funcall action)))
+    (propertize label
+                'local-map map
+                'mouse-face 'highlight
+                'help-echo help-text)))
+
+(defun claude-code--build-header-line ()
+  "Build a compact one-line status string for `header-line-format'.
+Always visible at the top of the window regardless of scroll position."
+  (let* ((cfg    (claude-code--session-config))
+         (model  (or (alist-get 'model  cfg) "default"))
+         (effort (or (alist-get 'effort cfg) "none"))
+         (status-face (pcase claude-code--status
+                        ('working 'claude-code-status)
+                        ('error   'claude-code-error)
+                        (_        'shadow)))
+         (ctx-str (when claude-code--last-input-tokens
+                    (let* ((pct    (min 100.0 (* 100.0
+                                              (/ (float claude-code--last-input-tokens)
+                                                 200000))))
+                           (filled (round (* pct 0.08)))
+                           (bar    (concat (make-string filled ?█)
+                                           (make-string (- 8 filled) ?░)))
+                           (face   (cond ((>= pct 90) 'claude-code-error)
+                                         ((>= pct 70) 'warning)
+                                         (t           'shadow))))
+                      (propertize (format "ctx:%s%.0f%%" bar pct) 'face face)))))
+    (concat
+     (propertize " Claude Code" 'face 'claude-code-header)
+     "  "
+     (propertize (format "[%s]" claude-code--status) 'face status-face)
+     (when claude-code--cwd
+       (concat "  "
+               (propertize (abbreviate-file-name claude-code--cwd) 'face 'shadow)))
+     "  │  "
+     (propertize "model:" 'face 'shadow)
+     (claude-code--header-line-prop
+      (format "[%s]" model)
+      (lambda () (call-interactively #'claude-code-set-model))
+      "Click to change model (or press 'm' in menu)")
+     "  "
+     (propertize "effort:" 'face 'shadow)
+     (claude-code--header-line-prop
+      (format "[%s]" effort)
+      (lambda () (call-interactively #'claude-code-set-effort))
+      "Click to change effort (or press 'e' in menu)")
+     (when ctx-str (concat "  " ctx-str)))))
+
+;;;; Buffer header (inserted into scrollable content)
 
 (defun claude-code--render-header ()
   "Render the buffer header line."

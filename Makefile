@@ -12,16 +12,12 @@ default: all
 clean:
 	rm -f *.elc
 
-# All source modules in load order (test file excluded — ERT style doesn't compile cleanly)
-SRC_FILES := claude-code-vars.el \
-             claude-code-agents.el \
-             claude-code-process.el \
-             claude-code-config.el \
-             claude-code-events.el \
-             claude-code-render.el \
-             claude-code-commands.el \
-             claude-code-git-graph.el \
-             claude-code.el
+# All source modules: every claude-code*.el at the repo root, except the test
+# file (ERT style doesn't compile cleanly) and the package descriptor (autogen).
+# Sorted alphabetically — `-' (0x2d) sorts before `.' (0x2e), so the entry-
+# point file `claude-code.el' naturally lands at the end of the list.
+SRC_FILES := $(sort $(filter-out claude-code-test.el claude-code-pkg.el, \
+               $(wildcard claude-code*.el)))
 
 # Run checkdoc on source files (skip test file — ERT style doesn't pass checkdoc)
 checkdoc:

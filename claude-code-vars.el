@@ -103,7 +103,7 @@ Possible values:
 ;; At query time, the project config is merged on top of the defaults.
 
 (defcustom claude-code-defaults
-  '((model            . nil)
+  '((model            . "claude-opus-4-6")
     (effort           . nil)
     (permission-mode  . "bypassPermissions")
     (max-turns        . 50)
