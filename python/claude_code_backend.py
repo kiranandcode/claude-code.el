@@ -410,14 +410,15 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
             task_id=task_id,
             description=description,
             last_tool_name=last_tool_name,
+            data=raw_data,
         ):
             return TaskProgressEvent(
                 task_id=task_id,
                 description=description,
                 last_tool_name=last_tool_name,
                 # The SDK typed API only exposes last_tool_name, but the raw
-                # protocol payload (msg.data) may include last_tool_input.
-                last_tool_input=msg.data.get("last_tool_input"),
+                # protocol payload may include last_tool_input.
+                last_tool_input=raw_data.get("last_tool_input"),
             )
 
         case TaskStartedMessage(task_id=task_id, description=description):
