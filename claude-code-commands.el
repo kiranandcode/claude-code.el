@@ -42,16 +42,44 @@
 ;;;; Interactive Commands
 
 ;;;###autoload
+(defun claude-code--collect-eval-results ()
+  "Collect unsent eval-result messages and format them as context.
+Replaces each collected eval-result message with an eval-result-sent
+message so it is only included once.
+Returns a string to prepend to the next prompt, or nil."
+  (let (results)
+    (setq claude-code--messages
+          (mapcar (lambda (msg)
+                    (if (equal (alist-get 'type msg) "eval-result")
+                        (progn (push msg results)
+                               ;; Replace with sent variant
+                               (cons (cons 'type "eval-result-sent")
+                                     (cdr msg)))
+                      msg))
+                  claude-code--messages))
+    (when results
+      (mapconcat
+       (lambda (msg)
+         (format "[Eval result for `%s`]: %s%s"
+                 (truncate-string-to-width (alist-get 'code msg) 60)
+                 (if (alist-get 'errorp msg) "ERROR: " "")
+                 (alist-get 'value msg)))
+       results "\n"))))
+
 (defun claude-code-send (prompt)
   "Send PROMPT to Claude.
 Any @file-path tokens in PROMPT are expanded to fenced code blocks containing
-the file's contents before the message is dispatched."
+the file's contents before the message is dispatched.  Unsent inline eval
+results are automatically prepended as context."
   (interactive
    (list (read-string "Claude> " nil 'claude-code--prompt-history)))
   (when (string-empty-p prompt)
     (user-error "Empty prompt"))
   ;; Expand @-mentions before dispatching so Claude sees the actual content.
   (setq prompt (claude-code--expand-at-mentions prompt))
+  ;; Prepend any inline eval results from code blocks the user evaluated.
+  (when-let ((eval-ctx (claude-code--collect-eval-results)))
+    (setq prompt (concat eval-ctx "\n\n" prompt)))
   (let* ((cwd    (or claude-code--cwd default-directory))
          (cfg    (claude-code--session-config))
          ;; Capture and clear pending images atomically before any async work.
@@ -127,7 +155,14 @@ SOURCE is either a file path string or the symbol `clipboard'."
         (let ((raw (gui-get-selection 'CLIPBOARD 'image/png)))
           (unless raw
             (user-error "No image found on clipboard"))
-          (setq raw-data   raw
+          ;; `gui-get-selection' on macOS NS sometimes returns a string
+          ;; with the multibyte flag set even though the bytes themselves
+          ;; are raw image data.  `base64-encode-string' refuses multibyte
+          ;; input ("multibyte character in data"), so force-coerce to
+          ;; unibyte first.  `string-make-unibyte' is the right tool here:
+          ;; it preserves the byte representation regardless of the source
+          ;; multibyte flag.
+          (setq raw-data   (string-make-unibyte raw)
                 media-type "image/png"
                 name       "clipboard.png"))
       ;; File path
@@ -147,6 +182,72 @@ SOURCE is either a file path string or the symbol `clipboard'."
           claude-code--pending-images)
     (message "Attached image: %s (%s)" name media-type)
     (claude-code--schedule-render)))
+
+(defun claude-code--image-file-p (filename)
+  "Return non-nil if FILENAME has a recognized image extension."
+  (let ((ext (downcase (or (file-name-extension filename) ""))))
+    (member ext '("png" "jpg" "jpeg" "gif" "webp"))))
+
+(defun claude-code--dnd-handle-drop (event)
+  "Handle a drag-n-drop EVENT in a Claude buffer.
+Image files are attached to the next prompt; non-image files fall
+through to the default handler (`ns-drag-n-drop' on macOS,
+`dnd-handle-one-url' elsewhere)."
+  (interactive "e")
+  (let* ((data  (caddr event))            ; (TYPE OPERATIONS . OBJECTS)
+         (type  (car data))
+         (objects (cddr data))
+         (handled nil))
+    ;; Try to attach any image files from the drop
+    (dolist (obj objects)
+      (let ((file (cond
+                   ;; macOS NS: type is 'file and obj is a bare path
+                   ((and (eq type 'file) (stringp obj) (file-name-absolute-p obj))
+                    obj)
+                   ;; X11/GTK: obj is a file: URI
+                   ((and (stringp obj) (string-match "\\`file:" obj))
+                    (or (dnd-get-local-file-name obj t) obj))
+                   (t nil))))
+        (when (and file (file-readable-p file) (claude-code--image-file-p file))
+          (claude-code-attach-image file)
+          (setq handled t))))
+    ;; If we didn't handle everything as images, let the default handler
+    ;; deal with non-image files.
+    (unless handled
+      (if (fboundp 'ns-drag-n-drop)
+          (ns-drag-n-drop event)
+        ;; Generic fallback for X11/GTK
+        (dolist (obj objects)
+          (dnd-handle-one-url (selected-window) 'private
+                              (if (eq type 'file)
+                                  (concat "file:" obj)
+                                obj)))))))
+
+(defvar-local claude-code--last-yanked-image-hash nil
+  "MD5 of the last clipboard image already attached via yank-or-paste.
+Prevents the same image from being re-attached on every subsequent yank
+when the user wants to yank text after pasting an image.")
+
+(defun claude-code-yank-or-paste-image ()
+  "Yank text, or if the clipboard contains a NEW image, attach it.
+In the input area: if the clipboard contains an image we have not yet
+attached this session, attach it.  Otherwise fall through to the normal
+`yank' command.  Tracking the image's MD5 prevents re-attaching the same
+image every time the user yanks text after pasting an image."
+  (interactive)
+  (let* ((clip-image (and (claude-code--input-area-p)
+                          (ignore-errors
+                            (gui-get-selection 'CLIPBOARD 'image/png))))
+         (clip-hash  (and clip-image
+                          (md5 (string-make-unibyte clip-image)))))
+    (cond
+     ;; New image on clipboard — attach it once.
+     ((and clip-hash
+           (not (equal clip-hash claude-code--last-yanked-image-hash)))
+      (setq claude-code--last-yanked-image-hash clip-hash)
+      (claude-code-attach-image 'clipboard))
+     ;; Anything else — normal yank
+     (t (yank)))))
 
 ;;;###autoload
 (defun claude-code-send-region (start end)
@@ -308,26 +409,32 @@ Point must be on a ▶ You message heading (not in the input area)."
            (buf-name     (generate-new-buffer-name base-name))
            (agent-key    (format "%s::%s" cwd (format-time-string "%s%N")))
            (buf          (get-buffer-create buf-name)))
-      (with-current-buffer buf
-        (claude-code-mode)
-        (setq claude-code--cwd        cwd
-              claude-code--session-id nil        ; fresh backend session
-              claude-code--session-key agent-key
-              claude-code--messages   forked-msgs)
-        (claude-code--agent-register
-         agent-key
-         :type 'session
-         :description (format "%s (fork)" (abbreviate-file-name cwd))
-         :status 'starting
-         :buffer buf
-         :cwd cwd
-         :children nil)
-        (claude-code--start-process)
-        (claude-code--schedule-render))
-      (pop-to-buffer buf)
-      (message "Forked at: %s"
-               (truncate-string-to-width
-                (alist-get 'prompt target-msg) 60)))))
+      (let ((parent-key (claude-code--effective-session-key))
+            (fork-label (truncate-string-to-width
+                         (alist-get 'prompt target-msg) 60)))
+        (with-current-buffer buf
+          (claude-code-mode)
+          (setq claude-code--cwd        cwd
+                claude-code--session-id nil        ; fresh backend session
+                claude-code--session-key agent-key
+                claude-code--messages   forked-msgs)
+          (claude-code--agent-register
+           agent-key
+           :type 'session
+           :description (format "⑂ %s" fork-label)
+           :status 'starting
+           :buffer buf
+           :parent-id parent-key
+           :fork-point fork-label
+           :cwd cwd
+           :children nil)
+          ;; Link fork as child of the parent session.
+          (when parent-key
+            (claude-code--agent-add-child parent-key agent-key))
+          (claude-code--start-process)
+          (claude-code--schedule-render))
+        (pop-to-buffer buf)
+        (message "Forked at: %s" fork-label)))))
 
 (defun claude-code--fork-at-msg (msg)
   "Fork the conversation at MSG without requiring point on a section.
@@ -338,6 +445,9 @@ accepts the target message alist directly."
          ;; claude-code--messages is newest-first; nthcdr gives target + older.
          (forked-msgs  (copy-sequence (nthcdr pos claude-code--messages)))
          (cwd          (or claude-code--cwd default-directory))
+         (parent-key   (claude-code--effective-session-key))
+         (fork-label   (truncate-string-to-width
+                        (alist-get 'prompt msg) 60))
          (base-name    (claude-code--buffer-name cwd))
          (buf-name     (generate-new-buffer-name base-name))
          (agent-key    (format "%s::%s" cwd (format-time-string "%s%N")))
@@ -351,17 +461,20 @@ accepts the target message alist directly."
       (claude-code--agent-register
        agent-key
        :type 'session
-       :description (format "%s (fork)" (abbreviate-file-name cwd))
+       :description (format "⑂ %s" fork-label)
        :status 'starting
        :buffer buf
+       :parent-id parent-key
+       :fork-point fork-label
        :cwd cwd
        :children nil)
+      ;; Link fork as child of the parent session.
+      (when parent-key
+        (claude-code--agent-add-child parent-key agent-key))
       (claude-code--start-process)
       (claude-code--schedule-render))
     (pop-to-buffer buf)
-    (message "Forked at: %s"
-             (truncate-string-to-width
-              (alist-get 'prompt msg) 60))))
+    (message "Forked at: %s" fork-label)))
 
 (defun claude-code-open-notes ()
   "Open the notes org file."
@@ -571,6 +684,49 @@ is not inside a code block."
 (claude-code--def-key-command claude-code-key-copy-code-block
   #'claude-code-copy-code-block
   "Copy code block at point, or self-insert in input area.")
+
+;;;; Inline Eval of Emacs Lisp Code Blocks
+
+(defun claude-code-eval-code-block (&optional code-override)
+  "Evaluate the Emacs Lisp code block at point and record the result.
+The result (or error) is pushed into `claude-code--messages' as an
+\"eval-result\" entry and rendered inline.  On the next turn the result
+is automatically included as context for Claude.
+
+When CODE-OVERRIDE is non-nil (e.g. called from the [eval] button),
+use it directly instead of reading the text property at point."
+  (interactive)
+  (let* ((code (or code-override
+                   (get-text-property (point) 'claude-code-code-content)))
+         (lang (or (get-text-property (point) 'claude-code-code-lang) "")))
+    (unless code
+      (user-error "No code block at point (move point into the code body)"))
+    ;; Only eval Emacs Lisp
+    (unless (or code-override  ; button already validated
+                (memq (claude-code--mode-for-lang lang)
+                      '(emacs-lisp-mode lisp-interaction-mode)))
+      (user-error "Only Emacs Lisp code blocks can be evaluated (this block is %s)"
+                  (if (string-empty-p lang) "unlabelled" lang)))
+    (let (value errorp)
+      (condition-case err
+          (setq value (prin1-to-string (eval (read (format "(progn %s)" code)) t)))
+        (error
+         (setq value (error-message-string err)
+               errorp t)))
+      ;; Record in conversation history
+      (push `((type . "eval-result")
+              (code . ,code)
+              (value . ,value)
+              (errorp . ,errorp))
+            claude-code--messages)
+      (claude-code--schedule-render)
+      (if errorp
+          (message "Eval error: %s" value)
+        (message "Eval ⇒ %s" (truncate-string-to-width value 80))))))
+
+(claude-code--def-key-command claude-code-key-eval-code-block
+  #'claude-code-eval-code-block
+  "Evaluate Emacs Lisp code block at point, or self-insert in input area.")
 
 ;;;; Tool-Call Permission Commands
 
@@ -1321,6 +1477,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "R"   #'claude-code-key-restart
   "n"   #'claude-code-key-deny-or-notes
   "w"   #'claude-code-key-copy-code-block
+  "e"   #'claude-code-key-eval-code-block
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
   "a"   #'claude-code-key-agents-toggle
@@ -1339,7 +1496,9 @@ Prevents S-SPC from triggering scroll-down while typing."
   "M-p" #'claude-code-previous-input
   "M-n" #'claude-code-next-input
   "C-c i" #'claude-code-attach-image
-  "C-w" #'claude-code-kill-region-or-copy)
+  "C-y"   #'claude-code-yank-or-paste-image
+  "C-w" #'claude-code-kill-region-or-copy
+  "<drag-n-drop>" #'claude-code--dnd-handle-drop)
 
 (defun claude-code-kill-region-or-copy (beg end &optional yank-handler)
   "Copy or kill the region, depending on where it falls.
@@ -1441,7 +1600,8 @@ Outside the input area, toggle the magit section at point."
   ;; (wrong-type-argument … nil) inside `magit-section-siblings'.  Remove
   ;; the hook locally; normal Emacs region highlighting still works fine.
   (remove-hook 'redisplay--update-region-highlight-functions
-               #'magit-section--highlight-region t))
+               #'magit-section--highlight-region t)
+)
 
 ;;;; Emacs-Native Subagent Spawning
 

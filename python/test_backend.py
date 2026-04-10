@@ -255,6 +255,48 @@ class TestConvertContentBlock:
         assert isinstance(result, ToolResultContentBlock)
         assert result.is_error is True
 
+    def test_tool_result_rewrites_stream_closed_string(self) -> None:
+        """The bundled-CLI 'Stream closed' pseudo-error gets rewritten."""
+        result = convert_content_block(
+            ToolResultBlock(
+                tool_use_id="tu1",
+                content="Tool permission request failed: Error: Stream closed",
+                is_error=True,
+            )
+        )
+        assert isinstance(result, ToolResultContentBlock)
+        # Rewritten content should mention transient + retry
+        assert "transient" in result.content.lower()  # type: ignore[union-attr]
+        assert "retry" in result.content.lower()  # type: ignore[union-attr]
+        # is_error cleared so the model treats it as actionable
+        assert result.is_error is False
+
+    def test_tool_result_rewrites_stream_closed_in_mcp_blocks(self) -> None:
+        """MCP tools return content as a list of {type,text} blocks."""
+        result = convert_content_block(
+            ToolResultBlock(
+                tool_use_id="tu1",
+                content=[
+                    {"type": "text",
+                     "text": "Tool permission request failed: Error: Stream closed"},
+                ],
+                is_error=True,
+            )
+        )
+        assert isinstance(result, ToolResultContentBlock)
+        assert isinstance(result.content, list)
+        assert "transient" in result.content[0]["text"].lower()
+        assert result.is_error is False
+
+    def test_tool_result_passthrough_normal_content(self) -> None:
+        """Normal tool results pass through unchanged."""
+        result = convert_content_block(
+            ToolResultBlock(tool_use_id="tu1", content="normal output", is_error=False)
+        )
+        assert isinstance(result, ToolResultContentBlock)
+        assert result.content == "normal output"
+        assert result.is_error is False
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # convert_stream_event()

@@ -458,6 +458,58 @@ def emit(event: EmitEvent) -> None:
     _stdout_queue.put_nowait(json.dumps(asdict(event), default=str) + "\n")
 
 
+# Error pattern produced by the bundled Claude CLI when its upstream HTTP/2
+# stream to the Anthropic API gets reset mid-tool-call.  The CLI swallows
+# the network failure and synthesizes a fake tool_result with this exact
+# text, which then becomes part of the conversation history visible to the
+# model.  We rewrite it into a clearer, retry-friendly message so the model
+# knows to retry the call rather than treating it as a real tool failure.
+_STREAM_CLOSED_PATTERN = "Tool permission request failed: Error: Stream closed"
+
+
+def _rewrite_stream_closed_error(content: Any) -> tuple[Any, bool]:
+    """If CONTENT contains the well-known CLI 'Stream closed' error, return
+    a rewritten version with retry guidance.  Returns (new_content, was_rewritten).
+
+    Logs a WARNING when a rewrite happens so we can track frequency in the
+    backend log.
+    """
+    if isinstance(content, str) and _STREAM_CLOSED_PATTERN in content:
+        _log.warning(
+            "rewriting CLI 'Stream closed' tool error to retry hint"
+        )
+        return (
+            "[transient: the upstream Anthropic HTTP stream was closed "
+            "before this tool call could complete.  This is a network/server "
+            "issue, not a real tool failure.  Please retry the same tool call.]",
+            True,
+        )
+    if isinstance(content, list):
+        rewritten = False
+        new_blocks: list[Any] = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                txt = b.get("text", "")
+                if _STREAM_CLOSED_PATTERN in txt:
+                    _log.warning(
+                        "rewriting CLI 'Stream closed' (in MCP block) to retry hint"
+                    )
+                    new_blocks.append({
+                        "type": "text",
+                        "text": (
+                            "[transient: upstream Anthropic stream was closed "
+                            "before this tool call completed — please retry "
+                            "the same call.]"
+                        ),
+                    })
+                    rewritten = True
+                    continue
+            new_blocks.append(b)
+        if rewritten:
+            return new_blocks, True
+    return content, False
+
+
 def convert_content_block(block: SDKContentBlock) -> EmitContentBlock:
     """Convert an SDK content block to a protocol content block."""
     match block:
@@ -470,8 +522,14 @@ def convert_content_block(block: SDKContentBlock) -> EmitContentBlock:
         case ToolResultBlock(
             tool_use_id=tool_use_id, content=content, is_error=is_error
         ):
+            # Detect the bundled-CLI's "Stream closed" pseudo-error and
+            # rewrite it as a clearer retry hint.  Also drop the is_error
+            # flag so the model treats it as actionable rather than fatal.
+            new_content, was_rewritten = _rewrite_stream_closed_error(content)
             return ToolResultContentBlock(
-                tool_use_id=tool_use_id, content=content, is_error=is_error
+                tool_use_id=tool_use_id,
+                content=new_content,
+                is_error=False if was_rewritten else is_error,
             )
 
 
@@ -1906,7 +1964,11 @@ async def main() -> None:
     emit(StatusEvent(status="ready"))
 
     loop = asyncio.get_event_loop()
-    reader = asyncio.StreamReader()
+    # Default line buffer is 64 KiB which is too small for prompts with
+    # base64-encoded image attachments (often 1-5 MB).  Bump to 16 MiB so
+    # readline() doesn't choke on the image payload with
+    # "Separator is found, but chunk is longer than limit".
+    reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
