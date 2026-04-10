@@ -268,6 +268,11 @@ Also pulses any open Emacs buffers whose files were touched by tool calls."
   (claude-code--flush-streaming)
   (claude-code--stop-thinking)
   (push event claude-code--messages)
+  ;; Capture token counts for the context-window usage bar in the header.
+  (when-let ((in  (alist-get 'input_tokens event)))
+    (setq claude-code--last-input-tokens in))
+  (when-let ((out (alist-get 'output_tokens event)))
+    (setq claude-code--last-output-tokens out))
   ;; Record stats (in-memory, session lifetime only)
   (claude-code-stats-record!
    (or claude-code--cwd default-directory)

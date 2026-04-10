@@ -30,11 +30,15 @@
 
 ;;;###autoload
 (defun claude-code-send (prompt)
-  "Send PROMPT to Claude."
+  "Send PROMPT to Claude.
+Any @file-path tokens in PROMPT are expanded to fenced code blocks containing
+the file's contents before the message is dispatched."
   (interactive
    (list (read-string "Claude> " nil 'claude-code--prompt-history)))
   (when (string-empty-p prompt)
     (user-error "Empty prompt"))
+  ;; Expand @-mentions before dispatching so Claude sees the actual content.
+  (setq prompt (claude-code--expand-at-mentions prompt))
   (let* ((cwd    (or claude-code--cwd default-directory))
          (cfg    (claude-code--session-config))
          ;; Capture and clear pending images atomically before any async work.
@@ -798,6 +802,104 @@ Activates when point is in the input area and the input starts with /."
                     (insert "/"))))
               :exclusive 'no)))))
 
+;;;; @-mention File Completion
+
+(defun claude-code--lang-for-file (file)
+  "Return a Markdown language identifier string for FILE's extension."
+  (let ((ext (downcase (or (file-name-extension file) ""))))
+    (pcase ext
+      ("el"   "elisp")
+      ("py"   "python")
+      ("js"   "javascript")
+      ("ts"   "typescript")
+      ("tsx"  "typescript")
+      ("jsx"  "javascript")
+      ("rb"   "ruby")
+      ("rs"   "rust")
+      ("go"   "go")
+      ("sh"   "bash")
+      ("bash" "bash")
+      ("zsh"  "bash")
+      ("fish" "fish")
+      ("c"    "c")
+      ("h"    "c")
+      ("cpp"  "cpp")
+      ("cc"   "cpp")
+      ("cs"   "csharp")
+      ("java" "java")
+      ("kt"   "kotlin")
+      ("swift" "swift")
+      ("html" "html")
+      ("css"  "css")
+      ("scss" "scss")
+      ("json" "json")
+      ("yaml" "yaml")
+      ("yml"  "yaml")
+      ("toml" "toml")
+      ("md"   "markdown")
+      ("org"  "org")
+      ("sql"  "sql")
+      ("nix"  "nix")
+      ("lua"  "lua")
+      ("vim"  "vim")
+      (_      ""))))
+
+(defun claude-code--expand-at-mentions (text)
+  "Replace @file-path tokens in TEXT with fenced file contents.
+Each @path is replaced with a Markdown fenced block containing the file's
+content.  Paths are resolved relative to `claude-code--cwd'.  If the file
+cannot be read, the @path token is left unchanged."
+  (let ((cwd (or claude-code--cwd default-directory)))
+    (replace-regexp-in-string
+     "@\\([^[:space:]\n]+\\)"
+     (lambda (match)
+       (let* ((path-raw (match-string 1 match))
+              (abs-path (expand-file-name path-raw cwd)))
+         (if (file-readable-p abs-path)
+             (let* ((lang (claude-code--lang-for-file abs-path))
+                    (content (with-temp-buffer
+                               (insert-file-contents abs-path)
+                               (buffer-string))))
+               (format "@%s\n```%s\n%s\n```" path-raw lang content))
+           ;; File not readable — leave the token intact.
+           match)))
+     text
+     t t)))
+
+(defun claude-code--at-mention-capf ()
+  "Completion-at-point function for @file-path mentions in the Claude input area.
+Activates when point is preceded by @ followed by a partial file path."
+  (when (claude-code--input-area-p)
+    (let* ((end        (point))
+           (line-start (save-excursion (beginning-of-line) (point)))
+           ;; Limit search to within the input area.
+           (input-start (marker-position claude-code--input-marker))
+           (search-start (max line-start input-start))
+           (before     (buffer-substring-no-properties search-start end)))
+      ;; Only activate when there's a bare @ (possibly with a partial path) at
+      ;; the end of what has been typed so far on this line.
+      (when (string-match "@\\([^[:space:]\n]*\\)\\'" before)
+        (let* ((partial   (match-string 1 before))
+               (at-offset (match-beginning 0))
+               ;; beg points just after the @, so completions replace the partial path.
+               (path-beg  (+ search-start at-offset 1))
+               (cwd       (or claude-code--cwd default-directory))
+               ;; Split partial into dir portion + file name prefix.
+               (dir-part  (or (file-name-directory partial) ""))
+               (file-pfx  (file-name-nondirectory partial))
+               (abs-dir   (expand-file-name dir-part cwd))
+               (all-files (when (file-directory-p abs-dir)
+                            (file-name-all-completions file-pfx abs-dir)))
+               ;; Re-prepend the typed directory so completions are full rel-paths.
+               (candidates (mapcar (lambda (f) (concat dir-part f)) all-files)))
+          (when candidates
+            (list path-beg end candidates
+                  :annotation-function
+                  (lambda (cand)
+                    (if (string-suffix-p "/" cand) "  [dir]" "  [file]"))
+                  :company-prefix-length (length partial)
+                  :exclusive 'no)))))))
+
 ;;;; Inline Input Commands
 
 (defun claude-code-submit-input ()
@@ -1254,10 +1356,12 @@ Outside the input area, toggle the magit section at point."
   ;; the buffer is erased and rewritten by the render function.
   (font-lock-mode -1)
   (visual-line-mode 1)
-  ;; Slash-command completion via CAPF (company picks this up automatically
-  ;; via company-capf when company-mode is active in the session).
+  ;; Slash-command and @-mention completion via CAPF (company picks these up
+  ;; automatically via company-capf when company-mode is active).
   (add-hook 'completion-at-point-functions
             #'claude-code--slash-command-capf nil t)
+  (add-hook 'completion-at-point-functions
+            #'claude-code--at-mention-capf nil t)
   ;; Unregister the agent automatically when the buffer is killed via any
   ;; path (C-x k, kill-buffer, etc.) — not just via `claude-code-kill'.
   (add-hook 'kill-buffer-hook

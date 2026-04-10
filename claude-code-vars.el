@@ -515,6 +515,14 @@ are written back to that slot before moving to the next.")
   "Total characters received from text/thinking deltas this query.
 Used as a rough token-count approximation in the thinking spinner.")
 
+(defvar-local claude-code--last-input-tokens nil
+  "Input token count from the most recent result event, or nil.
+Updated after each completed query.  Displayed as a context-window usage
+bar in the header: ████░░░░ 23%  (assumes 200k context window).")
+
+(defvar-local claude-code--last-output-tokens nil
+  "Output token count from the most recent result event, or nil.")
+
 ;;;; Tool-Call Permission State
 
 (defcustom claude-code-ask-permission-tools

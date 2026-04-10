@@ -269,6 +269,24 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
                      'face 'claude-code-action-button
                      'follow-link t)
       (insert "\n"))
+    ;; Context-window usage bar (shown after the first completed query).
+    (when claude-code--last-input-tokens
+      (let* ((used    claude-code--last-input-tokens)
+             ;; All current Claude models have a 200k token context window.
+             (total   200000)
+             (pct     (min 100.0 (* 100.0 (/ (float used) total))))
+             (filled  (round (* pct 0.08)))   ; 8 blocks total → 0–8 filled
+             (empty   (- 8 filled))
+             (bar     (concat (make-string filled ?█)
+                              (make-string empty ?░)))
+             (face    (cond ((>= pct 90) 'claude-code-error)
+                            ((>= pct 70) 'warning)
+                            (t           'shadow))))
+        (insert "  ")
+        (insert (propertize (format "ctx: %s %.0f%%" bar pct) 'face face))
+        (insert (propertize (format "  (%dk / 200k tokens)" (/ used 1000))
+                            'face 'shadow))
+        (insert "\n")))
     (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
     (insert "\n")
     ;; Action buttons: Cancel (when working), Reset, New Session
@@ -496,21 +514,30 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
       (insert "  " line "\n"))
     ;; Annotate body with the raw code string so `w' can find it at point
     (put-text-property body-beg (point) 'claude-code-code-content code)
+    ;; Fixed-pitch: keep code monospace even when surrounding prose is
+    ;; variable-pitch.  add-face-text-property appends without clobbering
+    ;; existing font-lock faces.
+    (add-face-text-property body-beg (point) 'fixed-pitch)
     ;; Closing fence
     (insert (propertize "  ```\n" 'face 'shadow))))
 
 (defun claude-code--render-text (text)
   "Render a TEXT content block.
 Fenced code blocks are syntax-highlighted using the language's major mode;
-prose lines are linkified as before."
+prose lines are linkified and rendered in `variable-pitch' face so they
+read as flowing prose alongside monospace code blocks."
   (when (and text (not (string-empty-p text)))
     (dolist (segment (claude-code--parse-text-blocks text))
       (pcase segment
         (`(text . ,prose)
-         (dolist (line (split-string prose "\n" nil))
-           (insert "  ")
-           (claude-code--insert-linkified line)
-           (insert "\n")))
+         (let ((seg-beg (point)))
+           (dolist (line (split-string prose "\n" nil))
+             (insert "  ")
+             (claude-code--insert-linkified line)
+             (insert "\n"))
+           ;; Variable-pitch prose: proportional font for readability.
+           ;; Falls back gracefully to default in terminal Emacs.
+           (add-face-text-property seg-beg (point) 'variable-pitch)))
         (`(code . (,lang . ,code))
          (claude-code--insert-code-block lang code))))))
 

@@ -10,10 +10,25 @@ from __future__ import annotations
 import anyio
 import asyncio
 import json
+import logging
 import os
+import queue as _queue_module
 import shutil
 import sys
+import threading
 import traceback
+
+# ---------------------------------------------------------------------------
+# Debug file logger — writes to /tmp/claude-code-backend.log
+# Enable with:  CLAUDE_CODE_DEBUG=1   (env var in claude-code-process.el or shell)
+# Then tail /tmp/claude-code-backend.log to observe MCP/streaming behaviour.
+# ---------------------------------------------------------------------------
+_log = logging.getLogger("claude_code_backend")
+if not _log.handlers:
+    _fh = logging.FileHandler("/tmp/claude-code-backend.log")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _log.addHandler(_fh)
+    _log.setLevel(logging.DEBUG if os.environ.get("CLAUDE_CODE_DEBUG") else logging.WARNING)
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, cast
@@ -199,6 +214,8 @@ class ResultEvent:
     total_cost_usd: float | None = None
     duration_ms: int = 0
     session_id: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 @dataclass
@@ -335,13 +352,48 @@ type SDKContentBlock = TextBlock | ThinkingBlock | ToolUseBlock | ToolResultBloc
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Non-blocking stdout writer
+#
+# `emit()` must never block the asyncio event loop.  Blocking `sys.stdout`
+# (a pipe to Emacs) while the event loop is running prevents asyncio from
+# reading emacsclient subprocess output, which stalls MCP tool calls and
+# causes the Claude CLI to see "Stream closed".
+#
+# Fix: a dedicated daemon thread drains a queue and writes to stdout.
+# `emit()` just does a non-blocking `put_nowait` — it never blocks.
+# ---------------------------------------------------------------------------
+
+_stdout_queue: _queue_module.Queue[str | None] = _queue_module.Queue()
+
+
+def _stdout_writer() -> None:
+    """Background daemon thread: drain _stdout_queue → sys.stdout."""
+    while True:
+        data = _stdout_queue.get()
+        if data is None:          # None is the shutdown sentinel
+            break
+        try:
+            sys.stdout.write(data)
+            sys.stdout.flush()
+        except BrokenPipeError:
+            sys.exit(0)
+        except Exception:
+            pass                  # swallow unexpected errors; don't crash the thread
+
+
+_stdout_thread = threading.Thread(target=_stdout_writer, daemon=True, name="stdout-writer")
+_stdout_thread.start()
+
+
 def emit(event: EmitEvent) -> None:
-    """Write a typed event to stdout for Emacs to consume."""
-    try:
-        sys.stdout.write(json.dumps(asdict(event), default=str) + "\n")
-        sys.stdout.flush()
-    except BrokenPipeError:
-        sys.exit(0)
+    """Enqueue a typed event for delivery to Emacs via the stdout writer thread.
+
+    This function is intentionally non-blocking: it never waits for the OS
+    pipe buffer.  The actual write happens on a separate daemon thread so the
+    asyncio event loop is always free to run MCP control-request tasks.
+    """
+    _stdout_queue.put_nowait(json.dumps(asdict(event), default=str) + "\n")
 
 
 def convert_content_block(block: SDKContentBlock) -> EmitContentBlock:
@@ -448,6 +500,7 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
             total_cost_usd=total_cost_usd,
             duration_ms=duration_ms,
             session_id=session_id,
+            usage=usage,
         ):
             return ResultEvent(
                 result=result,
@@ -457,6 +510,8 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 total_cost_usd=total_cost_usd,
                 duration_ms=duration_ms,
                 session_id=session_id,
+                input_tokens=usage.get("input_tokens") if usage else None,
+                output_tokens=usage.get("output_tokens") if usage else None,
             )
 
         case UserMessage(content=content) if isinstance(content, list):
@@ -670,15 +725,19 @@ def _tool_result(text: str, is_error: bool = False) -> dict[str, Any]:
 )
 async def _emacs_eval(args: dict[str, Any]) -> dict[str, Any]:
     code = args.get("code", "")
+    _log.debug("_emacs_eval called: %r", code[:120])
     try:
         # Delegate validation + eval to the Emacs-side helper
         elisp = f'(claude-code-tools-eval {json.dumps(code)})'
         out = await _run_emacsclient(elisp)
+        _log.debug("_emacs_eval result: %r", out[:120])
         is_error = out.startswith("error:")
         return _tool_result(out, is_error=is_error)
     except EmacsclientNotFoundError:
+        _log.debug("_emacs_eval: emacsclient not found")
         raise
     except Exception as e:
+        _log.debug("_emacs_eval exception: %s", e)
         return _tool_result(f"error: emacsclient failed — {e}", is_error=True)
 
 
@@ -1193,6 +1252,23 @@ async def _prompt_as_streaming(
     }
 
 
+def _needs_streaming(options: ClaudeAgentOptions) -> bool:
+    """Return True when the query must use streaming mode.
+
+    Streaming keeps stdin open for the bidirectional control protocol, which is
+    required by:
+      - ``can_use_tool`` callbacks (permission requests go back and forth), and
+      - in-process SDK MCP servers (tool calls are routed via control messages).
+    Without streaming the CLI closes stdin immediately after the prompt, so any
+    in-flight MCP tool call from Claude receives "Stream closed".
+    """
+    has_sdk_mcp = any(
+        isinstance(cfg, dict) and cfg.get("type") == "sdk"
+        for cfg in (options.mcp_servers or {}).values()
+    )
+    return options.can_use_tool is not None or has_sdk_mcp
+
+
 def build_prompt(cmd: QueryCommand, *, streaming: bool = False) -> Any:
     """Return the prompt value to pass to ``query()``.
 
@@ -1270,7 +1346,13 @@ def build_options(cmd: QueryCommand) -> ClaudeAgentOptions:
 async def handle_query(cmd: QueryCommand) -> None:
     """Process a query command from Emacs."""
     options = build_options(cmd)
-    needs_streaming = options.can_use_tool is not None
+    needs_streaming = _needs_streaming(options)
+    _log.debug(
+        "handle_query: streaming=%s can_use_tool=%s mcp_servers=%s",
+        needs_streaming,
+        options.can_use_tool is not None,
+        list((options.mcp_servers or {}).keys()),
+    )
 
     emit(StatusEvent(status="working"))
 
@@ -1293,7 +1375,7 @@ async def handle_query(cmd: QueryCommand) -> None:
             ))
             cmd.resume = None
             options = build_options(cmd)
-            needs_streaming = options.can_use_tool is not None
+            needs_streaming = _needs_streaming(options)
             try:
                 async for message in query(
                     prompt=build_prompt(cmd, streaming=needs_streaming),
