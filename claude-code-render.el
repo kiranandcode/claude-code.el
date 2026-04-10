@@ -513,95 +513,48 @@ from regular built-in tools."
          (disp-name (if is-mcp (claude-code--mcp-tool-short-name name) name))
          (summary   (claude-code--tool-summary name input))
          (name-face (if is-mcp 'claude-code-mcp-tool-name 'claude-code-tool-name)))
-    (magit-insert-section (claude-tool-use nil
-                                           (not claude-code-show-tool-details))
-      (magit-insert-heading
-        (concat "  "
-                (propertize (format "⚙ %s" disp-name) 'face name-face)
-                (when is-mcp
-                  (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
-                (when summary
-                  (concat " " (propertize summary 'face 'shadow)))))
-      (when input
-        (pcase (claude-code--mcp-tool-short-name name)
-          ("Edit"
-           (claude-code--render-edit-input input)
-           (insert "\n"))
-          ("MultiEdit"
-           (claude-code--render-multiedit-input input)
-           (insert "\n"))
-          (_
-           (insert (propertize
-                    (claude-code--indent
-                     (if (stringp input)
-                         input
-                       (json-encode input))
-                     6)
-                    'face 'claude-code-tool-input))
-           (insert "\n")))))))
+    ;; Edit and Write get their own rich diff sections from claude-code-diff.el.
+    (if (and claude-code-show-edit-diff (member name '("Edit" "Write")))
+        (pcase name
+          ("Edit"  (claude-code--render-edit-diff-section block))
+          ("Write" (claude-code--render-write-diff-section block)))
+      (magit-insert-section (claude-tool-use nil
+                                             (not claude-code-show-tool-details))
+        (magit-insert-heading
+          (concat "  "
+                  (propertize (format "⚙ %s" disp-name) 'face name-face)
+                  (when is-mcp
+                    (propertize " [Emacs]" 'face 'claude-code-mcp-badge))
+                  (when summary
+                    (concat " " (propertize summary 'face 'shadow)))))
+        (when input
+          (pcase (claude-code--mcp-tool-short-name name)
+            ("MultiEdit"
+             (claude-code--render-multiedit-input input)
+             (insert "\n"))
+            (_
+             (insert (propertize
+                      (claude-code--indent
+                       (if (stringp input)
+                           input
+                         (json-encode input))
+                       6)
+                      'face 'claude-code-tool-input))
+             (insert "\n"))))))))
 
-;;;; Edit / MultiEdit diff rendering
-
-(defun claude-code--diff-strings (old new)
-  "Return a unified diff string OLD → NEW, or nil on failure.
-Writes two temp files and invokes the external `diff -u' command.
-Exit codes 0 (identical) and 1 (differences found) are both treated as
-success; exit code 2 or higher indicates an error and nil is returned."
-  (when (and (stringp old) (stringp new))
-    (let ((old-file (make-temp-file "claude-edit-old"))
-          (new-file (make-temp-file "claude-edit-new")))
-      (unwind-protect
-          (progn
-            (with-temp-file old-file (insert old))
-            (with-temp-file new-file (insert new))
-            (with-temp-buffer
-              (let ((rc (call-process "diff" nil t nil "-u"
-                                      "--label" "before"
-                                      "--label" "after"
-                                      old-file new-file)))
-                (when (< rc 2)
-                  (buffer-string)))))
-        (ignore-errors (delete-file old-file))
-        (ignore-errors (delete-file new-file))))))
-
-(defun claude-code--insert-diff-lines (diff-str)
-  "Insert DIFF-STR with diff-mode-like face coloring, indented 6 spaces.
-Lines are colored by prefix:
-  `---' / `+++' → `diff-file-header'
-  `@@'           → `diff-hunk-header'
-  `-'            → `diff-removed'
-  `+'            → `diff-added'
-  context lines  → shadow"
-  (require 'diff-mode)
-  (dolist (line (split-string diff-str "\n" t))
-    (let ((face (cond
-                 ((string-prefix-p "---" line) 'diff-file-header)
-                 ((string-prefix-p "+++" line) 'diff-file-header)
-                 ((string-prefix-p "@@" line)  'diff-hunk-header)
-                 ((string-prefix-p "-" line)   'diff-removed)
-                 ((string-prefix-p "+" line)   'diff-added)
-                 (t 'shadow))))
-      (insert (propertize (concat "      " line) 'face face))
-      (insert "\n"))))
-
-(defun claude-code--render-edit-input (input)
-  "Render INPUT for an Edit tool call as a unified diff.
-Falls back to raw JSON if `diff' is unavailable or INPUT lacks the
-expected `old_string' / `new_string' keys."
-  (let* ((old  (alist-get 'old_string input))
-         (new  (alist-get 'new_string input))
-         (diff (and old new (claude-code--diff-strings old new))))
-    (if diff
-        (claude-code--insert-diff-lines diff)
-      (insert (propertize
-               (claude-code--indent (json-encode input) 6)
-               'face 'claude-code-tool-input)))))
+;;;; MultiEdit diff rendering
+;;
+;; Single Edit / Write blocks are delegated to `claude-code-diff.el' which
+;; provides richer sections with +N/-M stats and an [ediff] button.
+;; MultiEdit is handled here because it has no counterpart in that module.
 
 (defun claude-code--render-multiedit-input (input)
   "Render INPUT for a MultiEdit tool call as per-edit unified diffs.
 Each entry in the `edits' vector is rendered as a separate diff block
 labelled \"Edit N/M\" when there are multiple edits.  Falls back to raw
-JSON display when `diff' is unavailable."
+JSON display when `diff' is unavailable.
+Uses `claude-code--diff-strings' and `claude-code--render-diff-string'
+from `claude-code-diff.el'."
   (let* ((edits (alist-get 'edits input))
          (edit-list (cond ((vectorp edits) (append edits nil))
                           ((listp edits)   edits))))
@@ -618,7 +571,7 @@ JSON display when `diff' is unavailable."
                    (new  (alist-get 'new_string edit))
                    (diff (and old new (claude-code--diff-strings old new))))
               (if diff
-                  (claude-code--insert-diff-lines diff)
+                  (claude-code--render-diff-string diff 6)
                 (insert (propertize
                          (claude-code--indent (json-encode edit) 6)
                          'face 'claude-code-tool-input))))))

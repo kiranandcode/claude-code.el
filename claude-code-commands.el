@@ -1289,7 +1289,7 @@ Designed for dogfooding: edit the source, hit the keybinding, see changes."
       (condition-case err
           (dolist (subfile '("claude-code-vars" "claude-code-agents" "claude-code-process"
                              "claude-code-config" "claude-code-stats" "claude-code-events"
-                             "claude-code-diff" "claude-code-render" "claude-code-commands"
+                             "claude-code-render" "claude-code-commands"
                              "claude-code-git-graph" "claude-code-frame-render"
                              "claude-code-emacs-tools"))
             (load (expand-file-name (concat subfile ".el") claude-code--package-dir) nil t))

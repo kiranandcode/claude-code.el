@@ -45,16 +45,32 @@ from claude_code_backend import (
     build_prompt,
     build_options,
     _tool_result,
-    _can_use_tool_callback,
+    _make_can_use_tool_callback,
     _prompt_as_streaming,
     cancel_task,
+    # MCP tool handlers
+    _emacs_eval,
+    _emacs_render_frame,
+    _emacs_get_messages,
+    _emacs_get_debug_info,
+    _emacs_get_buffer,
+    _emacs_get_buffer_region,
+    _emacs_list_buffers,
+    _emacs_switch_buffer,
+    _emacs_get_point_info,
+    _emacs_search_forward,
+    _emacs_search_backward,
+    _emacs_goto_line,
+    _run_emacsclient,
+    _tool_result,
+    EmacsclientNotFoundError,
+    _EMACS_MCP_SERVER,
     # Constants
     DEFAULT_TOOLS,
     EMACS_TOOL_NAMES,
     # Permission state
     _pending_permission_requests,
     _permission_decisions,
-    _always_allowed_tools,
 )
 from claude_agent_sdk import (
     AssistantMessage,
@@ -753,7 +769,7 @@ class TestBuildOptions:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# _can_use_tool_callback()
+# _make_can_use_tool_callback() — per-query permission callback factory
 # ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -761,26 +777,17 @@ class TestCanUseToolCallback:
     def setup_method(self) -> None:
         _pending_permission_requests.clear()
         _permission_decisions.clear()
-        _always_allowed_tools.clear()
 
     def teardown_method(self) -> None:
         _pending_permission_requests.clear()
         _permission_decisions.clear()
-        _always_allowed_tools.clear()
-
-    @pytest.mark.asyncio
-    async def test_always_allowed_returns_immediately(self) -> None:
-        _always_allowed_tools.add("Read")
-        ctx = ToolPermissionContext()
-        result = await _can_use_tool_callback("Read", {}, ctx)
-        assert result.behavior == "allow"
 
     @pytest.mark.asyncio
     async def test_allow_decision(self) -> None:
+        callback = _make_can_use_tool_callback()
         ctx = ToolPermissionContext()
 
         async def _respond() -> None:
-            # Wait for the permission request to appear
             while not _pending_permission_requests:
                 await asyncio.sleep(0.01)
             req_id = next(iter(_pending_permission_requests))
@@ -789,14 +796,14 @@ class TestCanUseToolCallback:
 
         with patch("claude_code_backend.emit"):
             task = asyncio.create_task(_respond())
-            result = await _can_use_tool_callback("Bash", {"command": "ls"}, ctx)
+            result = await callback("Bash", {"command": "ls"}, ctx)
             await task
 
         assert result.behavior == "allow"
-        assert "Bash" not in _always_allowed_tools
 
     @pytest.mark.asyncio
     async def test_deny_decision(self) -> None:
+        callback = _make_can_use_tool_callback()
         ctx = ToolPermissionContext()
 
         async def _respond() -> None:
@@ -808,13 +815,15 @@ class TestCanUseToolCallback:
 
         with patch("claude_code_backend.emit"):
             task = asyncio.create_task(_respond())
-            result = await _can_use_tool_callback("Bash", {}, ctx)
+            result = await callback("Bash", {}, ctx)
             await task
 
         assert result.behavior == "deny"
 
     @pytest.mark.asyncio
-    async def test_always_allow_remembers(self) -> None:
+    async def test_always_allow_remembers_within_callback(self) -> None:
+        """'always_allow' is scoped to the callback instance (one query)."""
+        callback = _make_can_use_tool_callback()
         ctx = ToolPermissionContext()
 
         async def _respond() -> None:
@@ -826,28 +835,68 @@ class TestCanUseToolCallback:
 
         with patch("claude_code_backend.emit"):
             task = asyncio.create_task(_respond())
-            result = await _can_use_tool_callback("Bash", {}, ctx)
+            result = await callback("Bash", {}, ctx)
             await task
 
         assert result.behavior == "allow"
-        assert "Bash" in _always_allowed_tools
 
-        # Subsequent call should return immediately without emitting
-        result2 = await _can_use_tool_callback("Bash", {}, ctx)
+        # Same callback: subsequent call should auto-allow without prompting
+        result2 = await callback("Bash", {}, ctx)
         assert result2.behavior == "allow"
 
     @pytest.mark.asyncio
+    async def test_always_allow_does_not_leak_across_callbacks(self) -> None:
+        """A fresh callback should NOT inherit always-allowed from a prior one."""
+        cb1 = _make_can_use_tool_callback()
+        cb2 = _make_can_use_tool_callback()
+        ctx = ToolPermissionContext()
+
+        async def _respond_always() -> None:
+            while not _pending_permission_requests:
+                await asyncio.sleep(0.01)
+            req_id = next(iter(_pending_permission_requests))
+            _permission_decisions[req_id] = "always_allow"
+            _pending_permission_requests[req_id].set()
+
+        # cb1: always-allow Bash
+        with patch("claude_code_backend.emit"):
+            task = asyncio.create_task(_respond_always())
+            await cb1("Bash", {}, ctx)
+            await task
+
+        # cb2: should still prompt (not auto-allow)
+        emitted: list[Any] = []
+
+        async def _respond_deny() -> None:
+            while not _pending_permission_requests:
+                await asyncio.sleep(0.01)
+            req_id = next(iter(_pending_permission_requests))
+            _permission_decisions[req_id] = "deny"
+            _pending_permission_requests[req_id].set()
+
+        with patch("claude_code_backend.emit", side_effect=lambda e: emitted.append(e)):
+            task = asyncio.create_task(_respond_deny())
+            result = await cb2("Bash", {}, ctx)
+            await task
+
+        # cb2 should have prompted (emitted a permission request)
+        assert len(emitted) == 1
+        assert result.behavior == "deny"
+
+    @pytest.mark.asyncio
     async def test_timeout_denies(self) -> None:
+        callback = _make_can_use_tool_callback()
         ctx = ToolPermissionContext()
         with (
             patch("claude_code_backend.emit"),
             patch("claude_code_backend._PERMISSION_TIMEOUT", 0.05),
         ):
-            result = await _can_use_tool_callback("Bash", {}, ctx)
+            result = await callback("Bash", {}, ctx)
         assert result.behavior == "deny"
 
     @pytest.mark.asyncio
     async def test_emits_permission_request(self) -> None:
+        callback = _make_can_use_tool_callback()
         ctx = ToolPermissionContext()
         emitted: list[Any] = []
 
@@ -860,7 +909,7 @@ class TestCanUseToolCallback:
 
         with patch("claude_code_backend.emit", side_effect=lambda e: emitted.append(e)):
             task = asyncio.create_task(_respond())
-            await _can_use_tool_callback("Bash", {"command": "rm"}, ctx)
+            await callback("Bash", {"command": "rm"}, ctx)
             await task
 
         assert len(emitted) == 1
@@ -952,3 +1001,235 @@ class TestConstants:
         assert "EmacsGetMessages" in EMACS_TOOL_NAMES
         assert "EmacsGetBuffer" in EMACS_TOOL_NAMES
         assert "EmacsListBuffers" in EMACS_TOOL_NAMES
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _tool_result() helper
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestToolResultHelper:
+    def test_success_result(self) -> None:
+        r = _tool_result("hello")
+        assert r == {"content": [{"type": "text", "text": "hello"}]}
+        assert "is_error" not in r
+
+    def test_error_result(self) -> None:
+        r = _tool_result("oops", is_error=True)
+        assert r["is_error"] is True
+        assert r["content"][0]["text"] == "oops"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MCP Emacs tool handlers
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMcpServerStructure:
+    """Tests for the MCP server configuration and tool registration."""
+
+    def test_mcp_server_exists(self) -> None:
+        assert _EMACS_MCP_SERVER is not None
+
+    def test_all_emacs_tools_registered(self) -> None:
+        """Every name in EMACS_TOOL_NAMES should correspond to a registered tool."""
+        for name in EMACS_TOOL_NAMES:
+            assert name in EMACS_TOOL_NAMES
+
+
+class TestEmacsEval:
+    @pytest.mark.asyncio
+    async def test_eval_success(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="ok: 42"):
+            result = await _emacs_eval.handler({"code": "(+ 1 41)"})
+        assert result["content"][0]["text"] == "ok: 42"
+        assert "is_error" not in result
+
+    @pytest.mark.asyncio
+    async def test_eval_error_result(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="error: void-variable foo"):
+            result = await _emacs_eval.handler({"code": "foo"})
+        assert result["is_error"] is True
+        assert "void-variable" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_eval_emacsclient_failure(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", side_effect=RuntimeError("connection refused")):
+            result = await _emacs_eval.handler({"code": "(+ 1 1)"})
+        assert result["is_error"] is True
+        assert "emacsclient failed" in result["content"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_eval_emacsclient_not_found_raises(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", side_effect=EmacsclientNotFoundError("not found")):
+            with pytest.raises(EmacsclientNotFoundError):
+                await _emacs_eval.handler({"code": "(+ 1 1)"})
+
+    @pytest.mark.asyncio
+    async def test_eval_empty_code(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="ok: nil"):
+            result = await _emacs_eval.handler({})
+        assert result["content"][0]["text"] == "ok: nil"
+
+
+class TestEmacsRenderFrame:
+    @pytest.mark.asyncio
+    async def test_render_frame_success(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="frame output"):
+            result = await _emacs_render_frame.handler({})
+        assert result["content"][0]["text"] == "frame output"
+        assert "is_error" not in result
+
+    @pytest.mark.asyncio
+    async def test_render_frame_error(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", side_effect=RuntimeError("timeout")):
+            result = await _emacs_render_frame.handler({})
+        assert result["is_error"] is True
+
+
+class TestEmacsGetMessages:
+    @pytest.mark.asyncio
+    async def test_get_messages_default(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="msg output") as mock:
+            result = await _emacs_get_messages.handler({})
+        assert result["content"][0]["text"] == "msg output"
+        # Check that 3000 (default) was passed
+        call_arg = mock.call_args[0][0]
+        assert "3000" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_get_messages_custom_n(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="short") as mock:
+            result = await _emacs_get_messages.handler({"n_chars": 500})
+        call_arg = mock.call_args[0][0]
+        assert "500" in call_arg
+
+
+class TestEmacsGetBuffer:
+    @pytest.mark.asyncio
+    async def test_get_buffer_basic(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="buffer content") as mock:
+            result = await _emacs_get_buffer.handler({"buffer_name": "*scratch*"})
+        assert result["content"][0]["text"] == "buffer content"
+        call_arg = mock.call_args[0][0]
+        assert "*scratch*" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_get_buffer_with_line_numbers(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="1: line") as mock:
+            await _emacs_get_buffer.handler({"buffer_name": "test.el", "with_line_numbers": True})
+        call_arg = mock.call_args[0][0]
+        assert " t)" in call_arg  # the line-numbers flag
+
+    @pytest.mark.asyncio
+    async def test_get_buffer_error(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", side_effect=RuntimeError("no buffer")):
+            result = await _emacs_get_buffer.handler({"buffer_name": "nonexistent"})
+        assert result["is_error"] is True
+
+
+class TestEmacsGetBufferRegion:
+    @pytest.mark.asyncio
+    async def test_get_region(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="region text") as mock:
+            result = await _emacs_get_buffer_region.handler({
+                "buffer_name": "test.el", "start_line": 10, "end_line": 20
+            })
+        assert result["content"][0]["text"] == "region text"
+        call_arg = mock.call_args[0][0]
+        assert "10" in call_arg
+        assert "20" in call_arg
+
+
+class TestEmacsListBuffers:
+    @pytest.mark.asyncio
+    async def test_list_buffers(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="buf1\nbuf2"):
+            result = await _emacs_list_buffers.handler({})
+        assert "buf1" in result["content"][0]["text"]
+
+
+class TestEmacsSwitchBuffer:
+    @pytest.mark.asyncio
+    async def test_switch_buffer(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="switched") as mock:
+            result = await _emacs_switch_buffer.handler({"buffer_name": "*scratch*"})
+        assert result["content"][0]["text"] == "switched"
+        call_arg = mock.call_args[0][0]
+        assert "*scratch*" in call_arg
+
+
+class TestEmacsGetPointInfo:
+    @pytest.mark.asyncio
+    async def test_get_point_default_buffer(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="line:1 col:0") as mock:
+            result = await _emacs_get_point_info.handler({})
+        assert "line:1" in result["content"][0]["text"]
+        # No buffer arg → simpler elisp call
+        call_arg = mock.call_args[0][0]
+        assert "claude-code-tools-get-point-info)" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_get_point_specific_buffer(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="info") as mock:
+            await _emacs_get_point_info.handler({"buffer_name": "test.el"})
+        call_arg = mock.call_args[0][0]
+        assert "test.el" in call_arg
+
+
+class TestEmacsSearchForward:
+    @pytest.mark.asyncio
+    async def test_search_forward(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="found at line 5") as mock:
+            result = await _emacs_search_forward.handler({"pattern": "defun"})
+        assert "found" in result["content"][0]["text"]
+        call_arg = mock.call_args[0][0]
+        assert "defun" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_search_forward_with_buffer(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="found") as mock:
+            await _emacs_search_forward.handler({"pattern": "foo", "buffer_name": "bar.el"})
+        call_arg = mock.call_args[0][0]
+        assert "bar.el" in call_arg
+
+
+class TestEmacsSearchBackward:
+    @pytest.mark.asyncio
+    async def test_search_backward(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="found") as mock:
+            result = await _emacs_search_backward.handler({"pattern": "require"})
+        assert "found" in result["content"][0]["text"]
+
+
+class TestEmacsGotoLine:
+    @pytest.mark.asyncio
+    async def test_goto_line(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="at line 42") as mock:
+            result = await _emacs_goto_line.handler({"line_number": 42})
+        assert "42" in result["content"][0]["text"]
+        call_arg = mock.call_args[0][0]
+        assert "42" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_goto_line_with_buffer(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="ok") as mock:
+            await _emacs_goto_line.handler({"line_number": 1, "buffer_name": "init.el"})
+        call_arg = mock.call_args[0][0]
+        assert "init.el" in call_arg
+
+
+class TestEmacsGetDebugInfo:
+    @pytest.mark.asyncio
+    async def test_get_debug_info(self) -> None:
+        with patch("claude_code_backend._run_emacsclient", return_value="debug info"):
+            result = await _emacs_get_debug_info.handler({})
+        assert result["content"][0]["text"] == "debug info"
+
+
+class TestRunEmacsclient:
+    @pytest.mark.asyncio
+    async def test_emacsclient_not_found(self) -> None:
+        with patch("claude_code_backend._EMACSCLIENT", None):
+            with pytest.raises(EmacsclientNotFoundError):
+                await _run_emacsclient("(+ 1 1)")

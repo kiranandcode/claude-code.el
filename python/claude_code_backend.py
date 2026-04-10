@@ -14,6 +14,7 @@ import os
 import shutil
 import sys
 import traceback
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, cast
 
@@ -1052,9 +1053,13 @@ _permission_decisions: dict[str, str] = {}
 _PERMISSION_TIMEOUT = 60.0
 
 
-def _make_can_use_tool_callback() -> (
-    "Callable[[str, dict[str, Any], ToolPermissionContext], Awaitable[PermissionResultAllow | PermissionResultDeny]]"
-):
+_PermissionCallback = Callable[
+    [str, dict[str, Any], ToolPermissionContext],
+    Awaitable[PermissionResultAllow | PermissionResultDeny],
+]
+
+
+def _make_can_use_tool_callback() -> _PermissionCallback:
     """Return a fresh can_use_tool callback with its own always-allowed set.
 
     The set is scoped to a single query (i.e. one user message and all its

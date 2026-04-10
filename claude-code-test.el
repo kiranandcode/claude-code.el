@@ -1080,40 +1080,37 @@ trigger `scroll-down-command'."
     (should (string-match-p "^+world" result))))
 
 (ert-deftest claude-code-test-diff-strings-identical ()
-  "`claude-code--diff-strings' returns a string (possibly empty) for equal inputs."
-  (let ((result (claude-code--diff-strings "same\n" "same\n")))
-    ;; diff exits 0 on identical input; we get an empty string, not nil
-    (should (stringp result))))
+  "`claude-code--diff-strings' returns nil for identical inputs (from claude-code-diff.el)."
+  ;; The diff.el version short-circuits to nil when old==new rather than
+  ;; returning an empty string, unlike the original naive implementation.
+  (should (null (claude-code--diff-strings "same\n" "same\n"))))
 
-(ert-deftest claude-code-test-diff-strings-nil-on-non-string ()
-  "`claude-code--diff-strings' returns nil when given non-string arguments."
-  (should (null (claude-code--diff-strings nil "new")))
-  (should (null (claude-code--diff-strings "old" nil)))
+(ert-deftest claude-code-test-diff-strings-nil-treated-as-empty ()
+  "`claude-code--diff-strings' treats nil as an empty string (via string= nil handling).
+Diffing nil vs non-empty content produces a non-nil diff string."
+  ;; nil compared to different content → diff returned (nil acts like "")
+  (should (stringp (claude-code--diff-strings nil "new\n")))
+  ;; nil vs nil → identical → nil (short-circuited)
   (should (null (claude-code--diff-strings nil nil))))
 
-(ert-deftest claude-code-test-insert-diff-lines-faces ()
-  "`claude-code--insert-diff-lines' applies diff-mode faces to -, +, @@ lines."
+(ert-deftest claude-code-test-render-diff-string-faces ()
+  "`claude-code--render-diff-string' (from claude-code-diff.el) applies diff faces."
   (with-temp-buffer
-    (claude-code--insert-diff-lines
-     "--- before\n+++ after\n@@ -1 +1 @@\n-old line\n+new line\n context\n")
+    (claude-code--render-diff-string
+     "--- before\n+++ after\n@@ -1 +1 @@\n-old line\n+new line\n context\n" 0)
     (let ((text (buffer-string)))
-      ;; All lines present
       (should (string-match-p "old line" text))
       (should (string-match-p "new line" text))
       (should (string-match-p "context"  text)))
-    ;; Spot-check faces: find "+new line" and confirm face is diff-added
     (goto-char (point-min))
     (re-search-forward "new line")
-    (let ((face (get-text-property (match-beginning 0) 'face)))
-      (should (eq face 'diff-added)))
-    ;; Find "-old line" and confirm face is diff-removed
+    (should (eq 'diff-added (get-text-property (match-beginning 0) 'face)))
     (goto-char (point-min))
     (re-search-forward "old line")
-    (let ((face (get-text-property (match-beginning 0) 'face)))
-      (should (eq face 'diff-removed)))))
+    (should (eq 'diff-removed (get-text-property (match-beginning 0) 'face)))))
 
 (ert-deftest claude-code-test-render-edit-tool-shows-diff ()
-  "Rendering an Edit tool call should show diff markers in the buffer."
+  "Rendering an Edit tool call shows the file path and change stats."
   (claude-code-test-with-buffer
     (push `((type . "assistant")
             (content . [((type . "tool_use")
@@ -1123,29 +1120,30 @@ trigger `scroll-down-command'."
                                    (old_string . "hello\n")
                                    (new_string . "world\n"))))]))
           claude-code--messages)
-    ;; Expand all tool-use sections so body text is visible
-    (let ((claude-code-show-tool-details t))
-      (claude-code--render))
+    (claude-code--render)
     (let ((text (buffer-substring-no-properties (point-min) (point-max))))
-      (should (string-match-p "Edit"    text))
-      (should (string-match-p "hello"   text))
-      (should (string-match-p "world"   text)))))
+      ;; The diff section heading always shows: ✎ Edit  /tmp/foo.el  +1 -1
+      (should (string-match-p "Edit"       text))
+      (should (string-match-p "foo\\.el"   text))
+      ;; The diff body (hello/world) is in the collapsed section text
+      (should (string-match-p "hello"      text))
+      (should (string-match-p "world"      text)))))
 
-(ert-deftest claude-code-test-render-edit-tool-fallback-to-json ()
-  "Edit tool call missing old/new strings falls back to JSON display."
+(ert-deftest claude-code-test-render-edit-tool-no-diff-when-same ()
+  "Edit tool call with identical old/new shows '(no changes)'."
   (claude-code-test-with-buffer
     (push `((type . "assistant")
             (content . [((type . "tool_use")
-                         (id . "edit-nostr")
+                         (id . "edit-same")
                          (name . "Edit")
-                         (input . ((file_path . "/tmp/bar.el"))))]))
+                         (input . ((file_path  . "/tmp/same.el")
+                                   (old_string . "x\n")
+                                   (new_string . "x\n"))))]))
           claude-code--messages)
-    (let ((claude-code-show-tool-details t))
-      (claude-code--render))
+    (claude-code--render)
     (let ((text (buffer-substring-no-properties (point-min) (point-max))))
-      (should (string-match-p "Edit"     text))
-      ;; Falls back to JSON, which includes the key name
-      (should (string-match-p "file_path" text)))))
+      (should (string-match-p "Edit"       text))
+      (should (string-match-p "no changes" text)))))
 
 (ert-deftest claude-code-test-render-multiedit-shows-diffs ()
   "MultiEdit renders a diff block for each edit in the edits array."
