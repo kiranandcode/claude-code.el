@@ -18,6 +18,19 @@
 (declare-function org-roam-node-visit "ext:org-roam")
 (declare-function org-roam-db-update-file "ext:org-roam")
 (require 'claude-code-render)
+(require 'claude-code-export)
+;; IMPORTANT: claude-code-emacs-tools and claude-code-frame-render must be
+;; required here, NOT only from the top-level claude-code.el.  The user-
+;; facing entry point `claude-code' is autoloaded, which means starting a
+;; session via `M-x claude-code' loads this file (claude-code-commands.el)
+;; via the autoload but does NOT load the top-level claude-code.el.  Without
+;; these requires, `claude-code-tools-eval' and friends would be undefined
+;; when the Python backend tries to call them through emacsclient or the
+;; MCP socket — every MCP tool call would fail with "Symbol's function
+;; definition is void: claude-code-tools-eval" until the user explicitly
+;; ran `M-x claude-code-reload'.
+(require 'claude-code-emacs-tools)
+(require 'claude-code-frame-render)
 (require 'magit-section)
 (require 'transient)
 
@@ -773,6 +786,8 @@ Press C-c C-c to apply changes, q or C-c C-k to discard."
       ("/rules"         (call-interactively #'claude-code-edit-permission-rules))
       ("/inspect"       (call-interactively #'claude-code-inspect))
       ("/stats"         (call-interactively #'claude-code-stats))
+      ("/export"        (call-interactively #'claude-code-export))
+      ("/shell"         (call-interactively #'claude-code-send-shell-output))
       ("/help"          (call-interactively #'claude-code-menu))
       (_                (message "Unknown slash command: %s  (try /help)" cmd)))))
 
@@ -900,6 +915,54 @@ Activates when point is preceded by @ followed by a partial file path."
                     (if (string-suffix-p "/" cand) "  [dir]" "  [file]"))
                   :company-prefix-length (length partial)
                   :exclusive 'no)))))))
+
+;;;; Shell Output Capture
+
+(defun claude-code--shell-buffer-candidates ()
+  "Return an alist of (DISPLAY-NAME . BUFFER) for shell-like buffers.
+Covers `vterm-mode', `eshell-mode', `shell-mode', `term-mode',
+`comint-mode' and derived modes."
+  (let (result)
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (derived-mode-p 'vterm-mode 'eshell-mode 'shell-mode
+                              'term-mode 'comint-mode 'compilation-mode)
+          (push (cons (buffer-name buf) buf) result))))
+    (nreverse result)))
+
+(defun claude-code--capture-shell-output (buf &optional max-lines)
+  "Capture the last MAX-LINES lines (default 200) from shell buffer BUF."
+  (let ((n (or max-lines 200)))
+    (with-current-buffer buf
+      (save-excursion
+        (goto-char (point-max))
+        (forward-line (- n))
+        (buffer-substring-no-properties (point) (point-max))))))
+
+;;;###autoload
+(defun claude-code-send-shell-output (buf-name &optional lines)
+  "Send the last LINES (default 200) of shell buffer BUF-NAME to Claude.
+Interactively prompts for a shell buffer.  The output is prepended as
+context to the next prompt, or sent immediately with a default question."
+  (interactive
+   (let* ((candidates (claude-code--shell-buffer-candidates)))
+     (unless candidates
+       (user-error "No shell/terminal buffers found"))
+     (list (completing-read "Shell buffer: "
+                            (mapcar #'car candidates) nil t)
+           nil)))
+  (let* ((buf (get-buffer buf-name))
+         (output (claude-code--capture-shell-output buf lines))
+         (prompt (read-string
+                  "Prompt (empty = just send output): "
+                  nil 'claude-code--prompt-history))
+         (context (format "Output from %s:\n```\n%s\n```\n\n%s"
+                          buf-name
+                          (string-trim output)
+                          (if (string-empty-p prompt)
+                              "What do you see in this output? Any errors or issues?"
+                            prompt))))
+    (claude-code-send context)))
 
 ;;;; Inline Input Commands
 
