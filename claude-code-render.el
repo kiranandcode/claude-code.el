@@ -514,9 +514,9 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
       (insert "  " line "\n"))
     ;; Annotate body with the raw code string so `w' can find it at point
     (put-text-property body-beg (point) 'claude-code-code-content code)
-    ;; Fixed-pitch: keep code monospace even when surrounding prose is
-    ;; variable-pitch.  add-face-text-property appends without clobbering
-    ;; existing font-lock faces.
+    ;; Fixed-pitch: keep code blocks monospace even when surrounding prose uses
+    ;; variable-pitch (controlled by `claude-code-prose-font').
+    ;; add-face-text-property appends without clobbering existing font-lock faces.
     (add-face-text-property body-beg (point) 'fixed-pitch)
     ;; Closing fence
     (insert (propertize "  ```\n" 'face 'shadow))))
@@ -524,8 +524,8 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
 (defun claude-code--render-text (text)
   "Render a TEXT content block.
 Fenced code blocks are syntax-highlighted using the language's major mode;
-prose lines are linkified and rendered in `variable-pitch' face so they
-read as flowing prose alongside monospace code blocks."
+prose lines are linkified.  The font style for prose is controlled by
+`claude-code-prose-font'."
   (when (and text (not (string-empty-p text)))
     (dolist (segment (claude-code--parse-text-blocks text))
       (pcase segment
@@ -535,9 +535,9 @@ read as flowing prose alongside monospace code blocks."
              (insert "  ")
              (claude-code--insert-linkified line)
              (insert "\n"))
-           ;; Variable-pitch prose: proportional font for readability.
-           ;; Falls back gracefully to default in terminal Emacs.
-           (add-face-text-property seg-beg (point) 'variable-pitch)))
+           ;; Apply the user-configured prose face, if any.
+           (when claude-code-prose-font
+             (add-face-text-property seg-beg (point) claude-code-prose-font))))
         (`(code . (,lang . ,code))
          (claude-code--insert-code-block lang code))))))
 

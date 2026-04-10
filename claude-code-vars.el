@@ -69,6 +69,18 @@ Used to identify skill nodes when building the system prompt."
   :type 'string
   :group 'claude-code)
 
+(defcustom claude-code-prose-font 'variable-pitch
+  "Font style used for assistant prose in Claude conversation buffers.
+
+Possible values:
+  `variable-pitch' — proportional font for flowing, readable prose
+                     (default; code blocks stay monospace via `fixed-pitch').
+  nil              — no face override; uses the buffer's default font
+                     (typically monospace / fixed-pitch)."
+  :type '(choice (const :tag "Variable-pitch (proportional)" variable-pitch)
+                 (const :tag "None (buffer default / monospace)" nil))
+  :group 'claude-code)
+
 (defcustom claude-code-show-thinking nil
   "Whether thinking blocks are expanded by default."
   :type 'boolean
