@@ -12,6 +12,9 @@
 (declare-function claude-code--schedule-render "claude-code-events")
 (declare-function claude-code-cancel "claude-code-commands")
 (declare-function claude-code-kill "claude-code-commands")
+(declare-function claude-code--indent "claude-code-render")
+(declare-function claude-code--mcp-tool-short-name "claude-code-render")
+(declare-function claude-code--tool-input-primary-string "claude-code-vars")
 
 ;;;; Agent Tracking
 
@@ -78,8 +81,10 @@ Agent plist keys:
                claude-code--agents))))
 
 (defun claude-code--agent-root-p (agent)
-  "Return non-nil if AGENT plist is a root (top-level session) agent."
-  (eq (plist-get agent :type) 'session))
+  "Return non-nil if AGENT plist is a root (top-level session) agent.
+Forked sessions that have a :parent-id are children, not roots."
+  (and (eq (plist-get agent :type) 'session)
+       (null (plist-get agent :parent-id))))
 
 (defun claude-code--agent-unregister-self ()
   "Unregister the agent for the current buffer.
@@ -238,25 +243,35 @@ Shows ▾ when expanded (or no children), ▸ when collapsed."
         (insert "\n")))))
 
 (defun claude-code--agents-render-child (agent-id is-last)
-  "Render a child task agent AGENT-ID.
+  "Render a child agent AGENT-ID (task or fork).
 IS-LAST is non-nil if this is the last sibling."
   (when-let ((agent (gethash agent-id claude-code--agents)))
-    (let* ((status (plist-get agent :status))
+    (let* ((is-fork (plist-get agent :fork-point))
+           (status (plist-get agent :status))
            (desc (plist-get agent :description))
            (buf (plist-get agent :buffer))
            (buf-name (when (and buf (buffer-live-p buf)) (buffer-name buf)))
            (icon (claude-code--agents-status-icon status))
            (sface (claude-code--agents-status-face status))
            (branch (if is-last "└" "├"))
-           (cont   (if is-last " " "│")))
-      (magit-insert-section (claude-agent agent-id t)
+           (cont   (if is-last " " "│"))
+           (children (plist-get agent :children))
+           (has-children (not (null children))))
+      (magit-insert-section section (claude-agent agent-id (not is-fork))
         (magit-insert-heading
           (propertize
            (concat (propertize (format "  %s─ " branch) 'face 'shadow)
+                   ;; Fork children show fold indicator if they have sub-children
+                   (when (and is-fork has-children)
+                     (propertize
+                      (concat (claude-code--agents-fold-indicator section) " ")
+                      'face 'shadow))
                    (propertize icon 'face sface)
                    " "
-                   (propertize (or desc "task")
-                               'face 'claude-code-agent-task)
+                   (propertize (or desc (if is-fork "fork" "task"))
+                               'face (if is-fork
+                                         'claude-code-agent-session
+                                       'claude-code-agent-task))
                    "  "
                    (propertize (format "[%s]" status) 'face sface))
            'mouse-face 'highlight))
@@ -264,22 +279,31 @@ IS-LAST is non-nil if this is the last sibling."
           (insert (propertize (format "  %s    ⎘ %s\n" cont
                                       (truncate-string-to-width buf-name 30))
                               'face 'shadow)))
-        (when-let ((tool (plist-get agent :last-tool)))
-          (let* ((input (plist-get agent :last-tool-input))
-                 (arg   (when input
-                          (claude-code--tool-input-primary-string tool input)))
-                 (label (if (and arg (not (string-empty-p arg)))
-                            (format "⚙ %-10s  %s" tool
-                                    (truncate-string-to-width
-                                     (abbreviate-file-name arg) 22 nil nil "…"))
-                          (format "⚙ %s" tool))))
-            (insert (propertize (format "  %s    %s\n" cont label)
-                                'face 'shadow))))
-        (when-let ((summary (plist-get agent :summary)))
-          (insert (propertize
-                   (format "  %s    %s\n" cont
-                           (truncate-string-to-width summary 32))
-                   'face 'shadow)))))))
+        ;; Task-specific info
+        (unless is-fork
+          (when-let ((tool (plist-get agent :last-tool)))
+            (let* ((input (plist-get agent :last-tool-input))
+                   (arg   (when input
+                            (claude-code--tool-input-primary-string tool input)))
+                   (label (if (and arg (not (string-empty-p arg)))
+                              (format "⚙ %-10s  %s" tool
+                                      (truncate-string-to-width
+                                       (abbreviate-file-name arg) 22 nil nil "…"))
+                            (format "⚙ %s" tool))))
+              (insert (propertize (format "  %s    %s\n" cont label)
+                                  'face 'shadow))))
+          (when-let ((summary (plist-get agent :summary)))
+            (insert (propertize
+                     (format "  %s    %s\n" cont
+                             (truncate-string-to-width summary 32))
+                     'face 'shadow))))
+        ;; Recursively render fork's own children (sub-forks, tasks)
+        (when (and is-fork children)
+          (let ((last-idx (1- (length children))))
+            (cl-loop for child-id in children
+                     for idx from 0
+                     do (claude-code--agents-render-child
+                         child-id (= idx last-idx)))))))))
 
 (defvar-keymap claude-code-agents-mode-map
   :doc "Keymap for the Claude agent sidebar."
@@ -484,6 +508,82 @@ Deduplicates consecutive identical (tool + primary-arg) entries."
           (let ((inhibit-read-only t))
             (goto-char (point-max))
             (insert (propertize line 'face 'claude-code-tool-name))))))))
+
+(defun claude-code--task-buffer-append-content (buf role content)
+  "Append the contents of a subagent message (CONTENT vector) to task BUF.
+ROLE is \"assistant\" or \"user\".  Each content block is rendered:
+  text     → indented prose
+  thinking → italic dim block
+  tool_use → \"⚙ Tool  args…\" line plus a JSON dump of input
+  tool_result → \"↳ result\" with truncated body
+This is the equivalent of the main buffer's render-content-block helpers
+but flattened for the compact task-buffer view."
+  (when (and buf (buffer-live-p buf))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t)
+            ;; json-parse vector → lisp vector; convert to list for dolist
+            (blocks (cond ((vectorp content) (append content nil))
+                          ((listp content)   content)
+                          (t                  nil))))
+        (goto-char (point-max))
+        (dolist (block blocks)
+          (let ((type (alist-get 'type block)))
+            (pcase type
+              ("text"
+               (let ((text (alist-get 'text block)))
+                 (when (and text (not (string-empty-p text)))
+                   (insert (propertize "  ◀ " 'face 'claude-code-assistant-label))
+                   (insert (claude-code--indent
+                            (string-trim-right text) 4))
+                   (insert "\n"))))
+              ("thinking"
+               (let ((text (alist-get 'thinking block)))
+                 (when (and text (not (string-empty-p text)))
+                   (insert (propertize
+                            (concat "  ◆ "
+                                    (truncate-string-to-width
+                                     (replace-regexp-in-string "\n" " " text)
+                                     70 nil nil "…")
+                                    "\n")
+                            'face 'claude-code-thinking)))))
+              ("tool_use"
+               (let* ((name  (alist-get 'name block))
+                      (input (alist-get 'input block))
+                      (short (and name (claude-code--mcp-tool-short-name name)))
+                      (arg   (and input
+                                  (claude-code--tool-input-primary-string short input))))
+                 (insert (propertize
+                          (if (and arg (not (string-empty-p arg)))
+                              (format "  ⚙ %-10s  %s\n"
+                                      short
+                                      (truncate-string-to-width
+                                       (abbreviate-file-name arg) 50 nil nil "…"))
+                            (format "  ⚙ %s\n" short))
+                          'face 'claude-code-tool-name))))
+              ("tool_result"
+               (let* ((raw     (alist-get 'content block))
+                      (is-err  (eq t (alist-get 'is_error block)))
+                      (text    (claude-code--task-result-text raw)))
+                 (when (and text (not (string-empty-p text)))
+                   (insert (propertize
+                            (format "    ↳ %s\n"
+                                    (truncate-string-to-width
+                                     (replace-regexp-in-string "\n" " ⏎ " text)
+                                     80 nil nil "…"))
+                            'face (if is-err 'claude-code-error 'shadow)))))))))))))
+
+(defun claude-code--task-result-text (raw)
+  "Extract a plain string from a tool-result content value RAW.
+Mirrors `claude-code--tool-result-text' from the render module but kept
+local so the agents module doesn't depend on render."
+  (cond
+   ((null raw) nil)
+   ((stringp raw) raw)
+   ((or (vectorp raw) (listp raw))
+    (let* ((items (if (vectorp raw) (append raw nil) raw))
+           (texts (delq nil (mapcar (lambda (b) (alist-get 'text b)) items))))
+      (mapconcat #'identity texts "\n")))
+   (t nil)))
 
 (defun claude-code--task-buffer-finalize (buf status summary)
   "Mark task BUF as done with STATUS symbol string and SUMMARY text."

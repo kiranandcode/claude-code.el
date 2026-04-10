@@ -336,6 +336,48 @@ class TestConvertMessage:
         assert len(result.content) == 1  # type: ignore[arg-type]
         assert isinstance(result.content[0], TextContentBlock)  # type: ignore[index]
 
+    def test_assistant_message_with_parent_tool_use_id_routes_to_subagent(self) -> None:
+        """Subagent assistant messages must NOT pollute the main buffer."""
+        from claude_code_backend import SubagentMessageEvent
+        msg = AssistantMessage(
+            content=[TextBlock(text="from subagent")],
+            model="claude-sonnet",
+            parent_tool_use_id="toolu_abc",
+        )
+        result = convert_message(msg)
+        # Should be a SubagentMessageEvent, NOT an AssistantEvent
+        assert isinstance(result, SubagentMessageEvent)
+        assert result.parent_tool_use_id == "toolu_abc"
+        assert result.role == "assistant"
+        assert len(result.content) == 1  # type: ignore[arg-type]
+
+    def test_user_tool_result_with_parent_tool_use_id_routes_to_subagent(self) -> None:
+        """Subagent tool results must NOT pollute the main buffer."""
+        from claude_code_backend import SubagentMessageEvent
+        msg = UserMessage(
+            content=[ToolResultBlock(tool_use_id="tu1", content="output")],
+            parent_tool_use_id="toolu_xyz",
+        )
+        result = convert_message(msg)
+        assert isinstance(result, SubagentMessageEvent)
+        assert result.parent_tool_use_id == "toolu_xyz"
+        assert result.role == "user"
+
+    def test_task_started_captures_tool_use_id(self) -> None:
+        msg = TaskStartedMessage(
+            subtype="task_started",
+            data={},
+            task_id="t1",
+            description="audit error handling",
+            uuid="u1",
+            session_id="s1",
+            tool_use_id="toolu_task_spawn_1",
+        )
+        result = convert_message(msg)
+        assert isinstance(result, TaskStartedEvent)
+        assert result.tool_use_id == "toolu_task_spawn_1"
+        assert result.task_id == "t1"
+
     def test_result_message(self) -> None:
         msg = ResultMessage(
             subtype="result",

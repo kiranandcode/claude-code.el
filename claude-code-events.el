@@ -10,6 +10,7 @@
 (require 'claude-code-vars)
 (require 'claude-code-agents)
 (require 'claude-code-stats)
+(require 'claude-code-fringe)
 
 ;; Forward declarations for functions defined in files loaded after this one.
 (declare-function claude-code--render "claude-code-render")
@@ -46,6 +47,7 @@
       ;; Task / subagent events
       ("task_started"
        (let ((task-id (alist-get 'task_id event))
+             (tool-use-id (alist-get 'tool_use_id event))
              (desc (alist-get 'description event))
              (parent-key (claude-code--effective-session-key)))
          (when task-id
@@ -53,8 +55,14 @@
             task-id
             :type 'task :description desc :status 'working
             :parent-id parent-key :cwd claude-code--cwd
+            :tool-use-id tool-use-id
             :children nil)
            (claude-code--agent-add-child parent-key task-id)
+           ;; Index by the Task tool's tool_use_id so subagent_message events
+           ;; (which only carry parent_tool_use_id) can find their task buffer.
+           (when tool-use-id
+             (puthash tool-use-id task-id
+                      claude-code--subagent-tool-use-map))
            ;; Create a dedicated task buffer and store it on the agent entry
            (let ((task-buf (claude-code--task-buffer-create
                             task-id desc (current-buffer))))
@@ -63,6 +71,8 @@
                  (text . ,(format "Subagent started: %s" desc)))
                claude-code--messages)
          (claude-code--schedule-render)))
+      ("subagent_message"
+       (claude-code--handle-subagent-message event))
       ("task_progress"
        (let* ((task-id    (alist-get 'task_id event))
               (tool-name  (alist-get 'last_tool_name event))
@@ -223,6 +233,52 @@ TOOL-INPUT by `claude-code--tool-input-primary-string'."
                      (string-match-p (plist-get pat :pattern) input-str)))
               claude-code--permission-patterns)))
 
+;;;; Subagent message routing
+;;
+;; When the SDK's Task tool spawns a subagent, the subagent's assistant
+;; messages and tool-result messages arrive with `parent_tool_use_id'
+;; pointing back at the spawning Task tool call.  The Python backend
+;; converts those to `subagent_message' events instead of regular
+;; `assistant' events, so they don't pollute the main session buffer.
+;;
+;; Here we route them to the dedicated task buffer by looking up
+;; `parent_tool_use_id' in `claude-code--subagent-tool-use-map' (populated
+;; from `task_started' events) and rendering each content block into the
+;; task buffer.
+
+(defvar-local claude-code--subagent-tool-use-map nil
+  "Hash table mapping `parent_tool_use_id' (from the SDK Task tool) to
+the corresponding `task_id' so subagent_message events can find their
+dedicated task buffer.  Populated by the `task_started' event handler.")
+
+(defun claude-code--ensure-subagent-tool-use-map ()
+  "Lazily initialise `claude-code--subagent-tool-use-map' for this buffer."
+  (unless claude-code--subagent-tool-use-map
+    (setq claude-code--subagent-tool-use-map (make-hash-table :test #'equal)))
+  claude-code--subagent-tool-use-map)
+
+(defun claude-code--handle-subagent-message (event)
+  "Route a `subagent_message' EVENT to the matching task buffer.
+EVENT keys: parent_tool_use_id, role (\"assistant\" or \"user\"),
+content (vector of content blocks).  Looks up the parent tool_use_id
+in `claude-code--subagent-tool-use-map' to find the task_id, then
+appends the rendered content to that task's dedicated buffer."
+  (let* ((parent-tu-id (alist-get 'parent_tool_use_id event))
+         (role         (alist-get 'role event))
+         (content      (alist-get 'content event))
+         (map          (claude-code--ensure-subagent-tool-use-map))
+         (task-id      (and parent-tu-id (gethash parent-tu-id map))))
+    (cond
+     ((null task-id)
+      ;; We don't know which task this belongs to (task_started never
+      ;; arrived?).  Log and drop.
+      (message "claude-code: subagent_message with unknown parent_tool_use_id %s"
+               parent-tu-id))
+     (t
+      (when-let* ((agent (gethash task-id claude-code--agents))
+                  (buf   (plist-get agent :buffer)))
+        (claude-code--task-buffer-append-content buf role content))))))
+
 (defun claude-code--handle-permission-request (event)
   "Handle a permission_request EVENT from the backend.
 If a saved pattern in `claude-code--permission-patterns' matches the call,
@@ -268,6 +324,8 @@ Also pulses any open Emacs buffers whose files were touched by tool calls."
   (push event claude-code--messages)
   ;; Pulse open file buffers referenced by tool-use blocks (Read/Edit/Write).
   (claude-code--pulse-assistant-tool-files event)
+  ;; Record fringe indicators for Claude-touched lines in source buffers.
+  (claude-code--fringe-on-tool-use event claude-code--cwd)
   (claude-code--schedule-render))
 
 (defun claude-code--handle-result-event (event)

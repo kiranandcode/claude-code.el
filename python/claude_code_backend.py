@@ -276,6 +276,26 @@ class TaskStartedEvent:
     type: Literal["task_started"] = "task_started"
     task_id: str = ""
     description: str = ""
+    # `tool_use_id' is the ID of the SDK Task tool call that spawned this
+    # subagent.  Subsequent AssistantMessage / UserMessage objects whose
+    # `parent_tool_use_id' equals this value belong to the subagent and
+    # should be routed to the task buffer instead of the main buffer.
+    tool_use_id: str | None = None
+
+
+@dataclass
+class SubagentMessageEvent:
+    """An assistant or user message produced by a subagent task.
+
+    Carries the same content as a normal AssistantEvent but tagged with
+    the parent Task tool's `tool_use_id` so the renderer can route it
+    to the dedicated task buffer instead of polluting the main buffer.
+    """
+
+    type: Literal["subagent_message"] = "subagent_message"
+    parent_tool_use_id: str = ""
+    role: str = "assistant"   # "assistant" or "user" (tool result)
+    content: list[EmitContentBlock] | None = None
 
 
 @dataclass
@@ -359,6 +379,7 @@ type EmitEvent = (
     | ErrorEvent
     | SystemEvent
     | AssistantEvent
+    | SubagentMessageEvent
     | ResultEvent
     | TaskProgressEvent
     | TaskStartedEvent
@@ -525,8 +546,16 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 last_tool_input=raw_data.get("last_tool_input"),
             )
 
-        case TaskStartedMessage(task_id=task_id, description=description):
-            return TaskStartedEvent(task_id=task_id, description=description)
+        case TaskStartedMessage(
+            task_id=task_id,
+            description=description,
+            tool_use_id=tool_use_id,
+        ):
+            return TaskStartedEvent(
+                task_id=task_id,
+                description=description,
+                tool_use_id=tool_use_id,
+            )
 
         case TaskNotificationMessage(
             task_id=task_id, status=status, summary=summary
@@ -537,6 +566,18 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
 
         case SystemMessage(subtype=subtype, data=data):
             return SystemEvent(subtype=subtype, data=data)
+
+        case AssistantMessage(
+            content=content,
+            model=model,
+            parent_tool_use_id=parent_tool_use_id,
+        ) if parent_tool_use_id is not None:
+            # Subagent message — route to the task buffer, not the main one
+            return SubagentMessageEvent(
+                parent_tool_use_id=parent_tool_use_id,
+                role="assistant",
+                content=[convert_content_block(b) for b in content],
+            )
 
         case AssistantMessage(content=content, model=model):
             return AssistantEvent(
@@ -566,10 +607,29 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 output_tokens=usage.get("output_tokens") if usage else None,
             )
 
+        case UserMessage(
+            content=content,
+            parent_tool_use_id=parent_tool_use_id,
+        ) if isinstance(content, list) and parent_tool_use_id is not None:
+            # Subagent tool-result messages — route to the task buffer.
+            result_blocks = [
+                convert_content_block(b)
+                for b in content
+                if isinstance(b, ToolResultBlock)
+            ]
+            if result_blocks:
+                return SubagentMessageEvent(
+                    parent_tool_use_id=parent_tool_use_id,
+                    role="user",
+                    content=result_blocks,
+                )
+            return None
+
         case UserMessage(content=content) if isinstance(content, list):
-            # Tool-result messages arrive as UserMessage with a list of content
-            # blocks (ToolResultBlock entries).  Emit them as an AssistantEvent
-            # so the Elisp renderer can display "↳ Tool result" sections.
+            # Top-level tool-result messages arrive as UserMessage with a
+            # list of content blocks (ToolResultBlock entries).  Emit them
+            # as an AssistantEvent so the Elisp renderer can display the
+            # "↳ Tool result" sections in the main buffer.
             result_blocks = [
                 convert_content_block(b)
                 for b in content
