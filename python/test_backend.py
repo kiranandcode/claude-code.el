@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from io import StringIO
 from typing import Any
 from unittest.mock import patch
 
@@ -72,6 +71,8 @@ from claude_code_backend import (
     _pending_permission_requests,
     _permission_decisions,
 )
+import threading
+import claude_code_backend as _be
 from claude_agent_sdk import (
     AssistantMessage,
     RateLimitEvent as SDKRateLimitEvent,
@@ -96,11 +97,22 @@ from claude_agent_sdk import (
 
 
 def _capture_emit(event: Any) -> dict[str, Any]:
-    """Emit an event and return the JSON dict that was written to stdout."""
-    buf = StringIO()
-    with patch("claude_code_backend.sys.stdout", buf):
-        emit(event)
-    return json.loads(buf.getvalue().strip())
+    """Emit an event and return the JSON dict that was written to stdout.
+
+    ``emit()`` is now non-blocking — it enqueues the serialised line and a
+    background daemon thread writes it to stdout.  We read the line directly
+    from the queue so tests don't need to race against the writer thread.
+    """
+    # Drain any stale items left by previous test runs.
+    while not _be._stdout_queue.empty():
+        try:
+            _be._stdout_queue.get_nowait()
+        except Exception:
+            pass
+    emit(event)
+    # get() with a timeout so a broken test fails fast rather than hanging.
+    line = _be._stdout_queue.get(timeout=2)
+    return json.loads(line.strip())
 
 
 def _make_task_usage() -> TaskUsage:
@@ -157,10 +169,18 @@ class TestEmit:
         assert out["num_turns"] == 3
 
     def test_broken_pipe_exits(self) -> None:
-        with patch("claude_code_backend.sys.stdout") as mock_out:
+        # emit() is non-blocking: it enqueues and returns immediately.  The
+        # actual write (and the BrokenPipeError) happen on the writer thread.
+        # Inject a line directly into the live queue while stdout is patched so
+        # the writer thread picks it up, hits BrokenPipeError, and calls sys.exit.
+        exit_called = threading.Event()
+        with (
+            patch("claude_code_backend.sys.stdout") as mock_out,
+            patch("claude_code_backend.sys.exit", side_effect=lambda _: exit_called.set()),
+        ):
             mock_out.write.side_effect = BrokenPipeError
-            with pytest.raises(SystemExit):
-                emit(StatusEvent(status="ready"))
+            _be._stdout_queue.put('{"type":"status","status":"ready"}\n')
+            assert exit_called.wait(timeout=2), "sys.exit not called after BrokenPipeError"
 
     def test_permission_request_event(self) -> None:
         out = _capture_emit(
