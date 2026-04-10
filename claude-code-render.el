@@ -30,6 +30,7 @@
 (declare-function claude-code-deny-tool "claude-code-commands")
 (declare-function claude-code-toggle-ask-permission "claude-code-commands")
 (declare-function claude-code--ask-permission-active-p "claude-code-commands")
+(declare-function claude-code-edit-permission-rules "claude-code-commands")
 
 ;;;; Image Rendering Helpers
 
@@ -250,7 +251,16 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
                        'face (if ask-on
                                  'claude-code-permission-allow
                                'claude-code-config-button)
-                       'follow-link t))
+                       'follow-link t)
+        (let ((n (length claude-code--permission-patterns)))
+          (when (> n 0)
+            (insert " ")
+            (insert-button (format "[%d rule%s]" n (if (= n 1) "" "s"))
+                           'action (lambda (_btn)
+                                     (call-interactively #'claude-code-edit-permission-rules))
+                           'help-echo "Click to view/edit always-allow rules (/rules)"
+                           'face 'claude-code-permission-allow
+                           'follow-link t))))
       (insert "  ")
       (insert-button "[↓ Save as Project Default]"
                      'action (lambda (_btn)
@@ -459,18 +469,33 @@ are extracted as code segments; everything else is prose."
 
 (defun claude-code--insert-code-block (lang code)
   "Insert a syntax-highlighted fenced code block for LANG with CODE text.
-The opening and closing ``` fence lines are rendered in the `shadow' face.
-The code body is fontified using the major mode for LANG when available."
-  (let* ((mode-fn    (claude-code--mode-for-lang lang))
-         (label      (if (and lang (not (string-empty-p lang)))
-                         (format "```%s" lang)
-                       "```"))
-         (fontified  (claude-code--fontify-code code mode-fn)))
-    ;; Opening fence
-    (insert (propertize (concat "  " label "\n") 'face 'shadow))
+The opening fence line includes a [copy] button that copies CODE to the
+kill ring.  The code body region carries the `claude-code-code-content'
+text property so `claude-code-copy-code-block' (key: w) can find it."
+  (let* ((mode-fn   (claude-code--mode-for-lang lang))
+         (label     (if (and lang (not (string-empty-p lang)))
+                        (format "```%s" lang)
+                      "```"))
+         (fontified (claude-code--fontify-code code mode-fn))
+         body-beg)
+    ;; Opening fence with inline [copy] button
+    (insert (propertize (concat "  " label "  ") 'face 'shadow))
+    (insert-button "[copy]"
+                   'action (let ((c code))
+                             (lambda (_btn)
+                               (kill-new c)
+                               (message "Copied %d chars to kill ring" (length c))))
+                   'help-echo "Copy this code block (key: w)"
+                   'face 'shadow
+                   'follow-link t)
+    (insert "\n")
+    ;; Record start of code body for text-property annotation
+    (setq body-beg (point))
     ;; Fontified code body
     (dolist (line (split-string fontified "\n" nil))
       (insert "  " line "\n"))
+    ;; Annotate body with the raw code string so `w' can find it at point
+    (put-text-property body-beg (point) 'claude-code-code-content code)
     ;; Closing fence
     (insert (propertize "  ```\n" 'face 'shadow))))
 
@@ -724,9 +749,9 @@ magit's region-highlight hook never sees a nil section."
                        'face 'claude-code-permission-allow
                        'follow-link t)
         (insert "  ")
-        (insert-button "[Y] Always Allow"
+        (insert-button "[Y] Always Allow…"
                        'action (lambda (_btn) (claude-code-always-allow-tool))
-                       'help-echo "Allow and never ask again for this tool (key: Y)"
+                       'help-echo "Add a regexp rule to auto-approve similar calls (key: Y)"
                        'face 'claude-code-permission-allow
                        'follow-link t)
         (insert "  ")
@@ -741,11 +766,17 @@ magit's region-highlight hook never sees a nil section."
 
 (defun claude-code--render-subagents-panel ()
   "Render a pinned Spawned Agents panel after all messages.
-Shows one clickable link per subagent task, with its status and summary."
+Shows one clickable link per subagent task, with its status and summary.
+The panel is hidden once every child has reached a terminal status
+\(completed, failed, or stopped) — it only appears while work is in flight."
   (when-let* ((session-key (claude-code--effective-session-key))
               (parent (gethash session-key claude-code--agents))
               (children (plist-get parent :children)))
-    (when children
+    (when (seq-some (lambda (child-id)
+                      (when-let ((child (gethash child-id claude-code--agents)))
+                        (not (memq (plist-get child :status)
+                                   '(completed failed stopped)))))
+                    children)
       (insert (propertize (make-string 70 ?─) 'face 'claude-code-separator))
       (insert "\n")
       (insert (propertize "  Spawned Agents\n" 'face 'claude-code-assistant-label))

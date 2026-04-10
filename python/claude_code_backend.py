@@ -209,6 +209,7 @@ class TaskProgressEvent:
     task_id: str = ""
     description: str = ""
     last_tool_name: str | None = None
+    last_tool_input: dict[str, Any] | None = None
 
 
 @dataclass
@@ -414,6 +415,9 @@ def convert_message(message: SDKMessage) -> EmitEvent | None:
                 task_id=task_id,
                 description=description,
                 last_tool_name=last_tool_name,
+                # The SDK typed API only exposes last_tool_name, but the raw
+                # protocol payload (msg.data) may include last_tool_input.
+                last_tool_input=msg.data.get("last_tool_input"),
             )
 
         case TaskStartedMessage(task_id=task_id, description=description):

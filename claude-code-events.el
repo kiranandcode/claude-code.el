@@ -16,6 +16,7 @@
 (declare-function claude-code--start-thinking "claude-code-render")
 (declare-function claude-code--stop-thinking "claude-code-render")
 (declare-function claude-code--dispatch-input "claude-code-commands")
+(declare-function claude-code--send-json "claude-code-process")
 
 ;;;; Event Handling
 
@@ -63,18 +64,21 @@
                claude-code--messages)
          (claude-code--schedule-render)))
       ("task_progress"
-       (let ((task-id (alist-get 'task_id event)))
+       (let* ((task-id    (alist-get 'task_id event))
+              (tool-name  (alist-get 'last_tool_name event))
+              (tool-input (alist-get 'last_tool_input event)))
          (when task-id
            (claude-code--agent-update
             task-id
             :description (alist-get 'description event)
-            :last-tool (alist-get 'last_tool_name event)
+            :last-tool       tool-name
+            :last-tool-input tool-input
             :status 'working)
            ;; Forward tool-use events to the task buffer
            (when-let* ((child (gethash task-id claude-code--agents))
-                       (tool  (alist-get 'last_tool_name event)))
+                       (_ tool-name))
              (claude-code--task-buffer-append-tool
-              (plist-get child :buffer) tool)))))
+              (plist-get child :buffer) tool-name tool-input)))))
       ("task_notification"
        (let ((task-id (alist-get 'task_id event))
              (status (alist-get 'status event))
@@ -150,20 +154,91 @@
          (claude-code--agent-update agent-key :status 'error))))
     (claude-code--schedule-render)))
 
+;;;; File-buffer Pulse Highlighting
+
+(defun claude-code--tool-use-file-path (tool-name input)
+  "Return the file path from INPUT for a file-touching TOOL-NAME, or nil.
+Handles both symbol-keyed (decoded JSON alists) and string-keyed inputs."
+  (when (and input (not (eq input :null)) (listp input))
+    (pcase tool-name
+      ((or "Read" "Write" "Edit" "MultiEdit")
+       (when-let ((path (or (alist-get 'path input)
+                            (alist-get 'file_path input)
+                            (alist-get "path" input nil nil #'equal)
+                            (alist-get "file_path" input nil nil #'equal))))
+         (format "%s" path))))))
+
+(defun claude-code--pulse-buffer-region (buf beg end)
+  "Pulse BEG..END in BUF using `pulse-momentary-highlight-region'.
+Does nothing if BUF is not live or the region is degenerate."
+  (when (and (buffer-live-p buf) (< beg end))
+    (with-current-buffer buf
+      (pulse-momentary-highlight-region beg end))))
+
+(defun claude-code--pulse-from-tool-use (block cwd)
+  "Pulse any live buffer referenced by tool-use BLOCK.
+CWD is used to expand relative paths.  Silently does nothing when no
+buffer is currently visiting the referenced file."
+  (require 'pulse)
+  (let* ((name      (alist-get 'name block))
+         (input     (alist-get 'input block))
+         (rel-path  (claude-code--tool-use-file-path name input)))
+    (when rel-path
+      (let* ((full-path (if (file-name-absolute-p rel-path)
+                            rel-path
+                          (expand-file-name rel-path (or cwd default-directory))))
+             (buf       (find-buffer-visiting full-path)))
+        (when (buffer-live-p buf)
+          (claude-code--pulse-buffer-region buf
+                                            (with-current-buffer buf (point-min))
+                                            (with-current-buffer buf (point-max))))))))
+
+(defun claude-code--pulse-assistant-tool-files (event)
+  "Pulse open file buffers referenced by tool-use blocks in assistant EVENT.
+Iterates over every content block in EVENT; for each `tool_use' block
+that references a file, pulses any open buffer visiting that file."
+  (let* ((content (alist-get 'content event))
+         (cwd     claude-code--cwd)
+         (blocks  (cond ((vectorp content) (append content nil))
+                        ((listp   content) content))))
+    (dolist (block blocks)
+      (when (equal (alist-get 'type block) "tool_use")
+        (claude-code--pulse-from-tool-use block cwd)))))
+
+(defun claude-code--permission-pattern-allows-p (tool-name tool-input)
+  "Return non-nil if a pattern in `claude-code--permission-patterns' matches.
+Checks every entry whose :tool-name equals TOOL-NAME; the entry's :pattern
+is matched (as a regexp) against the primary argument string extracted from
+TOOL-INPUT by `claude-code--tool-input-primary-string'."
+  (let ((input-str (or (claude-code--tool-input-primary-string tool-name tool-input) "")))
+    (seq-some (lambda (pat)
+                (and (equal (plist-get pat :tool-name) tool-name)
+                     (string-match-p (plist-get pat :pattern) input-str)))
+              claude-code--permission-patterns)))
+
 (defun claude-code--handle-permission-request (event)
   "Handle a permission_request EVENT from the backend.
-Stores the request in `claude-code--pending-permission' and triggers a
-render so the approval widget appears inline above the input area."
+If a saved pattern in `claude-code--permission-patterns' matches the call,
+auto-approves it immediately (no widget shown).  Otherwise stores the
+request in `claude-code--pending-permission' and triggers a render so the
+approval widget appears inline above the input area."
   (let ((request-id (alist-get 'request_id event))
         (tool-name  (alist-get 'tool_name event))
         (tool-input (alist-get 'tool_input event)))
-    (setq claude-code--pending-permission
-          `((request-id . ,request-id)
-            (tool-name  . ,tool-name)
-            (tool-input . ,tool-input)))
-    (claude-code--schedule-render)
-    (message "claude-code: approval needed for %s — press y/Y/n in the Claude buffer"
-             tool-name)))
+    (if (claude-code--permission-pattern-allows-p tool-name tool-input)
+        ;; A saved pattern matches — silently approve without showing the widget.
+        (claude-code--send-json
+         `((type       . "permission_response")
+           (request_id . ,request-id)
+           (decision   . "allow")))
+      ;; No pattern matches — show the inline approval widget.
+      (setq claude-code--pending-permission
+            `((request-id . ,request-id)
+              (tool-name  . ,tool-name)
+              (tool-input . ,tool-input)))
+      (claude-code--schedule-render)
+      (message "claude-code: approval needed for %s — press y/Y/n in the Claude buffer"
+               tool-name))))
 
 (defun claude-code--handle-system-event (event)
   "Handle a system EVENT."
@@ -177,12 +252,15 @@ render so the approval widget appears inline above the input area."
   "Handle a complete assistant EVENT (non-streaming).
 The complete event already contains all content blocks (thinking, text,
 tool_use), so we discard the streaming buffers rather than flushing them
-to avoid duplicating thinking/text content in separate ◀ Assistant blocks."
+to avoid duplicating thinking/text content in separate ◀ Assistant blocks.
+Also pulses any open Emacs buffers whose files were touched by tool calls."
   ;; Discard streaming buffers — the complete event supersedes them.
   (setq claude-code--streaming-text ""
         claude-code--streaming-thinking ""
         claude-code--streaming-active nil)
   (push event claude-code--messages)
+  ;; Pulse open file buffers referenced by tool-use blocks (Read/Edit/Write).
+  (claude-code--pulse-assistant-tool-files event)
   (claude-code--schedule-render))
 
 (defun claude-code--handle-result-event (event)

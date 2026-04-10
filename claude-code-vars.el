@@ -136,10 +136,43 @@ Example:
 
 ;; Per-session "don't ask again" patterns.  Each entry is a plist:
 ;;   (:tool-name TOOL :pattern REGEXP)
-;; where REGEXP is matched against the serialised tool input.
+;; where REGEXP is matched against the primary argument (command string
+;; for Bash, file path for Edit/Write/MultiEdit, first value otherwise).
 (defvar-local claude-code--permission-patterns nil
-  "List of approved-forever patterns for the askConfirmation mode.
-Each entry is a plist (:tool-name NAME :pattern REGEXP).")
+  "Session-scoped list of always-allow patterns for the ask-permission system.
+Each entry is a plist (:tool-name NAME :pattern REGEXP).
+When a permission_request arrives, its primary argument is matched against
+every pattern whose :tool-name equals the tool.  A match auto-approves
+the call without showing the approval widget.
+Manage with `claude-code-edit-permission-rules'.")
+
+(defun claude-code--tool-input-primary-string (tool-name tool-input)
+  "Return the primary matchable string from TOOL-INPUT for TOOL-NAME.
+For Bash this is the command string; for file-touching tools it is the
+path; for other tools it is the first value in the input map.
+Returns nil when TOOL-INPUT is absent or null.
+Used for permission-pattern matching and pre-filling always-allow prompts."
+  (when (and tool-input (not (eq tool-input :null)))
+    (let ((input (cond
+                  ((listp tool-input) tool-input)
+                  ((hash-table-p tool-input)
+                   (let (pairs)
+                     (maphash (lambda (k v) (push (cons k v) pairs)) tool-input)
+                     pairs)))))
+      (pcase tool-name
+        ("Bash"
+         (format "%s"
+                 (or (alist-get 'command input)
+                     (alist-get "command" input nil nil #'equal)
+                     "")))
+        ((or "Write" "Edit" "MultiEdit")
+         (format "%s"
+                 (or (alist-get 'path input)
+                     (alist-get "path" input nil nil #'equal)
+                     "")))
+        (_
+         (when-let ((pair (car input)))
+           (format "%s" (cdr pair))))))))
 
 ;; The currently pending permission request (or nil).
 ;; Set when a `permission_request' event arrives; cleared when the user
@@ -438,6 +471,7 @@ DOC is the docstring."
     ("/notes"         . "Open the global notes file")
     ("/project-notes" . "Open or create project context notes")
     ("/todos"         . "Open or create project TODO list")
+    ("/rules"         . "View/edit session permission rules")
     ("/inspect"       . "Show session state")
     ("/stats"         . "Show token/cost usage statistics")
     ("/help"          . "Show the command menu"))

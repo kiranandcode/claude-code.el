@@ -537,6 +537,24 @@ User prompts (newest first):
            (if claude-code-show-tool-details "visible" "hidden"))
   (claude-code--schedule-render))
 
+;;;; Code Block Copy
+
+(defun claude-code-copy-code-block ()
+  "Copy the code block at point to the kill ring.
+Reads the `claude-code-code-content' text property placed on code body
+lines by `claude-code--insert-code-block'.  Signals an error when point
+is not inside a code block."
+  (interactive)
+  (if-let ((code (get-text-property (point) 'claude-code-code-content)))
+      (progn
+        (kill-new code)
+        (message "Copied %d chars to kill ring" (length code)))
+    (user-error "No code block at point (move point into the code body)")))
+
+(claude-code--def-key-command claude-code-key-copy-code-block
+  #'claude-code-copy-code-block
+  "Copy code block at point, or self-insert in input area.")
+
 ;;;; Tool-Call Permission Commands
 
 (defun claude-code--ask-permission-active-p ()
@@ -581,14 +599,151 @@ Clears `claude-code--pending-permission' and re-renders."
   (claude-code--respond-to-permission "allow"))
 
 (defun claude-code-always-allow-tool ()
-  "Approve the pending tool call and always allow this tool in the session."
+  "Approve and add a session pattern so similar calls auto-approve in future.
+Prompts for a regexp in the minibuffer, pre-filled with the actual command
+or path quoted as a literal regexp.  Edit to generalise — e.g. widen
+`git status' to `git .*' — then RET to confirm.  C-g to cancel entirely.
+
+The pattern is stored in `claude-code--permission-patterns' for the
+lifetime of this session; manage all rules with
+`claude-code-edit-permission-rules'."
   (interactive)
+  (unless claude-code--pending-permission
+    (user-error "No pending permission request"))
+  (let* ((tool-name  (alist-get 'tool-name  claude-code--pending-permission))
+         (tool-input (alist-get 'tool-input claude-code--pending-permission))
+         (base-str   (or (claude-code--tool-input-primary-string tool-name tool-input) ""))
+         (pattern    (read-string
+                      (format "Always-allow pattern for %s (regexp, RET to accept): "
+                              tool-name)
+                      (regexp-quote base-str))))
+    (push `(:tool-name ,tool-name :pattern ,pattern)
+          claude-code--permission-patterns)
+    (message "claude-code: added rule — %s ~= /%s/  (M-x claude-code-edit-permission-rules to manage)"
+             tool-name pattern))
+  ;; Also tell Python to always-allow for the rest of this query so
+  ;; subsequent calls in the same response skip the Emacs round-trip.
   (claude-code--respond-to-permission "always_allow"))
 
 (defun claude-code-deny-tool ()
   "Deny the pending tool call."
   (interactive)
   (claude-code--respond-to-permission "deny"))
+
+;;;; Permission Rules Buffer
+
+(defvar-local claude-code--rules-parent-buffer nil
+  "The Claude session buffer whose `claude-code--permission-patterns' this buffer edits.")
+
+(defvar claude-code-rules-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-c C-c") #'claude-code-rules-apply)
+    (define-key map (kbd "C-c C-k") #'claude-code-rules-discard)
+    (define-key map (kbd "q")       #'claude-code-rules-discard)
+    map)
+  "Keymap for `claude-code-rules-mode'.")
+
+(define-derived-mode claude-code-rules-mode text-mode "Claude-Rules"
+  "Major mode for editing Claude Code session permission rules.
+
+Each non-comment line defines one always-allow rule in the form:
+
+  TOOL-NAME   REGEXP
+
+TOOL-NAME is the exact tool name (e.g. Bash, Edit, Write, MultiEdit).
+REGEXP is matched (via `string-match-p') against the primary argument:
+  Bash       — the shell command string
+  Edit/Write — the file path
+  Other      — the first input value
+
+Lines starting with # are comments.  Blank lines are ignored.
+
+\\{claude-code-rules-mode-map}"
+  (setq-local comment-start "# ")
+  (setq-local comment-end "")
+  (font-lock-mode -1))
+
+(defun claude-code--rules-to-string (patterns)
+  "Serialise PATTERNS list to human-readable text for the rules buffer."
+  (mapconcat (lambda (pat)
+               (format "%-12s %s"
+                       (plist-get pat :tool-name)
+                       (plist-get pat :pattern)))
+             patterns
+             "\n"))
+
+(defun claude-code--string-to-rules (text)
+  "Parse TEXT from the rules buffer into a `claude-code--permission-patterns' list."
+  (let (result)
+    (dolist (line (split-string text "\n"))
+      (setq line (string-trim line))
+      (unless (or (string-empty-p line) (string-prefix-p "#" line))
+        (when (string-match "^\\([^ \t]+\\)[ \t]+\\(.*\\)$" line)
+          (push `(:tool-name ,(match-string 1 line)
+                  :pattern   ,(string-trim (match-string 2 line)))
+                result))))
+    (nreverse result)))
+
+(defun claude-code-rules-apply ()
+  "Apply edits in the rules buffer back to the parent Claude session.
+Parses the buffer contents and updates `claude-code--permission-patterns'
+in the session buffer.  Closes the rules buffer."
+  (interactive)
+  (unless (buffer-live-p claude-code--rules-parent-buffer)
+    (user-error "Parent Claude session buffer is no longer live"))
+  (let ((rules (claude-code--string-to-rules (buffer-string))))
+    (with-current-buffer claude-code--rules-parent-buffer
+      (setq claude-code--permission-patterns rules)
+      ;; Keep the always-allowed-tools mirror in sync with the new pattern set.
+      (setq claude-code--always-allowed-tools
+            (seq-uniq (mapcar (lambda (p) (plist-get p :tool-name)) rules)
+                      #'equal)))
+    (message "claude-code: %d permission rule%s applied"
+             (length rules) (if (= 1 (length rules)) "" "s")))
+  (quit-window t))
+
+(defun claude-code-rules-discard ()
+  "Discard unsaved edits and close the rules buffer."
+  (interactive)
+  (quit-window t))
+
+(defun claude-code-edit-permission-rules ()
+  "Open a buffer to view and edit the current session's permission rules.
+
+Rules are plain-text lines of the form:
+
+  TOOL-NAME   REGEXP
+
+Examples:
+  Bash    git .*
+  Bash    cargo (build|test|check)
+  Edit    src/.*\\.el
+  Read    .*
+
+Press C-c C-c to apply changes, q or C-c C-k to discard."
+  (interactive)
+  (let ((parent   (current-buffer))
+        (patterns claude-code--permission-patterns)
+        (cwd      claude-code--cwd))
+    (let ((buf (get-buffer-create
+                (format "*Claude Permission Rules: %s*"
+                        (or cwd "session")))))
+      (pop-to-buffer buf)
+      (claude-code-rules-mode)
+      (setq claude-code--rules-parent-buffer parent)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "# Permission rules for %s\n" (buffer-name parent)))
+        (insert "# Format: TOOL-NAME  REGEXP  (one rule per line, # = comment)\n")
+        (insert "# C-c C-c to apply · q or C-c C-k to discard\n\n")
+        (let ((body (claude-code--rules-to-string patterns)))
+          (unless (string-empty-p body)
+            (insert body)
+            (insert "\n"))))
+      ;; Position point on the first real rule, or at end for an empty list.
+      (goto-char (point-min))
+      (unless (re-search-forward "^[^#\n]" nil t)
+        (goto-char (point-max))))))
 
 ;;;; Slash Command Dispatch
 
@@ -610,6 +765,7 @@ Clears `claude-code--pending-permission' and re-renders."
       ("/notes"         (call-interactively #'claude-code-open-notes))
       ("/project-notes" (call-interactively #'claude-code-open-dir-notes))
       ("/todos"         (call-interactively #'claude-code-open-dir-todos))
+      ("/rules"         (call-interactively #'claude-code-edit-permission-rules))
       ("/inspect"       (call-interactively #'claude-code-inspect))
       ("/stats"         (call-interactively #'claude-code-stats))
       ("/help"          (call-interactively #'claude-code-menu))
@@ -909,6 +1065,7 @@ persists the change via `customize-save-variable'."
    ("e" "Set effort" claude-code-set-effort)
    ("p" "Set permission mode" claude-code-set-permission-mode)
    ("A" "Toggle ask-permission" claude-code-toggle-ask-permission)
+   ("E" "Edit permission rules" claude-code-edit-permission-rules)
    ("P" "Save as project default" claude-code-save-project-config)]
   ["View"
    ("t" "Toggle thinking" claude-code-toggle-thinking)
@@ -997,6 +1154,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "k"   #'claude-code-key-kill
   "R"   #'claude-code-key-restart
   "n"   #'claude-code-key-deny-or-notes
+  "w"   #'claude-code-key-copy-code-block
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
   "a"   #'claude-code-key-agents-toggle

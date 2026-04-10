@@ -25,7 +25,8 @@ Agent plist keys:
   :buffer      - associated buffer (sessions only)
   :parent-id   - id of parent agent, nil for root sessions
   :children    - list of child agent ids
-  :last-tool   - last tool name (tasks only)
+  :last-tool       - last tool name (tasks only)
+  :last-tool-input - last tool input alist (tasks only, may be nil)
   :summary     - completion summary (tasks only)
   :cwd         - working directory")
 
@@ -264,8 +265,16 @@ IS-LAST is non-nil if this is the last sibling."
                                       (truncate-string-to-width buf-name 30))
                               'face 'shadow)))
         (when-let ((tool (plist-get agent :last-tool)))
-          (insert (propertize (format "  %s    ⚙ %s\n" cont tool)
-                              'face 'shadow)))
+          (let* ((input (plist-get agent :last-tool-input))
+                 (arg   (when input
+                          (claude-code--tool-input-primary-string tool input)))
+                 (label (if (and arg (not (string-empty-p arg)))
+                            (format "⚙ %-10s  %s" tool
+                                    (truncate-string-to-width
+                                     (abbreviate-file-name arg) 22 nil nil "…"))
+                          (format "⚙ %s" tool))))
+            (insert (propertize (format "  %s    %s\n" cont label)
+                                'face 'shadow))))
         (when-let ((summary (plist-get agent :summary)))
           (insert (propertize
                    (format "  %s    %s\n" cont
@@ -396,7 +405,10 @@ For task agents, sends a cancel signal via the parent session."
   "Parent session buffer for this task buffer.")
 
 (defvar-local claude-code--task-last-tool nil
-  "Last tool name appended to this task buffer (used to deduplicate).")
+  "Last tool entry string appended to this task buffer (used to deduplicate).
+Stores the full formatted line (tool name + argument) so consecutive
+identical calls for the same tool+input are suppressed, while the same
+tool used on different files still produces distinct lines.")
 
 (defvar-keymap claude-code-task-mode-map
   :doc "Keymap for Claude subagent task progress buffers."
@@ -451,17 +463,27 @@ PARENT-BUF is the parent session buffer."
         (insert "\n\n")))
     buf))
 
-(defun claude-code--task-buffer-append-tool (buf tool-name)
-  "Append TOOL-NAME as a step to task BUF.
-Deduplicates consecutive identical calls."
+(defun claude-code--task-buffer-append-tool (buf tool-name &optional tool-input)
+  "Append a TOOL-NAME step with optional TOOL-INPUT summary to task BUF.
+TOOL-INPUT is the raw tool-input alist from the protocol (may be nil).
+The primary argument is extracted via `claude-code--tool-input-primary-string'
+and shown after the tool name — e.g. \"⚙ Read  src/foo.el\".
+Deduplicates consecutive identical (tool + primary-arg) entries."
   (when (and buf (buffer-live-p buf))
     (with-current-buffer buf
-      (unless (equal tool-name claude-code--task-last-tool)
-        (setq claude-code--task-last-tool tool-name)
-        (let ((inhibit-read-only t))
-          (goto-char (point-max))
-          (insert (propertize (format "  ⚙ %s\n" tool-name)
-                              'face 'claude-code-tool-name)))))))
+      (let* ((arg     (when tool-input
+                        (claude-code--tool-input-primary-string tool-name tool-input)))
+             (line    (if (and arg (not (string-empty-p arg)))
+                          (format "  ⚙ %-10s  %s\n"
+                                  tool-name
+                                  (truncate-string-to-width
+                                   (abbreviate-file-name arg) 45 nil nil "…"))
+                        (format "  ⚙ %s\n" tool-name))))
+        (unless (equal line claude-code--task-last-tool)
+          (setq claude-code--task-last-tool line)
+          (let ((inhibit-read-only t))
+            (goto-char (point-max))
+            (insert (propertize line 'face 'claude-code-tool-name))))))))
 
 (defun claude-code--task-buffer-finalize (buf status summary)
   "Mark task BUF as done with STATUS symbol string and SUMMARY text."
