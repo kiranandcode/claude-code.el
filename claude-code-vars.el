@@ -486,6 +486,8 @@ DOC is the docstring."
     ("/rules"         . "View/edit session permission rules")
     ("/inspect"       . "Show session state")
     ("/stats"         . "Show token/cost usage statistics")
+    ("/export"        . "Export conversation to org or markdown")
+    ("/shell"         . "Send visible shell/terminal output to Claude")
     ("/help"          . "Show the command menu"))
   "Slash commands available in the Claude input area.")
 

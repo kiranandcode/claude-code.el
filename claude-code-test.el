@@ -3800,5 +3800,119 @@ extends into the input area (which has no magit section)."
           (memq 'magit-section--highlight-region
                 redisplay--update-region-highlight-functions)))))
 
+;; ---------------------------------------------------------------------------
+;; Export tests
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-export-org-basic ()
+  "Export to org produces valid org structure."
+  (claude-code-test-with-buffer
+    (setq claude-code--messages
+          (list
+           `((type . "result") (total_cost_usd . 0.05) (num_turns . 3)
+             (duration_ms . 5000))
+           `((type . "assistant")
+             (content . [((type . "text") (text . "Hello! Here is my answer."))]))
+           `((type . "user") (prompt . "What is Emacs?"))))
+    (let ((text (claude-code-export--to-org (reverse claude-code--messages))))
+      (should (string-match-p "^\\*\\* User" text))
+      (should (string-match-p "What is Emacs?" text))
+      (should (string-match-p "^\\*\\* Assistant" text))
+      (should (string-match-p "Hello! Here is my answer." text))
+      (should (string-match-p "Done" text))
+      (should (string-match-p "\\$0.0500" text)))))
+
+(ert-deftest claude-code-test-export-md-basic ()
+  "Export to markdown produces valid markdown structure."
+  (claude-code-test-with-buffer
+    (setq claude-code--messages
+          (list
+           `((type . "assistant")
+             (content . [((type . "text") (text . "The answer is 42."))]))
+           `((type . "user") (prompt . "What is the meaning of life?"))))
+    (let ((text (claude-code-export--to-md (reverse claude-code--messages))))
+      (should (string-match-p "^## 🧑 User" text))
+      (should (string-match-p "meaning of life" text))
+      (should (string-match-p "^## 🤖 Assistant" text))
+      (should (string-match-p "42" text)))))
+
+(ert-deftest claude-code-test-export-thinking-blocks ()
+  "Thinking blocks are rendered as collapsible sections."
+  (claude-code-test-with-buffer
+    (setq claude-code--messages
+          (list
+           `((type . "assistant")
+             (content . [((type . "thinking") (thinking . "Let me think..."))
+                         ((type . "text") (text . "Done thinking."))]))))
+    (let ((org-text (claude-code-export--to-org
+                     (reverse claude-code--messages)))
+          (md-text (claude-code-export--to-md
+                    (reverse claude-code--messages))))
+      ;; Org uses #+begin_details
+      (should (string-match-p "begin_details" org-text))
+      (should (string-match-p "Let me think" org-text))
+      ;; MD uses <details>
+      (should (string-match-p "<details>" md-text))
+      (should (string-match-p "Let me think" md-text)))))
+
+(ert-deftest claude-code-test-export-tool-use-blocks ()
+  "Tool use/result blocks are exported."
+  (claude-code-test-with-buffer
+    (setq claude-code--messages
+          (list
+           `((type . "assistant")
+             (content . [((type . "tool_use") (name . "Bash")
+                          (input . ((command . "ls -la")))
+                          (id . "test-123"))
+                         ((type . "tool_result")
+                          (tool_use_id . "test-123")
+                          (content . "file1.txt\nfile2.txt"))]))))
+    (let ((org-text (claude-code-export--to-org
+                     (reverse claude-code--messages))))
+      (should (string-match-p "Tool: Bash" org-text))
+      (should (string-match-p "ls -la" org-text))
+      (should (string-match-p "file1.txt" org-text)))))
+
+(ert-deftest claude-code-test-export-error-messages ()
+  "Error messages are exported."
+  (claude-code-test-with-buffer
+    (setq claude-code--messages
+          (list `((type . "error") (message . "Something went wrong"))))
+    (let ((text (claude-code-export--to-org
+                 (reverse claude-code--messages))))
+      (should (string-match-p "Error" text))
+      (should (string-match-p "Something went wrong" text)))))
+
+;; ---------------------------------------------------------------------------
+;; Shell output capture tests
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-shell-buffer-candidates ()
+  "Shell buffer candidates detect shell-like modes."
+  (let ((buf (generate-new-buffer " *test-shell*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            ;; comint-mode is always available
+            (comint-mode))
+          (let ((candidates (claude-code--shell-buffer-candidates)))
+            (should (assoc (buffer-name buf) candidates))))
+      (kill-buffer buf))))
+
+(ert-deftest claude-code-test-capture-shell-output ()
+  "Capture shell output grabs the last N lines."
+  (let ((buf (generate-new-buffer " *test-capture*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf
+            (dotimes (i 10)
+              (insert (format "line %d\n" i))))
+          (let ((output (claude-code--capture-shell-output buf 3)))
+            ;; Should contain the last 3 lines
+            (should (string-match-p "line 7" output))
+            (should (string-match-p "line 8" output))
+            (should (string-match-p "line 9" output))))
+      (kill-buffer buf))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

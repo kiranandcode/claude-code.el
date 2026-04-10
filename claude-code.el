@@ -37,6 +37,7 @@
 (require 'claude-code-events)
 (require 'claude-code-diff)
 (require 'claude-code-render)
+(require 'claude-code-export)
 (require 'claude-code-commands)
 (require 'claude-code-git-graph)
 (require 'claude-code-frame-render)
