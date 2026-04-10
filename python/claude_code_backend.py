@@ -1262,9 +1262,10 @@ def _needs_streaming(options: ClaudeAgentOptions) -> bool:
     Without streaming the CLI closes stdin immediately after the prompt, so any
     in-flight MCP tool call from Claude receives "Stream closed".
     """
-    has_sdk_mcp = any(
+    servers = options.mcp_servers
+    has_sdk_mcp = isinstance(servers, dict) and any(
         isinstance(cfg, dict) and cfg.get("type") == "sdk"
-        for cfg in (options.mcp_servers or {}).values()
+        for cfg in servers.values()
     )
     return options.can_use_tool is not None or has_sdk_mcp
 
@@ -1351,7 +1352,7 @@ async def handle_query(cmd: QueryCommand) -> None:
         "handle_query: streaming=%s can_use_tool=%s mcp_servers=%s",
         needs_streaming,
         options.can_use_tool is not None,
-        list((options.mcp_servers or {}).keys()),
+        list(options.mcp_servers.keys()) if isinstance(options.mcp_servers, dict) else options.mcp_servers,
     )
 
     emit(StatusEvent(status="working"))
