@@ -16,6 +16,7 @@ import queue as _queue_module
 import shutil
 import sys
 import threading
+import time
 import traceback
 
 # ---------------------------------------------------------------------------
@@ -219,6 +220,15 @@ class ResultEvent:
 
 
 @dataclass
+class TokenUsageEvent:
+    """Input-token count sampled from a message_start stream event.
+    Reflects the full context window usage for the current API call."""
+
+    type: Literal["token_usage"] = "token_usage"
+    input_tokens: int = 0
+
+
+@dataclass
 class TaskProgressEvent:
     """Progress update from a subagent task."""
 
@@ -330,6 +340,7 @@ type EmitEvent = (
     | InputJsonDeltaEvent
     | ContentBlockStopEvent
     | PermissionRequestEvent
+    | TokenUsageEvent
 )
 
 # ---------------------------------------------------------------------------
@@ -447,8 +458,19 @@ def convert_stream_event(event: dict[str, Any]) -> EmitEvent | None:
         case "content_block_stop":
             return ContentBlockStopEvent(index=event.get("index", 0))
 
+        case "message_start":
+            # The message_start event carries the full context-window input
+            # token count for this API call (entire conversation history +
+            # system prompt), which is what we display in the ctx bar.
+            msg = event.get("message", {})
+            usage_data = msg.get("usage", {})
+            input_tokens = usage_data.get("input_tokens", 0)
+            if input_tokens:
+                return TokenUsageEvent(input_tokens=input_tokens)
+            return None
+
         case _:
-            # message_start, message_delta, message_stop, etc. — skip
+            # message_delta, message_stop, etc. — skip
             return None
 
 
@@ -642,26 +664,147 @@ def _unescape_emacs_string(s: str) -> str:  # kept for reference; no longer call
     return result.decode("utf-8", errors="replace")
 
 
-async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
-    """Evaluate ELISP in the running Emacs and return the result as a string.
+# ---------------------------------------------------------------------------
+# emacsclient diagnostics
+#
+# Tracks call counts, timeouts, and slow calls so we can diagnose the
+# intermittent "MCP server stops working" pattern.  Diagnostic lines are
+# written to stderr; Emacs's process filter merges stderr with stdout and
+# routes non-JSON lines to *Messages* with a "Claude SDK:" prefix, so the
+# user can see them as they happen.
+# ---------------------------------------------------------------------------
 
-    Async so it never blocks the asyncio event loop.  Blocking the event
-    loop (with subprocess.run) while the claude CLI is streaming tokens
-    causes the OS pipe buffer to fill, stalling the CLI, which then times
-    out and reports "Stream closed" for in-flight MCP tool calls.
+_emacsclient_stats: dict[str, int] = {
+    "calls": 0,
+    "timeouts": 0,
+    "errors": 0,
+    "slow_calls": 0,            # > 5s but completed
+    "retries_succeeded": 0,
+    "retries_failed": 0,
+}
 
-    Output encoding: wraps ELISP in (json-encode ...) so Emacs itself
-    produces well-formed JSON.  Python's json.loads then decodes it — no
-    hand-rolled Lisp escape parsing needed.  Non-string return values
-    (nil, t, numbers) are serialised back to their JSON representation so
-    callers always receive a plain string.
 
-    Raises RuntimeError on non-zero exit or if emacsclient is not found.
+def _log_diag(msg: str) -> None:
+    """Write a diagnostic line to stderr (lands in Emacs *Messages*)."""
+    try:
+        sys.stderr.write(f"[claude-code-backend] {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Persistent MCP socket client
+#
+# When the env var `CLAUDE_CODE_MCP_SOCKET` is set, MCP tool calls go through
+# a persistent Unix socket connection to the Emacs side instead of forking
+# `emacsclient` per call.  Eliminates ~50-200 ms of fork/exec overhead per
+# call and avoids stale-socket bugs.
+#
+# Wire format: line-delimited JSON.  See claude-code-emacs-tools.el.
+# ---------------------------------------------------------------------------
+
+_MCP_SOCKET_PATH: str | None = os.environ.get("CLAUDE_CODE_MCP_SOCKET") or None
+
+
+class _McpSocketClient:
+    """Persistent line-delimited JSON client for the Emacs MCP socket.
+
+    Single global instance.  Auto-connects on first use; reconnects on
+    disconnect.  All access is serialised through `_lock` because Emacs
+    is single-threaded — there is no point sending concurrent requests.
     """
-    if _EMACSCLIENT is None:
-        raise EmacsclientNotFoundError("emacsclient not found on PATH")
-    # Wrap in json-encode so Emacs handles all escaping; princ writes the
-    # raw JSON to stdout (no extra Lisp-level quoting on top).
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._reader: asyncio.StreamReader | None = None
+        self._writer: asyncio.StreamWriter | None = None
+        self._lock = asyncio.Lock()
+        self._next_id = 0
+
+    async def _ensure_connected(self) -> None:
+        if self._writer is not None and not self._writer.is_closing():
+            return
+        self._reader, self._writer = await asyncio.open_unix_connection(self.path)
+
+    async def _disconnect(self) -> None:
+        if self._writer is not None:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+        self._reader = None
+        self._writer = None
+
+    async def close(self) -> None:
+        """Close the connection.  Used by tests; production code keeps the
+        client alive for the lifetime of the backend process."""
+        async with self._lock:
+            await self._disconnect()
+
+    async def call(self, elisp: str, timeout: float) -> str:
+        """Send ELISP, await response, return its result coerced to a string.
+
+        Raises RuntimeError on timeout, eval-error response, or socket
+        failure (after one reconnect attempt).
+        """
+        async with self._lock:
+            self._next_id += 1
+            req_id = f"req-{self._next_id}"
+            payload = json.dumps({"id": req_id, "elisp": elisp}) + "\n"
+
+            for attempt in (1, 2):
+                try:
+                    await self._ensure_connected()
+                    assert self._writer is not None and self._reader is not None
+                    self._writer.write(payload.encode("utf-8"))
+                    await self._writer.drain()
+                    with anyio.fail_after(timeout):
+                        line = await self._reader.readline()
+                    if not line:
+                        raise RuntimeError("mcp socket: empty response (closed)")
+                    response = json.loads(line.decode("utf-8"))
+                    if response.get("ok") is True:
+                        result = response.get("result")
+                        # Coerce non-string results to JSON for caller compat
+                        return result if isinstance(result, str) else json.dumps(result)
+                    error_msg = response.get("error", "unknown")
+                    raise RuntimeError(f"emacs eval failed: {error_msg}")
+                except TimeoutError:
+                    # IMPORTANT: TimeoutError is a subclass of OSError in
+                    # Python 3.11+, so this clause MUST come before the
+                    # OSError clause below or it will be swallowed.
+                    # Drop the connection — the response we abandoned would
+                    # otherwise corrupt the next request/response pairing.
+                    await self._disconnect()
+                    raise RuntimeError(f"mcp socket timed out after {timeout:.0f}s")
+                except (
+                    BrokenPipeError,
+                    ConnectionResetError,
+                    ConnectionRefusedError,
+                    FileNotFoundError,
+                    OSError,
+                ) as e:
+                    await self._disconnect()
+                    if attempt == 2:
+                        raise RuntimeError(f"mcp socket failed: {e}")
+                    _log_diag(
+                        f"mcp socket reconnecting after {type(e).__name__}: {e}"
+                    )
+                    continue
+            # Unreachable, but mypy needs an explicit return
+            raise RuntimeError("mcp socket: exhausted retries")
+
+
+_mcp_client: _McpSocketClient | None = (
+    _McpSocketClient(_MCP_SOCKET_PATH) if _MCP_SOCKET_PATH else None
+)
+
+
+async def _run_emacsclient_once(elisp: str, timeout: float) -> str:
+    """One emacsclient invocation. Raises RuntimeError on timeout/non-zero exit."""
+    assert _EMACSCLIENT is not None  # caller checks
     wrapped = f"(progn (require 'json) (princ (json-encode {elisp})))"
     proc = await asyncio.create_subprocess_exec(
         _EMACSCLIENT, "--eval", wrapped,
@@ -691,6 +834,84 @@ async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
     # All callers expect a string; for non-string values (nil → null,
     # t → true, numbers, lists) serialise back to a terse representation.
     return parsed if isinstance(parsed, str) else json.dumps(parsed)
+
+
+async def _run_emacsclient(elisp: str, timeout: float = 15.0) -> str:
+    """Evaluate ELISP in the running Emacs and return the result as a string.
+
+    Two transports:
+
+    1. **Persistent socket** (preferred): when `CLAUDE_CODE_MCP_SOCKET` is
+       set in the environment, requests go through `_mcp_client` over a
+       Unix socket maintained by `claude-code-tools-mcp-server-start`.
+       Saves ~50-200 ms per call (no fork/exec) and avoids stale-socket
+       issues.
+
+    2. **emacsclient subprocess** (fallback): one `emacsclient --eval`
+       per call.  Used when the socket env var is unset, when the socket
+       client fails to connect, or for backward compatibility with
+       existing setups.
+
+    On timeout, retries once.  Emacs is single-threaded; if it is
+    mid-render of a large Claude buffer, the eval queues behind the
+    render and may exceed the timeout.  A second attempt usually
+    succeeds because the render has finished.  Diagnostic events
+    (slow calls, timeouts, retries) are logged to stderr.
+    """
+    use_socket = _mcp_client is not None
+    if not use_socket and _EMACSCLIENT is None:
+        raise EmacsclientNotFoundError("emacsclient not found on PATH")
+
+    _emacsclient_stats["calls"] += 1
+    elisp_preview = elisp[:80].replace("\n", " ")
+    start = time.monotonic()
+
+    async def _run_once(t: float) -> str:
+        if use_socket:
+            assert _mcp_client is not None
+            return await _mcp_client.call(elisp, t)
+        return await _run_emacsclient_once(elisp, t)
+
+    try:
+        result = await _run_once(timeout)
+        elapsed = time.monotonic() - start
+        if elapsed > 5.0:
+            _emacsclient_stats["slow_calls"] += 1
+            _log_diag(
+                f"slow emacsclient call took {elapsed:.1f}s "
+                f"(threshold 5s, timeout {timeout:.0f}s): {elisp_preview!r}"
+            )
+        return result
+    except RuntimeError as first_err:
+        if "timed out" not in str(first_err):
+            # Non-timeout failures (e.g. emacsclient exited non-zero) are
+            # not retried — they reflect a real error from Emacs, not
+            # transient busyness.
+            _emacsclient_stats["errors"] += 1
+            raise
+
+        _emacsclient_stats["timeouts"] += 1
+        _log_diag(
+            f"emacsclient TIMEOUT after {time.monotonic()-start:.1f}s "
+            f"(attempt 1/2); retrying. elisp: {elisp_preview!r}"
+        )
+        # Retry once with the same timeout.
+        try:
+            result = await _run_once(timeout)
+            _emacsclient_stats["retries_succeeded"] += 1
+            _log_diag(
+                f"emacsclient retry SUCCEEDED after "
+                f"{time.monotonic()-start:.1f}s total"
+            )
+            return result
+        except RuntimeError as second_err:
+            _emacsclient_stats["retries_failed"] += 1
+            _log_diag(
+                f"emacsclient retry FAILED after "
+                f"{time.monotonic()-start:.1f}s total. "
+                f"elisp: {elisp_preview!r}. err: {second_err}"
+            )
+            raise
 
 
 def _tool_result(text: str, is_error: bool = False) -> dict[str, Any]:

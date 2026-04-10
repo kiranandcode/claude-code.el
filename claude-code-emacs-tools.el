@@ -293,5 +293,147 @@ Requires `claude-code-frame-render' to be loaded."
       (claude-code-frame-render)
     "error: claude-code-frame-render not loaded"))
 
+;;;; ─────────────────────────────────────────────────────────────────────────
+;;;; Persistent MCP socket server
+;;;;
+;;;; Replaces the per-call `emacsclient' subprocess with a Unix socket that
+;;;; the Python backend connects to once and reuses for every MCP tool call.
+;;;; Eliminates fork/exec overhead and avoids stale-socket-file issues.
+;;;;
+;;;; Wire format: line-delimited JSON.
+;;;;   request:  {"id": "<str>", "elisp": "<form>"}\n
+;;;;   response: {"id": "<str>", "ok": true, "result": <any>}\n
+;;;;             {"id": "<str>", "ok": false, "error": "<msg>"}\n
+;;;;
+;;;; The server is single-shared per Emacs instance.  Multiple Python
+;;;; backends (one per Claude session buffer) all connect to the same socket.
+;;;; ─────────────────────────────────────────────────────────────────────────
+
+(require 'json)
+
+(defvar claude-code-tools--mcp-socket-process nil
+  "The listening server process, or nil if not running.")
+
+(defvar claude-code-tools--mcp-socket-path nil
+  "Filesystem path of the Unix socket the server is listening on.")
+
+(defun claude-code-tools--mcp-socket-default-path ()
+  "Return the default socket path for this Emacs instance."
+  (expand-file-name (format "claude-code-mcp-%d.sock" (emacs-pid))
+                    temporary-file-directory))
+
+(defun claude-code-tools-mcp-server-start ()
+  "Start the MCP Unix socket server if not already running.
+Returns the socket path.  Idempotent: a no-op if the server is alive."
+  (if (and claude-code-tools--mcp-socket-process
+           (process-live-p claude-code-tools--mcp-socket-process))
+      claude-code-tools--mcp-socket-path
+    ;; Clean up any stale socket file from a previous (crashed) Emacs.
+    (let ((path (claude-code-tools--mcp-socket-default-path)))
+      (when (file-exists-p path)
+        (ignore-errors (delete-file path)))
+      (setq claude-code-tools--mcp-socket-path path
+            claude-code-tools--mcp-socket-process
+            (make-network-process
+             :name "claude-code-mcp-server"
+             :family 'local
+             :server t
+             :service path
+             :coding 'utf-8-unix
+             :filter #'claude-code-tools--mcp-socket-filter
+             :sentinel #'claude-code-tools--mcp-socket-sentinel
+             :noquery t))
+      path)))
+
+(defun claude-code-tools-mcp-server-stop ()
+  "Stop the MCP socket server and remove the socket file."
+  (interactive)
+  (when (and claude-code-tools--mcp-socket-process
+             (process-live-p claude-code-tools--mcp-socket-process))
+    (delete-process claude-code-tools--mcp-socket-process))
+  (setq claude-code-tools--mcp-socket-process nil)
+  (when (and claude-code-tools--mcp-socket-path
+             (file-exists-p claude-code-tools--mcp-socket-path))
+    (ignore-errors (delete-file claude-code-tools--mcp-socket-path)))
+  (setq claude-code-tools--mcp-socket-path nil))
+
+(defun claude-code-tools--mcp-socket-sentinel (proc event)
+  "Handle EVENT for the MCP server PROC.
+Logs disconnects and cleans up partial-line buffers."
+  (cond
+   ((string-match-p "open" event)
+    nil)  ; new client connection
+   ((string-match-p "deleted" event)
+    nil)  ; orderly client disconnect
+   (t
+    (process-put proc :claude-mcp-buf nil))))
+
+(defun claude-code-tools--mcp-socket-filter (proc data)
+  "Filter for incoming socket data.
+Buffers partial lines per-connection in PROC's plist."
+  (let ((buf (concat (or (process-get proc :claude-mcp-buf) "") data)))
+    (while (string-match "\n" buf)
+      (let ((line (substring buf 0 (match-beginning 0)))
+            (rest (substring buf (match-end 0))))
+        (setq buf rest)
+        (when (and line (not (string-empty-p line)))
+          (claude-code-tools--mcp-handle-request proc line))))
+    (process-put proc :claude-mcp-buf buf)))
+
+(defun claude-code-tools--mcp-handle-request (proc line)
+  "Parse LINE as a JSON request and send a response back to PROC.
+The request format is `{\"id\": <str>, \"elisp\": <form>}'.
+Errors during JSON decoding or evaluation are returned as
+`{\"id\": <id>, \"ok\": false, \"error\": <msg>}'."
+  (let (req-id elisp-str response-alist)
+    (condition-case parse-err
+        (let ((req (json-parse-string line :object-type 'alist)))
+          (setq req-id (alist-get 'id req)
+                elisp-str (alist-get 'elisp req)))
+      (error
+       ;; JSON parse failed — best-effort response with no id
+       (setq response-alist
+             `((id . :null)
+               (ok . :false)
+               (error . ,(format "json parse: %s"
+                                 (error-message-string parse-err)))))))
+    (unless response-alist
+      (setq response-alist
+            (claude-code-tools--mcp-eval-and-encode req-id elisp-str)))
+    (condition-case _err
+        (process-send-string proc
+                             (concat (json-encode response-alist) "\n"))
+      (error nil))))  ; client may have disconnected
+
+(defun claude-code-tools--mcp-eval-and-encode (req-id elisp-str)
+  "Evaluate ELISP-STR and return a response alist for REQ-ID.
+The result is included as a JSON value (string, number, bool, …).
+On error, the alist contains an `error' key instead of `result'."
+  (condition-case eval-err
+      (let* ((form (read elisp-str))
+             (result (eval form t)))
+        ;; json-encode handles strings, numbers, booleans, nil, alists
+        ;; and vectors; for anything else (e.g. cons cells, symbols)
+        ;; fall back to a printed representation.
+        `((id . ,(or req-id ""))
+          (ok . t)
+          (result . ,(claude-code-tools--mcp-jsonable result))))
+    (error
+     `((id . ,(or req-id ""))
+       (ok . :false)
+       (error . ,(error-message-string eval-err))))))
+
+(defun claude-code-tools--mcp-jsonable (value)
+  "Coerce VALUE into something `json-encode' can serialize.
+Strings, numbers, t, nil, vectors, and alists pass through unchanged.
+Symbols and other Lisp objects are converted to their printed form."
+  (cond
+   ((or (stringp value) (numberp value) (vectorp value)) value)
+   ((eq value t) t)
+   ((null value) nil)
+   ((and (consp value) (consp (car value)) (symbolp (caar value)))
+    value)  ; alist — let json-encode handle it
+   (t (format "%s" value))))
+
 (provide 'claude-code-emacs-tools)
 ;;; claude-code-emacs-tools.el ends here

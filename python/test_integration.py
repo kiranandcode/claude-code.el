@@ -48,7 +48,11 @@ def _server_running() -> bool:
 
 
 _SERVER_UP = _server_running()
-pytestmark = pytest.mark.skipif(
+# Marker applied to test classes that need a user-running Emacs server
+# (i.e. they call emacsclient against the user's existing session, not a
+# spawned batch Emacs).  The socket-transport tests below skip this and
+# spawn their own Emacs.
+needs_running_emacs = pytest.mark.skipif(
     not _SERVER_UP,
     reason="Emacs server not running (emacsclient can't connect)",
 )
@@ -77,6 +81,7 @@ async def _teardown_test_buffer() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestEvalEmacsIntegration:
     @pytest.mark.asyncio
     async def test_simple_arithmetic(self) -> None:
@@ -109,6 +114,7 @@ class TestEvalEmacsIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestGetBufferIntegration:
     @pytest.mark.asyncio
     async def test_get_test_buffer(self) -> None:
@@ -149,6 +155,7 @@ class TestGetBufferIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestGetBufferRegionIntegration:
     @pytest.mark.asyncio
     async def test_get_region(self) -> None:
@@ -171,6 +178,7 @@ class TestGetBufferRegionIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestListBuffersIntegration:
     @pytest.mark.asyncio
     async def test_lists_buffers_returns_text(self) -> None:
@@ -187,6 +195,7 @@ class TestListBuffersIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestGetMessagesIntegration:
     @pytest.mark.asyncio
     async def test_returns_string(self) -> None:
@@ -207,6 +216,7 @@ class TestGetMessagesIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestNavigationIntegration:
     @pytest.mark.asyncio
     async def test_switch_to_test_buffer(self) -> None:
@@ -236,6 +246,7 @@ class TestNavigationIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestSearchIntegration:
     @pytest.mark.asyncio
     async def test_search_forward_found(self) -> None:
@@ -288,9 +299,172 @@ class TestSearchIntegration:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+@needs_running_emacs
 class TestGetDebugInfoIntegration:
     @pytest.mark.asyncio
     async def test_returns_string(self) -> None:
         result = await _emacs_get_debug_info.handler({})
         text = result["content"][0]["text"]
         assert isinstance(text, str)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Persistent socket transport — end-to-end against a real Emacs MCP server
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# These tests spin up the Emacs-side socket server in a *separate* batch
+# Emacs subprocess (so they don't depend on the user's running Emacs having
+# the latest claude-code-emacs-tools.el loaded), then exercise the Python
+# `_McpSocketClient` against it end-to-end.
+
+import os
+import subprocess
+from pathlib import Path
+
+from claude_code_backend import _McpSocketClient
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_BATCH_SH = _REPO_ROOT / "emacs-batch.sh"
+_HAS_BATCH_EMACS = _BATCH_SH.exists()
+
+
+def _spawn_emacs_mcp_server() -> tuple[subprocess.Popen[bytes], str]:
+    """Synchronously spawn a batch-Emacs MCP server and wait for the socket.
+
+    Returns (process, socket_path).  Caller is responsible for terminating
+    the process and removing the socket file.
+    """
+    if not _HAS_BATCH_EMACS:
+        pytest.skip("emacs-batch.sh not found")
+
+    sock_path = f"/tmp/cc-mcp-integ-{os.getpid()}.sock"
+    if os.path.exists(sock_path):
+        os.unlink(sock_path)
+
+    elisp = (
+        f'(progn '
+        f'(load-file "{_REPO_ROOT}/claude-code-emacs-tools.el") '
+        f'(require (quote cl-lib)) '
+        f'(cl-letf (((symbol-function (quote claude-code-tools--mcp-socket-default-path)) '
+        f'(lambda () "{sock_path}"))) '
+        f'(claude-code-tools-mcp-server-start)) '
+        f'(sleep-for 60) '
+        f'(claude-code-tools-mcp-server-stop))'
+    )
+    proc = subprocess.Popen(
+        [str(_BATCH_SH), "--eval", elisp],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=str(_REPO_ROOT),
+    )
+    # Wait synchronously for the socket file to appear
+    import time as _time
+    deadline = _time.time() + 8.0
+    while _time.time() < deadline:
+        if os.path.exists(sock_path):
+            return proc, sock_path
+        if proc.poll() is not None:
+            out, err = proc.communicate()
+            pytest.skip(
+                f"emacs MCP server died early (rc={proc.returncode}): "
+                f"stdout={out.decode()[:300]!r} stderr={err.decode()[:300]!r}"
+            )
+        _time.sleep(0.05)
+    proc.kill()
+    out, err = proc.communicate()
+    pytest.skip(
+        f"emacs MCP server failed to create socket in 8s. "
+        f"stdout={out.decode()[:300]!r} stderr={err.decode()[:300]!r}"
+    )
+    raise RuntimeError("unreachable")  # for mypy
+
+
+class TestSocketTransportIntegration:
+    """End-to-end tests against a real (batch-mode) Emacs MCP server."""
+
+    @pytest.mark.asyncio
+    async def test_eval_through_socket(self) -> None:
+        proc, sock_path = _spawn_emacs_mcp_server()
+        client = _McpSocketClient(sock_path)
+        try:
+            result = await client.call("(+ 21 21)", timeout=5.0)
+            assert result == "42"
+        finally:
+            await client.close()
+            proc.kill()
+            proc.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_string_result_through_socket(self) -> None:
+        proc, sock_path = _spawn_emacs_mcp_server()
+        client = _McpSocketClient(sock_path)
+        try:
+            result = await client.call('(concat "hello" " " "world")', timeout=5.0)
+            assert result == "hello world"
+        finally:
+            await client.close()
+            proc.kill()
+            proc.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_eval_error_through_socket(self) -> None:
+        proc, sock_path = _spawn_emacs_mcp_server()
+        client = _McpSocketClient(sock_path)
+        try:
+            with pytest.raises(RuntimeError, match="emacs eval failed"):
+                await client.call("(/ 1 0)", timeout=5.0)
+        finally:
+            await client.close()
+            proc.kill()
+            proc.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_persistent_connection_handles_many_calls(self) -> None:
+        """One connection, many sequential calls — should never reconnect."""
+        proc, sock_path = _spawn_emacs_mcp_server()
+        client = _McpSocketClient(sock_path)
+        try:
+            for i in range(20):
+                result = await client.call(f"(+ {i} 1)", timeout=5.0)
+                assert result == str(i + 1)
+        finally:
+            await client.close()
+            proc.kill()
+            proc.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_emacs_tools_eval_through_socket(self) -> None:
+        """Full path: claude-code-tools-eval wrapper invoked via socket."""
+        proc, sock_path = _spawn_emacs_mcp_server()
+        client = _McpSocketClient(sock_path)
+        try:
+            result = await client.call(
+                '(claude-code-tools-eval "(+ 21 21)")', timeout=5.0,
+            )
+            assert "42" in result
+            assert "ok" in result.lower()
+        finally:
+            await client.close()
+            proc.kill()
+            proc.wait(timeout=5)
+
+    @pytest.mark.asyncio
+    async def test_run_emacsclient_uses_socket_when_env_set(self) -> None:
+        """`_run_emacsclient` routes through the socket when `_mcp_client` is set."""
+        from claude_code_backend import _run_emacsclient
+        import claude_code_backend as backend
+
+        proc, sock_path = _spawn_emacs_mcp_server()
+        original_client = backend._mcp_client
+        backend._mcp_client = _McpSocketClient(sock_path)
+        try:
+            result = await _run_emacsclient(
+                '(claude-code-tools-eval "(+ 100 1)")', timeout=5.0,
+            )
+            assert "101" in result
+        finally:
+            await backend._mcp_client.close()
+            backend._mcp_client = original_client
+            proc.kill()
+            proc.wait(timeout=5)

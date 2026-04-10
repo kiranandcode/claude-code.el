@@ -17,4 +17,5 @@ dev = [
     "mypy",
     "pytest",
     "pytest-asyncio",
+    "pytest-cov>=7.1.0",
 ]

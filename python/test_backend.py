@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from typing import Any
 from unittest.mock import patch
 
@@ -61,6 +63,7 @@ from claude_code_backend import (
     _emacs_search_backward,
     _emacs_goto_line,
     _run_emacsclient,
+    _McpSocketClient,
     _tool_result,
     EmacsclientNotFoundError,
     _EMACS_MCP_SERVER,
@@ -1250,6 +1253,319 @@ class TestEmacsGetDebugInfo:
 class TestRunEmacsclient:
     @pytest.mark.asyncio
     async def test_emacsclient_not_found(self) -> None:
-        with patch("claude_code_backend._EMACSCLIENT", None):
+        with patch("claude_code_backend._EMACSCLIENT", None), \
+             patch("claude_code_backend._mcp_client", None):
             with pytest.raises(EmacsclientNotFoundError):
                 await _run_emacsclient("(+ 1 1)")
+
+    @pytest.mark.asyncio
+    async def test_retry_on_timeout_succeeds(self) -> None:
+        """First call times out, second call succeeds — retry path."""
+        call_count = 0
+
+        async def fake_once(elisp: str, timeout: float) -> str:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("emacsclient timed out after 15s")
+            return "ok: 42"
+
+        with patch("claude_code_backend._mcp_client", None), \
+             patch("claude_code_backend._run_emacsclient_once", side_effect=fake_once):
+            stats_before = _be._emacsclient_stats.copy()
+            result = await _run_emacsclient("(+ 21 21)")
+            assert result == "ok: 42"
+            assert call_count == 2
+            assert (_be._emacsclient_stats["timeouts"] >
+                    stats_before["timeouts"])
+            assert (_be._emacsclient_stats["retries_succeeded"] >
+                    stats_before["retries_succeeded"])
+
+    @pytest.mark.asyncio
+    async def test_retry_on_timeout_double_failure(self) -> None:
+        """Both attempts time out — caller sees the failure."""
+        async def fake_once(elisp: str, timeout: float) -> str:
+            raise RuntimeError("emacsclient timed out after 15s")
+
+        with patch("claude_code_backend._mcp_client", None), \
+             patch("claude_code_backend._run_emacsclient_once", side_effect=fake_once):
+            stats_before = _be._emacsclient_stats.copy()
+            with pytest.raises(RuntimeError, match="timed out"):
+                await _run_emacsclient("(+ 1 1)")
+            assert (_be._emacsclient_stats["retries_failed"] >
+                    stats_before["retries_failed"])
+
+    @pytest.mark.asyncio
+    async def test_non_timeout_error_not_retried(self) -> None:
+        """Real Emacs errors propagate immediately without retry."""
+        call_count = 0
+
+        async def fake_once(elisp: str, timeout: float) -> str:
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("emacsclient exited 1: Symbol's value as variable is void")
+
+        with patch("claude_code_backend._mcp_client", None), \
+             patch("claude_code_backend._run_emacsclient_once", side_effect=fake_once):
+            stats_before = _be._emacsclient_stats.copy()
+            with pytest.raises(RuntimeError, match="void"):
+                await _run_emacsclient("foo")
+            assert call_count == 1   # no retry
+            assert (_be._emacsclient_stats["errors"] >
+                    stats_before["errors"])
+
+    @pytest.mark.asyncio
+    async def test_slow_call_logged(self) -> None:
+        """A successful call slower than 5s increments slow_calls."""
+        async def slow_once(elisp: str, timeout: float) -> str:
+            await asyncio.sleep(0)  # not actually slow — we patch time.monotonic
+            return "ok"
+
+        # Fake time so the call appears to take 6s
+        times = iter([100.0, 106.0, 106.0, 106.0])
+        with patch("claude_code_backend._mcp_client", None), \
+             patch("claude_code_backend._run_emacsclient_once", side_effect=slow_once), \
+             patch("claude_code_backend.time.monotonic", side_effect=lambda: next(times)):
+            stats_before = _be._emacsclient_stats.copy()
+            await _run_emacsclient("(+ 1 1)")
+            assert (_be._emacsclient_stats["slow_calls"] >
+                    stats_before["slow_calls"])
+
+    @pytest.mark.asyncio
+    async def test_routes_through_mcp_client_when_set(self) -> None:
+        """When _mcp_client is non-None, _run_emacsclient uses it instead of subprocess."""
+        from claude_code_backend import _McpSocketClient
+
+        called: list[str] = []
+
+        class FakeClient:
+            async def call(self, elisp: str, timeout: float) -> str:
+                called.append(elisp)
+                return "from-socket"
+
+        with patch("claude_code_backend._mcp_client", FakeClient()):
+            result = await _run_emacsclient("(+ 1 1)")
+            assert result == "from-socket"
+            assert called == ["(+ 1 1)"]
+
+
+class TestLogDiag:
+    def test_log_diag_writes_to_stderr(self, capsys: Any) -> None:
+        from claude_code_backend import _log_diag
+        _log_diag("hello world")
+        captured = capsys.readouterr()
+        assert "[claude-code-backend]" in captured.err
+        assert "hello world" in captured.err
+
+    def test_log_diag_swallows_errors(self) -> None:
+        """If stderr write fails, _log_diag must not raise."""
+        from claude_code_backend import _log_diag
+        with patch.object(sys, "stderr") as fake_stderr:
+            fake_stderr.write.side_effect = OSError("disk full")
+            _log_diag("test")  # must not raise
+
+
+class TestEmacsclientStats:
+    def test_stats_dict_has_expected_keys(self) -> None:
+        from claude_code_backend import _emacsclient_stats
+        for key in ("calls", "timeouts", "errors", "slow_calls",
+                    "retries_succeeded", "retries_failed"):
+            assert key in _emacsclient_stats
+            assert isinstance(_emacsclient_stats[key], int)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# _McpSocketClient — persistent Unix-socket transport
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestMcpSocketClient:
+    """Unit tests for the persistent socket client.
+
+    Each test spins up an in-process echo server using `asyncio.start_unix_server`
+    so we don't need a live Emacs.  The fake server speaks the same line-
+    delimited JSON protocol as `claude-code-tools--mcp-handle-request`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_simple_request_response(self) -> None:
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-1.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        received: list[dict[str, Any]] = []
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            line = await reader.readline()
+            req = json.loads(line.decode())
+            received.append(req)
+            response = {"id": req["id"], "ok": True, "result": "42"}
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            result = await client.call("(+ 21 21)", timeout=5.0)
+            assert result == "42"
+            assert received[0]["elisp"] == "(+ 21 21)"
+            assert received[0]["id"].startswith("req-")
+        finally:
+            await client.close()
+            server.close()
+            os.unlink(sock_path) if os.path.exists(sock_path) else None
+
+    @pytest.mark.asyncio
+    async def test_eval_error_raises(self) -> None:
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-2.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            line = await reader.readline()
+            req = json.loads(line.decode())
+            response = {"id": req["id"], "ok": False, "error": "void-function foo"}
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            with pytest.raises(RuntimeError, match="void-function"):
+                await client.call("(foo)", timeout=5.0)
+        finally:
+            await client.close()
+            server.close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+    @pytest.mark.asyncio
+    async def test_non_string_result_serialized(self) -> None:
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-3.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            line = await reader.readline()
+            req = json.loads(line.decode())
+            response = {"id": req["id"], "ok": True, "result": 42}
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            result = await client.call("42", timeout=5.0)
+            assert result == "42"
+        finally:
+            await client.close()
+            server.close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+    @pytest.mark.asyncio
+    async def test_connection_refused_raises(self) -> None:
+        sock_path = f"/tmp/cc-mcp-no-such-{os.getpid()}.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        client = _McpSocketClient(sock_path)
+        with pytest.raises(RuntimeError, match="mcp socket failed"):
+            await client.call("(+ 1 1)", timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_request_serialization_via_lock(self) -> None:
+        """Concurrent calls are serialized; each gets its own response."""
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-4.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        seen: list[str] = []
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                req = json.loads(line.decode())
+                seen.append(req["id"])
+                await asyncio.sleep(0.05)
+                response = {"id": req["id"], "ok": True, "result": req["elisp"]}
+                writer.write((json.dumps(response) + "\n").encode())
+                await writer.drain()
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            results = await asyncio.gather(
+                client.call("a", timeout=5.0),
+                client.call("b", timeout=5.0),
+                client.call("c", timeout=5.0),
+            )
+            assert sorted(results) == ["a", "b", "c"]
+            assert len(set(seen)) == 3
+        finally:
+            await client.close()
+            server.close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+    @pytest.mark.asyncio
+    async def test_timeout_disconnects(self) -> None:
+        """A timeout drops the connection so the next request gets a fresh slate."""
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-5.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            # Read but never reply — forces a timeout on the client
+            await reader.readline()
+            await asyncio.sleep(10)
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            with pytest.raises(RuntimeError, match="timed out"):
+                await client.call("(+ 1 1)", timeout=0.2)
+            # Connection should have been dropped after the timeout
+            assert client._writer is None
+        finally:
+            await client.close()
+            server.close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+    @pytest.mark.asyncio
+    async def test_reconnects_after_server_closes(self) -> None:
+        """If the server closes the connection mid-call, client reconnects on retry."""
+        sock_path = f"/tmp/cc-mcp-test-{os.getpid()}-6.sock"
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        call_count = 0
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            nonlocal call_count
+            line = await reader.readline()
+            if not line:
+                return
+            call_count += 1
+            req = json.loads(line.decode())
+            if call_count == 1:
+                # First call: close immediately without responding
+                writer.close()
+                return
+            response = {"id": req["id"], "ok": True, "result": "ok"}
+            writer.write((json.dumps(response) + "\n").encode())
+            await writer.drain()
+
+        server = await asyncio.start_unix_server(handle, path=sock_path)
+        client = _McpSocketClient(sock_path)
+        try:
+            # First call: server closes, client raises empty-response error.
+            with pytest.raises(RuntimeError):
+                await client.call("(+ 1 1)", timeout=2.0)
+            # Second call: fresh connection, succeeds.
+            result = await client.call("(+ 2 2)", timeout=2.0)
+            assert result == "ok"
+        finally:
+            await client.close()
+            server.close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)

@@ -14,6 +14,7 @@
 (declare-function claude-code--schedule-render "claude-code-events")
 (declare-function claude-code--agent-update "claude-code-agents")
 (declare-function claude-code--stop-thinking "claude-code-render")
+(declare-function claude-code-tools-mcp-server-start "claude-code-emacs-tools")
 
 (defun claude-code--python-dir ()
   "Return the path to the python/ subdirectory."
@@ -75,15 +76,33 @@ virtual environment does not exist yet."
 
 (defun claude-code--start-process ()
   "Start the Python backend process.
-Ensures the Python environment is set up before launching."
+Ensures the Python environment is set up before launching, and starts
+the persistent MCP socket server so the backend can reach Emacs without
+forking `emacsclient' for every tool call."
   (claude-code--ensure-environment)
   (when (and claude-code--process
              (process-live-p claude-code--process))
     (delete-process claude-code--process))
-  ;; Do NOT clear claude-code--session-id here.  The backend's handle_query
-  ;; already retries without resume on failure, so a stale ID is safe and
-  ;; preserving it lets claude-code-reload resume the conversation.
-  (let* ((default-directory (expand-file-name "python/" claude-code--package-dir))
+  ;; Start (or reuse) the persistent MCP socket server and pass its path
+  ;; to the Python backend via env var.  Falls back gracefully to the
+  ;; emacsclient subprocess transport if the server can't start.
+  (let* ((mcp-socket-path
+          (condition-case err
+              (claude-code-tools-mcp-server-start)
+            (error
+             (message "claude-code: MCP socket server failed to start (%s); \
+falling back to emacsclient" (error-message-string err))
+             nil)))
+         (process-environment
+          (if mcp-socket-path
+              (cons (format "CLAUDE_CODE_MCP_SOCKET=%s" mcp-socket-path)
+                    process-environment)
+            process-environment))
+         ;; Do NOT clear claude-code--session-id here.  The backend's
+         ;; handle_query already retries without resume on failure, so a
+         ;; stale ID is safe and preserving it lets claude-code-reload
+         ;; resume the conversation.
+         (default-directory (expand-file-name "python/" claude-code--package-dir))
          (buf (current-buffer))
          (proc (make-process
                 :name (format "claude-sdk-%s" (buffer-name buf))
