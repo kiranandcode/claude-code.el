@@ -19,20 +19,50 @@ import threading
 import time
 import traceback
 
-# ---------------------------------------------------------------------------
-# Debug file logger — writes to /tmp/claude-code-backend.log
-# Enable with:  CLAUDE_CODE_DEBUG=1   (env var in claude-code-process.el or shell)
-# Then tail /tmp/claude-code-backend.log to observe MCP/streaming behaviour.
-# ---------------------------------------------------------------------------
-_log = logging.getLogger("claude_code_backend")
-if not _log.handlers:
-    _fh = logging.FileHandler("/tmp/claude-code-backend.log")
-    _fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    _log.addHandler(_fh)
-    _log.setLevel(logging.DEBUG if os.environ.get("CLAUDE_CODE_DEBUG") else logging.WARNING)
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, cast
+import logging.handlers as _logging_handlers
+
+
+# ---------------------------------------------------------------------------
+# Always-on diagnostic logger.
+#
+# Writes everything DEBUG-and-above to a per-process rotating log file at
+# /tmp/claude-code-backend-<pid>.log (5 MB × 3 backups), and everything
+# WARNING-and-above to stderr (which Emacs's process filter routes to
+# *Messages* with a "Claude SDK:" prefix).
+#
+# Tail the file with `tail -F /tmp/claude-code-backend-*.log' from a shell
+# while reproducing the bug, then send the relevant slice for diagnosis.
+# ---------------------------------------------------------------------------
+_LOG_PATH = os.path.join(
+    os.environ.get("TMPDIR", "/tmp").rstrip("/"),
+    f"claude-code-backend-{os.getpid()}.log",
+)
+_log = logging.getLogger("claude_code_backend")
+if not _log.handlers:
+    _log.setLevel(logging.DEBUG)
+    _log.propagate = False
+    try:
+        _fh = _logging_handlers.RotatingFileHandler(
+            _LOG_PATH, maxBytes=5_000_000, backupCount=3, encoding="utf-8",
+        )
+        _fh.setLevel(logging.DEBUG)
+        _fh.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        _log.addHandler(_fh)
+    except Exception:  # pragma: no cover - filesystem permission issues
+        pass
+    _sh = logging.StreamHandler(sys.stderr)
+    _sh.setLevel(logging.WARNING)
+    _sh.setFormatter(logging.Formatter("[claude-code-backend] %(levelname)s: %(message)s"))
+    _log.addHandler(_sh)
+    _log.info("=" * 60)
+    _log.info("backend startup pid=%d log=%s", os.getpid(), _LOG_PATH)
+    _log.info("=" * 60)
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -601,6 +631,8 @@ EMACS_TOOL_NAMES: list[str] = [
     "EmacsSearchForward",
     "EmacsSearchBackward",
     "EmacsGotoLine",
+    "ClaudeCodeReload",
+    "RestartBackend",
 ]
 
 
@@ -713,6 +745,8 @@ class _McpSocketClient:
     Single global instance.  Auto-connects on first use; reconnects on
     disconnect.  All access is serialised through `_lock` because Emacs
     is single-threaded — there is no point sending concurrent requests.
+    Every operation is logged via the `log` module helpers below so we
+    can diagnose hangs/timeouts/disconnects after the fact.
     """
 
     def __init__(self, path: str) -> None:
@@ -721,19 +755,23 @@ class _McpSocketClient:
         self._writer: asyncio.StreamWriter | None = None
         self._lock = asyncio.Lock()
         self._next_id = 0
+        _log.info("mcp_socket: created client for %s", path)
 
     async def _ensure_connected(self) -> None:
         if self._writer is not None and not self._writer.is_closing():
             return
+        _log.info("mcp_socket: connecting to %s", self.path)
         self._reader, self._writer = await asyncio.open_unix_connection(self.path)
+        _log.info("mcp_socket: connected")
 
     async def _disconnect(self) -> None:
         if self._writer is not None:
+            _log.info("mcp_socket: disconnecting")
             try:
                 self._writer.close()
                 await self._writer.wait_closed()
-            except Exception:
-                pass
+            except Exception as e:
+                _log.warning("mcp_socket: error during disconnect: %s", e)
         self._reader = None
         self._writer = None
 
@@ -749,10 +787,16 @@ class _McpSocketClient:
         Raises RuntimeError on timeout, eval-error response, or socket
         failure (after one reconnect attempt).
         """
+        elisp_preview = elisp[:120].replace("\n", " ")
         async with self._lock:
             self._next_id += 1
             req_id = f"req-{self._next_id}"
             payload = json.dumps({"id": req_id, "elisp": elisp}) + "\n"
+            _log.info(
+                "mcp_socket: call[%s] (timeout=%.0fs) elisp=%r",
+                req_id, timeout, elisp_preview,
+            )
+            t0 = time.monotonic()
 
             for attempt in (1, 2):
                 try:
@@ -760,23 +804,41 @@ class _McpSocketClient:
                     assert self._writer is not None and self._reader is not None
                     self._writer.write(payload.encode("utf-8"))
                     await self._writer.drain()
+                    _log.debug("mcp_socket: call[%s] write+drain done", req_id)
                     with anyio.fail_after(timeout):
                         line = await self._reader.readline()
+                    elapsed = time.monotonic() - t0
                     if not line:
+                        _log.warning(
+                            "mcp_socket: call[%s] EMPTY response after %.2fs (server closed)",
+                            req_id, elapsed,
+                        )
                         raise RuntimeError("mcp socket: empty response (closed)")
                     response = json.loads(line.decode("utf-8"))
                     if response.get("ok") is True:
                         result = response.get("result")
-                        # Coerce non-string results to JSON for caller compat
+                        _log.info(
+                            "mcp_socket: call[%s] OK in %.2fs (result=%d chars)",
+                            req_id, elapsed,
+                            len(result) if isinstance(result, str)
+                                       else len(json.dumps(result)),
+                        )
                         return result if isinstance(result, str) else json.dumps(result)
                     error_msg = response.get("error", "unknown")
+                    _log.warning(
+                        "mcp_socket: call[%s] EVAL_ERR in %.2fs: %s",
+                        req_id, elapsed, error_msg,
+                    )
                     raise RuntimeError(f"emacs eval failed: {error_msg}")
                 except TimeoutError:
+                    elapsed = time.monotonic() - t0
+                    _log.error(
+                        "mcp_socket: call[%s] TIMEOUT after %.2fs (limit %.0fs)",
+                        req_id, elapsed, timeout,
+                    )
                     # IMPORTANT: TimeoutError is a subclass of OSError in
                     # Python 3.11+, so this clause MUST come before the
                     # OSError clause below or it will be swallowed.
-                    # Drop the connection — the response we abandoned would
-                    # otherwise corrupt the next request/response pairing.
                     await self._disconnect()
                     raise RuntimeError(f"mcp socket timed out after {timeout:.0f}s")
                 except (
@@ -786,14 +848,24 @@ class _McpSocketClient:
                     FileNotFoundError,
                     OSError,
                 ) as e:
+                    elapsed = time.monotonic() - t0
+                    _log.warning(
+                        "mcp_socket: call[%s] %s on attempt %d/2 after %.2fs: %s",
+                        req_id, type(e).__name__, attempt, elapsed, e,
+                    )
                     await self._disconnect()
                     if attempt == 2:
                         raise RuntimeError(f"mcp socket failed: {e}")
-                    _log_diag(
-                        f"mcp socket reconnecting after {type(e).__name__}: {e}"
-                    )
                     continue
-            # Unreachable, but mypy needs an explicit return
+                except Exception as e:
+                    elapsed = time.monotonic() - t0
+                    _log.error(
+                        "mcp_socket: call[%s] UNEXPECTED %s after %.2fs: %s",
+                        req_id, type(e).__name__, elapsed, e,
+                        exc_info=True,
+                    )
+                    await self._disconnect()
+                    raise
             raise RuntimeError("mcp socket: exhausted retries")
 
 
@@ -1303,6 +1375,96 @@ async def _emacs_goto_line(args: dict[str, Any]) -> dict[str, Any]:
         return _tool_result(f"error: {e}", is_error=True)
 
 
+# ── ClaudeCodeReload ───────────────────────────────────────────────────────
+#
+# Self-healing: when the in-session Claude detects that something has
+# gone wonky (stale faces, void functions, "Stream closed" on tool calls,
+# etc.) it can call this tool to reload claude-code.el's source from disk.
+# Auto-detects every claude-code*.el at the package root and re-evaluates
+# them, with error recovery on the keymap variables.
+
+@tool(
+    "ClaudeCodeReload",
+    description=(
+        "Reload claude-code.el's source files from disk in the running "
+        "Emacs.  Auto-detects every claude-code*.el module, re-evaluates "
+        "all of them, and refreshes the active Claude buffers without "
+        "killing in-flight backend processes.  Use this whenever you "
+        "edit a .el file, OR when you suspect the loaded code is stale "
+        "(stale faces, void functions, intermittent MCP failures).  "
+        "Returns a one-line summary like \"claude-code reloaded (N buffer(s))\""
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _emacs_claude_code_reload(_args: dict[str, Any]) -> dict[str, Any]:
+    _log.info("ClaudeCodeReload tool invoked")
+    try:
+        out = await _run_emacsclient("(claude-code-reload)", timeout=30)
+        _log.info("ClaudeCodeReload result: %r", out)
+        return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
+    except Exception as e:
+        _log.error("ClaudeCodeReload failed: %s", e)
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+# ── RestartBackend ─────────────────────────────────────────────────────────
+#
+# Nuclear option: restart the Python backend process entirely.  Useful
+# when the MCP layer is stuck in a state that reload alone can't fix.
+# The current backend is killed, a fresh one is launched, and the SDK
+# session is resumed via the saved session ID so the conversation
+# continues seamlessly.
+
+@tool(
+    "RestartBackend",
+    description=(
+        "Restart the Python backend process for the current Claude "
+        "session.  Use this only when `ClaudeCodeReload' is insufficient "
+        "(e.g. the MCP layer is stuck and tool calls keep failing with "
+        "Stream closed).  The conversation history is preserved and the "
+        "SDK session is resumed.  Note: this tool will likely not return "
+        "a normal result because the very process handling this call is "
+        "the one being restarted — the in-flight tool call will be cut "
+        "off, and you should observe success by trying another tool "
+        "call afterward."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _emacs_restart_backend(_args: dict[str, Any]) -> dict[str, Any]:
+    _log.info("RestartBackend tool invoked")
+    try:
+        # We can't await this — the backend is restarting itself, so
+        # the result will likely never come back.  Fire-and-forget via
+        # emacsclient with a short timeout.
+        elisp = (
+            '(progn '
+            '(let ((bufs (cl-loop for buf being the buffers '
+            'when (with-current-buffer buf '
+            '(eq major-mode (quote claude-code-mode))) '
+            'collect buf))) '
+            '(dolist (b bufs) (with-current-buffer b (claude-code-restart))) '
+            '(format "restarted %d backend(s)" (length bufs))))'
+        )
+        out = await _run_emacsclient(elisp, timeout=15)
+        _log.info("RestartBackend result: %r", out)
+        return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
+    except Exception as e:
+        _log.error("RestartBackend failed: %s", e)
+        return _tool_result(f"error: {e}", is_error=True)
+
+
 # ── Assemble MCP server ────────────────────────────────────────────────────
 
 _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
@@ -1321,6 +1483,8 @@ _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
         _emacs_search_forward,
         _emacs_search_backward,
         _emacs_goto_line,
+        _emacs_claude_code_reload,
+        _emacs_restart_backend,
     ],
 )
 
@@ -1569,29 +1733,56 @@ async def handle_query(cmd: QueryCommand) -> None:
     """Process a query command from Emacs."""
     options = build_options(cmd)
     needs_streaming = _needs_streaming(options)
-    _log.debug(
-        "handle_query: streaming=%s can_use_tool=%s mcp_servers=%s",
+    query_start = time.monotonic()
+    _log.info(
+        "handle_query START: prompt=%r streaming=%s can_use_tool=%s "
+        "ask_tools=%s perm_mode=%s model=%s resume=%s",
+        cmd.prompt[:120].replace("\n", " "),
         needs_streaming,
         options.can_use_tool is not None,
-        list(options.mcp_servers.keys()) if isinstance(options.mcp_servers, dict) else options.mcp_servers,
+        list(cmd.ask_permission_tools or []),
+        options.permission_mode,
+        cmd.model,
+        cmd.resume,
     )
 
     emit(StatusEvent(status="working"))
+    msg_count = 0
 
     try:
         async for message in query(
             prompt=build_prompt(cmd, streaming=needs_streaming),
             options=options,
         ):
+            msg_count += 1
+            _log.debug(
+                "handle_query msg #%d: %s",
+                msg_count, type(message).__name__,
+            )
             event = convert_message(message)
             if event is not None:
                 emit(event)
+        _log.info(
+            "handle_query DONE: %d messages in %.2fs",
+            msg_count, time.monotonic() - query_start,
+        )
     except asyncio.CancelledError:
+        _log.info(
+            "handle_query CANCELLED after %d msgs in %.2fs",
+            msg_count, time.monotonic() - query_start,
+        )
         emit(StatusEvent(status="cancelled"))
         return
     except Exception as e:
+        _log.error(
+            "handle_query EXCEPTION after %d msgs in %.2fs: %s: %s",
+            msg_count, time.monotonic() - query_start,
+            type(e).__name__, e,
+            exc_info=True,
+        )
         # If resume failed, retry without it (stale session ID).
         if cmd.resume is not None:
+            _log.info("handle_query: retrying without resume")
             emit(ErrorEvent(
                 message=f"Resume failed, retrying fresh: {e}",
             ))
@@ -1606,10 +1797,15 @@ async def handle_query(cmd: QueryCommand) -> None:
                     event = convert_message(message)
                     if event is not None:
                         emit(event)
+                _log.info("handle_query: retry succeeded")
             except asyncio.CancelledError:
                 emit(StatusEvent(status="cancelled"))
                 return
             except Exception as e2:
+                _log.error(
+                    "handle_query retry FAILED: %s: %s",
+                    type(e2).__name__, e2, exc_info=True,
+                )
                 emit(ErrorEvent(message=str(e2), detail=traceback.format_exc()))
         else:
             emit(ErrorEvent(message=str(e), detail=traceback.format_exc()))

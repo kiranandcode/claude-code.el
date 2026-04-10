@@ -1024,6 +1024,8 @@ class TestConstants:
         assert "EmacsGetMessages" in EMACS_TOOL_NAMES
         assert "EmacsGetBuffer" in EMACS_TOOL_NAMES
         assert "EmacsListBuffers" in EMACS_TOOL_NAMES
+        assert "ClaudeCodeReload" in EMACS_TOOL_NAMES
+        assert "RestartBackend" in EMACS_TOOL_NAMES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1248,6 +1250,48 @@ class TestEmacsGetDebugInfo:
         with patch("claude_code_backend._run_emacsclient", return_value="debug info"):
             result = await _emacs_get_debug_info.handler({})
         assert result["content"][0]["text"] == "debug info"
+
+
+class TestClaudeCodeReload:
+    @pytest.mark.asyncio
+    async def test_reload_success(self) -> None:
+        from claude_code_backend import _emacs_claude_code_reload
+        with patch("claude_code_backend._run_emacsclient",
+                   return_value="claude-code reloaded (1 buffer)") as mock:
+            result = await _emacs_claude_code_reload.handler({})
+        assert "reloaded" in result["content"][0]["text"]
+        # Should call (claude-code-reload) with a generous timeout
+        call_elisp = mock.call_args[0][0]
+        assert "claude-code-reload" in call_elisp
+
+    @pytest.mark.asyncio
+    async def test_reload_emacsclient_error(self) -> None:
+        from claude_code_backend import _emacs_claude_code_reload
+        with patch("claude_code_backend._run_emacsclient",
+                   side_effect=RuntimeError("emacsclient timed out")):
+            result = await _emacs_claude_code_reload.handler({})
+        assert result.get("is_error") is True
+        assert "timed out" in result["content"][0]["text"]
+
+
+class TestRestartBackend:
+    @pytest.mark.asyncio
+    async def test_restart_success(self) -> None:
+        from claude_code_backend import _emacs_restart_backend
+        with patch("claude_code_backend._run_emacsclient",
+                   return_value="restarted 1 backend(s)") as mock:
+            result = await _emacs_restart_backend.handler({})
+        assert "restarted" in result["content"][0]["text"]
+        call_elisp = mock.call_args[0][0]
+        assert "claude-code-restart" in call_elisp
+
+    @pytest.mark.asyncio
+    async def test_restart_failure(self) -> None:
+        from claude_code_backend import _emacs_restart_backend
+        with patch("claude_code_backend._run_emacsclient",
+                   side_effect=RuntimeError("connection refused")):
+            result = await _emacs_restart_backend.handler({})
+        assert result.get("is_error") is True
 
 
 class TestRunEmacsclient:
