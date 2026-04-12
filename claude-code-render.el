@@ -34,6 +34,7 @@
 (declare-function claude-code-eval-code-block "claude-code-commands")
 (declare-function claude-code-lsp-link--linkify-region "claude-code-lsp-link")
 (declare-function claude-code-xwidget-maybe-add-render-button "claude-code-xwidget")
+(declare-function claude-code-edit-result-maybe-add-button "claude-code-edit-result")
 
 ;;;; Image Rendering Helpers
 
@@ -979,6 +980,9 @@ section is collapsed."
           ;; Add [render] button for HTML/SVG content
           (when (fboundp 'claude-code-xwidget-maybe-add-render-button)
             (claude-code-xwidget-maybe-add-render-button content))
+          ;; Add [edit] button for in-place tool result editing
+          (when (fboundp 'claude-code-edit-result-maybe-add-button)
+            (claude-code-edit-result-maybe-add-button block))
           (insert (propertize (claude-code--indent content 6) 'face face))
           (insert "\n"))))))
 
