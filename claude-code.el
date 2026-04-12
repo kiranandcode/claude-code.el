@@ -39,6 +39,7 @@
 (require 'claude-code-diff)
 (require 'claude-code-render)
 (require 'claude-code-lsp-link)
+(require 'claude-code-xwidget)
 (require 'claude-code-export)
 (require 'claude-code-fork-tree)
 (require 'claude-code-commands)
