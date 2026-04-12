@@ -139,8 +139,14 @@ Falls back to a text chip when not in GUI mode or image display is disabled."
       ;; create the overlay — that only happens when magit-section-hide is
       ;; called explicitly (normally by magit-refresh).  Since we drive
       ;; rendering ourselves we must do this walk after the tree is built.
+      ;; Also applies adaptive collapse overrides from observed UI behaviour.
       (when (and (boundp 'magit-root-section) magit-root-section)
         (cl-labels ((apply-hide (sec)
+          ;; Adaptive override: collapse sections the user rarely reads.
+          (when (and (not (oref sec hidden))
+                     (fboundp 'claude-code-adaptive-default-hidden-p)
+                     (claude-code-adaptive-default-hidden-p sec))
+            (oset sec hidden t))
           (when (oref sec hidden)
             (magit-section-hide sec))
           (dolist (child (oref sec children))

@@ -45,6 +45,7 @@
 (require 'claude-code-dynamic-tools)
 (require 'claude-code-self-heal)
 (require 'claude-code-ambient)
+(require 'claude-code-adaptive)
 (require 'claude-code-project-notes)
 (require 'claude-code-export)
 (require 'claude-code-fork-tree)
