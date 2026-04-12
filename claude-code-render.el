@@ -393,8 +393,11 @@ Always visible at the top of the window regardless of scroll position."
 Must be called immediately after `magit-insert-heading' while point is
 at the start of the section body.  Inserts TEXT at the end of the
 preceding heading line (before its trailing newline) as a clickable
-button with FACE, HELP-ECHO, and ACTION.  This bypasses the magit
-section keymap that `magit-insert-heading' stamps onto heading text."
+button with FACE, HELP-ECHO, and ACTION.
+
+An overlay keymap is used to guarantee that RET and mouse clicks
+activate the button, regardless of any text-property keymap that
+`magit-insert-heading' stamps on the heading line."
   (save-excursion
     (forward-line -1)
     (end-of-line)
@@ -405,7 +408,16 @@ section keymap that `magit-insert-heading' stamps onto heading text."
                         'action    action
                         'help-echo help-echo
                         'face      face
-                        'follow-link t))))
+                        'follow-link t)
+      ;; Overlay keymap takes priority over text-property keymaps,
+      ;; so magit's heading keymap cannot shadow button activation.
+      (let ((ov (make-overlay btn-start (point) nil t nil))
+            (km (make-sparse-keymap)))
+        (define-key km [mouse-1] #'push-button)
+        (define-key km [mouse-2] #'push-button)
+        (define-key km (kbd "RET") #'push-button)
+        (overlay-put ov 'keymap km)
+        (overlay-put ov 'claude-code-button t)))))
 
 (defun claude-code--render-user-msg (msg)
   "Render a user MSG."

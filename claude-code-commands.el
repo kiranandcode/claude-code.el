@@ -1282,9 +1282,10 @@ input.  Edits to queued slots are saved back before moving on."
            (nth new-index claude-code--input-history))))))))
 
 (defun claude-code-return ()
-  "Submit input, open ediff for edit diffs, or toggle section.
+  "Submit input, activate button, open ediff for edit diffs, or toggle section.
 
 In the input area: submit the prompt.
+On a button ([view], [render], [edit], [fork], URL/file link): activate it.
 On a `claude-edit-diff' section: open a side-by-side ediff comparison
   in a new tab (identical to clicking the [ediff] button).
 On a `claude-edit-diff' section that is a Write (no old-string): open
@@ -1296,6 +1297,9 @@ Elsewhere: toggle the magit section at point."
    ((and claude-code--input-marker
          (>= (point) (marker-position claude-code--input-marker)))
     (claude-code-submit-input))
+   ;; Button at point → activate it
+   ((get-text-property (point) 'button)
+    (push-button))
    ;; Edit/Write diff section → open ediff (or file for Write)
    ((when-let* ((sec (magit-current-section))
                 (_ (eq (oref sec type) 'claude-edit-diff))
@@ -1453,6 +1457,14 @@ Self-inserts in the input area."
    (claude-code--pending-permission (claude-code-deny-tool))
    (t (call-interactively #'claude-code-open-notes))))
 
+(defun claude-code-push-button ()
+  "Activate the button at point, or signal an error if there is none.
+Standard Emacs binding for following links (C-c C-o in org-mode, etc.)."
+  (interactive)
+  (if (get-text-property (point) 'button)
+      (push-button)
+    (user-error "No button at point")))
+
 (defun claude-code-key-space ()
   "Self-insert in input area, scroll up in conversation."
   (interactive)
@@ -1504,6 +1516,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "M-n" #'claude-code-next-input
   "C-c n" #'claude-code-annotate
   "C-c i" #'claude-code-attach-image
+  "C-c C-o" #'claude-code-push-button
   "C-y"   #'claude-code-yank-or-paste-image
   "C-w" #'claude-code-kill-region-or-copy
   "<drag-n-drop>" #'claude-code--dnd-handle-drop)

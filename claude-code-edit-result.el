@@ -130,23 +130,16 @@ PARENT-BUF is the Claude conversation buffer."
 
 ;;;; Button helper for render pipeline
 
+(declare-function claude-code--splice-heading-button "claude-code-render")
+
 (defun claude-code-edit-result-maybe-add-button (block)
   "Splice an [edit] button into the current tool-result heading.
 BLOCK is the tool-result alist.  Call after other heading buttons."
   (let ((parent-buf (current-buffer)))
-    (save-excursion
-      (forward-line -1)
-      (end-of-line)
-      (insert "  ")
-      (let ((btn-start (point)))
-        (insert "[edit]")
-        (make-text-button btn-start (point)
-                          'action (lambda (_btn)
-                                    (claude-code-edit-result-open
-                                     block parent-buf))
-                          'help-echo "Edit this tool result"
-                          'face 'claude-code-action-button
-                          'follow-link t)))))
+    (claude-code--splice-heading-button
+     "[edit]" 'claude-code-action-button
+     "Edit this tool result"
+     (lambda (_btn) (claude-code-edit-result-open block parent-buf)))))
 
 (provide 'claude-code-edit-result)
 ;;; claude-code-edit-result.el ends here

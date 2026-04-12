@@ -139,22 +139,16 @@ Requires Emacs compiled with xwidget-webkit support and a graphical frame."
 
 ;;;; Integration with render pipeline
 
+(declare-function claude-code--splice-heading-button "claude-code-render")
+
 (defun claude-code-xwidget-maybe-add-render-button (content)
   "If CONTENT is renderable HTML/SVG, splice a [render] button.
 Call this immediately after `claude-code--splice-heading-button' for [view]."
   (when (claude-code-xwidget--renderable-p content)
-    (save-excursion
-      (forward-line -1)
-      (end-of-line)
-      (insert "  ")
-      (let ((btn-start (point)))
-        (insert "[render]")
-        (make-text-button btn-start (point)
-                          'action (lambda (_btn)
-                                    (claude-code-xwidget--preview content))
-                          'help-echo "Render HTML/SVG in xwidget-webkit"
-                          'face 'claude-code-action-button
-                          'follow-link t)))))
+    (claude-code--splice-heading-button
+     "[render]" 'claude-code-action-button
+     "Render HTML/SVG in xwidget-webkit"
+     (lambda (_btn) (claude-code-xwidget--preview content)))))
 
 (provide 'claude-code-xwidget)
 ;;; claude-code-xwidget.el ends here

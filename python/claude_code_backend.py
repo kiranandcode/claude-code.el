@@ -64,6 +64,39 @@ if not _log.handlers:
     _log.info("backend startup pid=%d log=%s", os.getpid(), _LOG_PATH)
     _log.info("=" * 60)
 
+# ---------------------------------------------------------------------------
+# SDK stream-close timeout override.
+#
+# The Claude Agent SDK closes the CLI subprocess's stdin after it receives the
+# first `result` message, OR after CLAUDE_CODE_STREAM_CLOSE_TIMEOUT elapses
+# (default 60 000 ms) — whichever comes first.  Once stdin is closed, the
+# bundled Node CLI's internal control-protocol transport sets
+# `inputClosed = true`, and any subsequent attempt to send a control request
+# (e.g. `can_use_tool` or an SDK-MCP `tools/call`) throws `Error("Stream
+# closed")`, which the CLI then synthesises into a fake tool_result with the
+# text "Tool permission request failed: Error: Stream closed".
+#
+# In a long agentic turn (many tool calls, subagents, large context), Claude
+# often takes more than 60 seconds to emit its first `result` message — so the
+# SDK's default timeout fires mid-turn, closes stdin, and every MCP tool call
+# from that point on fails with "Stream closed".  This is exactly the
+# intermittent "Stream closed" error we were chasing: built-in tools (Read,
+# Bash, Grep, …) work fine because they run inside the CLI with no control-
+# protocol round trip, but in-process SDK MCP tools (EvalEmacs,
+# EmacsRenderFrame, ClaudeCodeReload, …) all go through the control protocol
+# and break the instant stdin closes.
+#
+# Fix: raise the timeout to 24 hours (effectively "never").  This is safe
+# because `Query._read_messages` sets `_first_result_event` in its `finally`
+# clause when the read loop exits for any reason (CLI exit, error, cancel), so
+# `wait_for_result_and_end_input` will always wake up at the real end of the
+# turn even without the timeout — we just stop closing stdin prematurely while
+# Claude is still working.
+#
+# See: claude_agent_sdk/_internal/query.py:614-630 (`wait_for_result_and_end_input`)
+#      and the bundled CLI's `_O_.inputClosed` check.
+os.environ.setdefault("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT", str(24 * 60 * 60 * 1000))
+
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
@@ -458,12 +491,19 @@ def emit(event: EmitEvent) -> None:
     _stdout_queue.put_nowait(json.dumps(asdict(event), default=str) + "\n")
 
 
-# Error pattern produced by the bundled Claude CLI when its upstream HTTP/2
-# stream to the Anthropic API gets reset mid-tool-call.  The CLI swallows
-# the network failure and synthesizes a fake tool_result with this exact
-# text, which then becomes part of the conversation history visible to the
-# model.  We rewrite it into a clearer, retry-friendly message so the model
-# knows to retry the call rather than treating it as a real tool failure.
+# Error pattern produced by the bundled Claude CLI when it tries to send a
+# control request (permission check or SDK-MCP `tools/call`) after its stdin
+# pipe has been closed by the SDK.  The CLI's internal control-protocol
+# transport (class `_O_`) throws `Error("Stream closed")` whenever
+# `inputClosed === true`, and then the CLI synthesises a fake tool_result
+# with this exact text.
+#
+# With the `CLAUDE_CODE_STREAM_CLOSE_TIMEOUT = 24h` override at the top of
+# this module, stdin should stay open for the whole turn and this error
+# should no longer appear.  We keep the rewriter as a defence-in-depth
+# safety net: if it ever *does* trigger (e.g. if the SDK ever ignores the
+# env var or exits the read loop early), the model sees a retry hint
+# instead of a confusing hard failure, and we log a WARNING so we notice.
 _STREAM_CLOSED_PATTERN = "Tool permission request failed: Error: Stream closed"
 
 
@@ -479,9 +519,8 @@ def _rewrite_stream_closed_error(content: Any) -> tuple[Any, bool]:
             "rewriting CLI 'Stream closed' tool error to retry hint"
         )
         return (
-            "[transient: the upstream Anthropic HTTP stream was closed "
-            "before this tool call could complete.  This is a network/server "
-            "issue, not a real tool failure.  Please retry the same tool call.]",
+            "[transient: CLI stdin was closed before this tool call could "
+            "complete.  Please retry the same tool call.]",
             True,
         )
     if isinstance(content, list):
@@ -497,9 +536,8 @@ def _rewrite_stream_closed_error(content: Any) -> tuple[Any, bool]:
                     new_blocks.append({
                         "type": "text",
                         "text": (
-                            "[transient: upstream Anthropic stream was closed "
-                            "before this tool call completed — please retry "
-                            "the same call.]"
+                            "[transient: CLI stdin was closed before this "
+                            "tool call completed — please retry the same call.]"
                         ),
                     })
                     rewritten = True
