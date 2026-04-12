@@ -3914,5 +3914,438 @@ extends into the input area (which has no magit section)."
             (should (string-match-p "line 9" output))))
       (kill-buffer buf))))
 
+;; ---------------------------------------------------------------------------
+;; Markdown Inline Decoration
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-markdown-bold ()
+  "Bold text gets the bold face and delimiters are hidden."
+  (with-temp-buffer
+    (insert "hello **world** end")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "world")
+    (let* ((pos (1- (point)))
+           (faces (get-text-property pos 'face)))
+      (should (memq 'claude-code-markdown-bold (if (listp faces) faces (list faces)))))
+    ;; Delimiters should be hidden
+    (goto-char (point-min))
+    (search-forward "**")
+    (should (equal (get-text-property (match-beginning 0) 'display) ""))))
+
+(ert-deftest claude-code-test-markdown-italic ()
+  "Italic text gets the italic face."
+  (with-temp-buffer
+    (insert "hello *world* end")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "world")
+    (let* ((pos (1- (point)))
+           (faces (get-text-property pos 'face)))
+      (should (memq 'claude-code-markdown-italic
+                    (if (listp faces) faces (list faces)))))))
+
+(ert-deftest claude-code-test-markdown-inline-code ()
+  "Inline code gets the code face and backticks are hidden."
+  (with-temp-buffer
+    (insert "use `defun` here")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "defun")
+    (let* ((pos (1- (point)))
+           (faces (get-text-property pos 'face)))
+      (should (memq 'claude-code-markdown-code
+                    (if (listp faces) faces (list faces)))))))
+
+(ert-deftest claude-code-test-markdown-strikethrough ()
+  "Strikethrough text gets the strikethrough face."
+  (with-temp-buffer
+    (insert "~~removed~~ kept")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "removed")
+    (let* ((pos (1- (point)))
+           (faces (get-text-property pos 'face)))
+      (should (memq 'claude-code-markdown-strikethrough
+                    (if (listp faces) faces (list faces)))))))
+
+(ert-deftest claude-code-test-markdown-bold-italic ()
+  "***bold italic*** gets the combined face."
+  (with-temp-buffer
+    (insert "***wow*** plain")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "wow")
+    (let* ((pos (1- (point)))
+           (faces (get-text-property pos 'face)))
+      (should (memq 'claude-code-markdown-bold-italic
+                    (if (listp faces) faces (list faces)))))))
+
+(ert-deftest claude-code-test-markdown-mixed-line ()
+  "Multiple markdown styles on the same line."
+  (with-temp-buffer
+    (insert "**bold** and `code` and *italic*")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    ;; Check bold
+    (goto-char (point-min))
+    (search-forward "bold")
+    (should (memq 'claude-code-markdown-bold
+                  (let ((f (get-text-property (1- (point)) 'face)))
+                    (if (listp f) f (list f)))))
+    ;; Check code
+    (search-forward "code")
+    (should (memq 'claude-code-markdown-code
+                  (let ((f (get-text-property (1- (point)) 'face)))
+                    (if (listp f) f (list f)))))
+    ;; Check italic
+    (search-forward "italic")
+    (should (memq 'claude-code-markdown-italic
+                  (let ((f (get-text-property (1- (point)) 'face)))
+                    (if (listp f) f (list f)))))))
+
+(ert-deftest claude-code-test-markdown-no-false-positive ()
+  "Plain asterisks in arithmetic should not be decorated."
+  (with-temp-buffer
+    (insert "2 * 3 * 4 = 24")
+    (claude-code--decorate-markdown-inline (point-min) (point-max))
+    ;; '3' should have no markdown face
+    (goto-char (point-min))
+    (search-forward "3")
+    (let ((f (get-text-property (1- (point)) 'face)))
+      ;; face should be nil or not a markdown face
+      (should-not (and f (memq 'claude-code-markdown-italic
+                               (if (listp f) f (list f))))))))
+
+;; ---------------------------------------------------------------------------
+;; Inline Eval of Emacs Lisp Code Blocks
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-eval-code-block-simple ()
+  "Eval command evaluates elisp and pushes eval-result message."
+  (with-temp-buffer
+    (setq claude-code--messages nil)
+    ;; Simulate a code block region with text properties
+    (insert (propertize "  (+ 1 2)\n"
+                        'claude-code-code-content "(+ 1 2)"
+                        'claude-code-code-lang "emacs-lisp"))
+    (goto-char (point-min))
+    (claude-code-eval-code-block)
+    (should (= (length claude-code--messages) 1))
+    (let ((msg (car claude-code--messages)))
+      (should (equal (alist-get 'type msg) "eval-result"))
+      (should (equal (alist-get 'value msg) "3"))
+      (should-not (alist-get 'errorp msg)))))
+
+(ert-deftest claude-code-test-eval-code-block-error ()
+  "Eval command captures errors in eval-result message."
+  (with-temp-buffer
+    (setq claude-code--messages nil)
+    (insert (propertize "  (error \"boom\")\n"
+                        'claude-code-code-content "(error \"boom\")"
+                        'claude-code-code-lang "emacs-lisp"))
+    (goto-char (point-min))
+    (claude-code-eval-code-block)
+    (should (= (length claude-code--messages) 1))
+    (let ((msg (car claude-code--messages)))
+      (should (equal (alist-get 'type msg) "eval-result"))
+      (should (alist-get 'errorp msg))
+      (should (string-match-p "boom" (alist-get 'value msg))))))
+
+(ert-deftest claude-code-test-eval-code-block-rejects-non-elisp ()
+  "Eval command rejects non-elisp code blocks."
+  (with-temp-buffer
+    (insert (propertize "  print('hi')\n"
+                        'claude-code-code-content "print('hi')"
+                        'claude-code-code-lang "python"))
+    (goto-char (point-min))
+    (should-error (claude-code-eval-code-block) :type 'user-error)))
+
+(ert-deftest claude-code-test-eval-results-collected-for-prompt ()
+  "Unsent eval results are collected and formatted as context."
+  (with-temp-buffer
+    (setq claude-code--eval-results-sent 0)
+    (setq claude-code--messages
+          (list (list (cons 'type "eval-result")
+                      (cons 'code "(+ 1 2)")
+                      (cons 'value "3")
+                      (cons 'errorp nil))
+                (list (cons 'type "eval-result")
+                      (cons 'code "(* 3 4)")
+                      (cons 'value "12")
+                      (cons 'errorp nil))))
+    (let ((ctx (claude-code--collect-eval-results)))
+      (should (stringp ctx))
+      (should (string-match-p "(\\+ 1 2)" ctx))
+      (should (string-match-p ": 3" ctx))
+      ;; Collecting again should return nil (already sent)
+      (should-not (claude-code--collect-eval-results)))))
+
+;; ---------------------------------------------------------------------------
+;; Fringe Indicators
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-fringe-record-touch ()
+  "Recording a touch stores it in the hash table."
+  (let ((claude-code--fringe-touches (make-hash-table :test 'equal)))
+    (claude-code--fringe-record-touch "/tmp/test.el" 'read 1 10)
+    (let ((touches (gethash "/tmp/test.el" claude-code--fringe-touches)))
+      (should (= (length touches) 1))
+      (should (eq (plist-get (car touches) :type) 'read))
+      (should (= (plist-get (car touches) :start-line) 1))
+      (should (= (plist-get (car touches) :end-line) 10)))))
+
+(ert-deftest claude-code-test-fringe-record-from-tool-use ()
+  "Recording from a tool-use block extracts the right type and path."
+  (let ((claude-code--fringe-touches (make-hash-table :test 'equal)))
+    (claude-code--fringe-record-from-tool-use
+     "Read"
+     '((file_path . "/tmp/foo.el") (offset . 10) (limit . 20))
+     "/tmp")
+    (let ((touches (gethash "/tmp/foo.el" claude-code--fringe-touches)))
+      (should (= (length touches) 1))
+      (should (eq (plist-get (car touches) :type) 'read))
+      (should (= (plist-get (car touches) :start-line) 10))
+      (should (= (plist-get (car touches) :end-line) 30)))))
+
+(ert-deftest claude-code-test-fringe-clear-all ()
+  "Clearing all fringe data empties the hash table."
+  (let ((claude-code--fringe-touches (make-hash-table :test 'equal)))
+    (claude-code--fringe-record-touch "/tmp/a.el" 'write 1 5)
+    (claude-code--fringe-record-touch "/tmp/b.el" 'read 1 10)
+    (claude-code-fringe-clear-all)
+    (should (= (hash-table-count claude-code--fringe-touches) 0))))
+
+;; ---------------------------------------------------------------------------
+;; Fork Tree (parent-child linking)
+;; ---------------------------------------------------------------------------
+
+(ert-deftest claude-code-test-fork-agent-root-excludes-children ()
+  "Forked sessions with parent-id are not roots."
+  (let ((claude-code--agents (make-hash-table :test 'equal)))
+    (puthash "root" (list :id "root" :type 'session :parent-id nil
+                          :children '("fork1"))
+             claude-code--agents)
+    (puthash "fork1" (list :id "fork1" :type 'session :parent-id "root"
+                           :fork-point "test prompt" :children nil)
+             claude-code--agents)
+    ;; Root should be root-p
+    (should (claude-code--agent-root-p (gethash "root" claude-code--agents)))
+    ;; Fork should NOT be root-p
+    (should-not (claude-code--agent-root-p (gethash "fork1" claude-code--agents)))
+    ;; Only root in root-ids
+    (should (equal (claude-code--agent-root-ids) '("root")))))
+
+(ert-deftest claude-code-test-code-block-lang-text-property ()
+  "Code blocks store language as a text property."
+  (with-temp-buffer
+    (claude-code--insert-code-block "emacs-lisp" "(message \"hello\")")
+    (goto-char (point-min))
+    ;; Move into the code body (past the fence line)
+    (forward-line 1)
+    (should (equal (get-text-property (point) 'claude-code-code-lang) "emacs-lisp"))
+    (should (equal (get-text-property (point) 'claude-code-code-content)
+                   "(message \"hello\")"))))
+
+;;;; Table parsing and rendering tests
+
+(ert-deftest claude-code-test-table-line-p ()
+  "Markdown table line detection."
+  (should (claude-code--table-line-p "| foo | bar |"))
+  (should (claude-code--table-line-p "|---|---|"))
+  (should (claude-code--table-line-p "  | col1 | col2 |"))
+  (should-not (claude-code--table-line-p "no pipes here"))
+  (should-not (claude-code--table-line-p "| only opening pipe"))
+  (should-not (claude-code--table-line-p "just some | text")))
+
+(ert-deftest claude-code-test-parse-text-blocks-table ()
+  "Tables are parsed as (table . TEXT) segments."
+  (let* ((input "Some prose\n| a | b |\n|---|---|\n| 1 | 2 |\nMore prose")
+         (segments (claude-code--parse-text-blocks input)))
+    (should (= (length segments) 3))
+    (should (eq (car (nth 0 segments)) 'text))
+    (should (string-match-p "Some prose" (cdr (nth 0 segments))))
+    (should (eq (car (nth 1 segments)) 'table))
+    (should (string-match-p "| a | b |" (cdr (nth 1 segments))))
+    (should (string-match-p "| 1 | 2 |" (cdr (nth 1 segments))))
+    (should (eq (car (nth 2 segments)) 'text))
+    (should (string-match-p "More prose" (cdr (nth 2 segments))))))
+
+(ert-deftest claude-code-test-parse-text-blocks-table-only ()
+  "A text block containing only a table yields a single table segment."
+  (let* ((input "| h1 | h2 |\n|---|---|\n| c1 | c2 |")
+         (segments (claude-code--parse-text-blocks input)))
+    (should (= (length segments) 1))
+    (should (eq (car (nth 0 segments)) 'table))))
+
+(ert-deftest claude-code-test-parse-text-blocks-table-then-code ()
+  "A table followed by a code block produces both segments."
+  (let* ((input "| a | b |\n|---|---|\n```elisp\n(+ 1 2)\n```")
+         (segments (claude-code--parse-text-blocks input)))
+    (should (= (length segments) 2))
+    (should (eq (car (nth 0 segments)) 'table))
+    (should (eq (car (nth 1 segments)) 'code))))
+
+(ert-deftest claude-code-test-render-table-inserts-text ()
+  "Rendering a table inserts the table content into the buffer."
+  (with-temp-buffer
+    (let ((claude-code-table-style 'fancy))
+      (claude-code--render-table "| a | b |\n|---|---|\n| 1 | 2 |")
+      (let ((content (buffer-string)))
+        (should (string-match-p "a" content))
+        (should (string-match-p "1" content))
+        ;; Should have the table face applied
+        (goto-char (point-min))
+        (should (memq 'claude-code-markdown-table
+                      (let ((face (get-text-property (point) 'face)))
+                        (if (listp face) face (list face)))))))))
+
+(ert-deftest claude-code-test-heading-face-for-level ()
+  "Each heading level maps to its own face."
+  (should (eq (claude-code--heading-face-for-level 1) 'claude-code-markdown-heading-1))
+  (should (eq (claude-code--heading-face-for-level 2) 'claude-code-markdown-heading-2))
+  (should (eq (claude-code--heading-face-for-level 3) 'claude-code-markdown-heading-3))
+  (should (eq (claude-code--heading-face-for-level 4) 'claude-code-markdown-heading-4))
+  (should (eq (claude-code--heading-face-for-level 5) 'claude-code-markdown-heading-5))
+  (should (eq (claude-code--heading-face-for-level 6) 'claude-code-markdown-heading-6))
+  (should (eq (claude-code--heading-face-for-level 7) 'claude-code-markdown-heading)))
+
+(ert-deftest claude-code-test-decorate-markdown-heading ()
+  "Heading lines get the correct level face and # prefix is hidden."
+  (with-temp-buffer
+    (insert "  # Title\n  ## Section\n  ### Sub\n  Normal text\n")
+    (claude-code--decorate-markdown-heading (point-min) (point-max))
+    ;; H1: "# " should be hidden
+    (goto-char (point-min))
+    (should (re-search-forward "Title" nil t))
+    (should (memq 'claude-code-markdown-heading-1
+                  (let ((face (get-text-property (match-beginning 0) 'face)))
+                    (if (listp face) face (list face)))))
+    ;; H2
+    (goto-char (point-min))
+    (should (re-search-forward "Section" nil t))
+    (should (memq 'claude-code-markdown-heading-2
+                  (let ((face (get-text-property (match-beginning 0) 'face)))
+                    (if (listp face) face (list face)))))
+    ;; H3
+    (goto-char (point-min))
+    (should (re-search-forward "Sub" nil t))
+    (should (memq 'claude-code-markdown-heading-3
+                  (let ((face (get-text-property (match-beginning 0) 'face)))
+                    (if (listp face) face (list face)))))
+    ;; Normal text should not have any heading face
+    (goto-char (point-min))
+    (should (re-search-forward "Normal text" nil t))
+    (let ((face (get-text-property (match-beginning 0) 'face)))
+      (should-not (and face
+                       (or (memq 'claude-code-markdown-heading (if (listp face) face (list face)))
+                           (memq 'claude-code-markdown-heading-1 (if (listp face) face (list face)))))))))
+
+(ert-deftest claude-code-test-table-separator-line-p ()
+  "Separator lines are correctly detected."
+  (should (claude-code--table-separator-line-p "|---|---|"))
+  (should (claude-code--table-separator-line-p "| --- | --- |"))
+  (should (claude-code--table-separator-line-p "|:---:|---:|"))
+  (should (claude-code--table-separator-line-p "  |---|---|"))
+  (should-not (claude-code--table-separator-line-p "| data | here |"))
+  (should-not (claude-code--table-separator-line-p "no pipes")))
+
+(ert-deftest claude-code-test-render-table-fancy-header ()
+  "Fancy table: header gets header face, data rows get zebra faces."
+  (let ((claude-code-table-style 'fancy))
+    (with-temp-buffer
+      (claude-code--render-table "| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bob | 25 |")
+      (let ((content (buffer-string)))
+        (should (string-match-p "Name" content))
+        (should (string-match-p "Alice" content))
+        ;; Separator rule character
+        (should (string-match-p "─" content)))
+      ;; Header row should have the header face
+      (goto-char (point-min))
+      (should (re-search-forward "Name" nil t))
+      (should (memq 'claude-code-markdown-table-header
+                    (let ((face (get-text-property (match-beginning 0) 'face)))
+                      (if (listp face) face (list face)))))
+      ;; First data row (even) should have even face
+      (goto-char (point-min))
+      (should (re-search-forward "Alice" nil t))
+      (should (memq 'claude-code-markdown-table-row-even
+                    (let ((face (get-text-property (match-beginning 0) 'face)))
+                      (if (listp face) face (list face)))))
+      ;; Second data row (odd) should have odd face
+      (goto-char (point-min))
+      (should (re-search-forward "Bob" nil t))
+      (should (memq 'claude-code-markdown-table-row-odd
+                    (let ((face (get-text-property (match-beginning 0) 'face)))
+                      (if (listp face) face (list face))))))))
+
+(ert-deftest claude-code-test-render-table-header-face-plain ()
+  "Plain table: header row gets bold face, separator gets dimmed face."
+  (let ((claude-code-table-style 'plain))
+    (with-temp-buffer
+      (claude-code--render-table "| Head1 | Head2 |\n|---|---|\n| d1 | d2 |")
+      (goto-char (point-min))
+      (should (re-search-forward "Head1" nil t))
+      (should (memq 'claude-code-markdown-table-header
+                    (let ((face (get-text-property (match-beginning 0) 'face)))
+                      (if (listp face) face (list face)))))
+      (goto-char (point-min))
+      (should (re-search-forward "---" nil t))
+      (should (memq 'claude-code-markdown-table-separator
+                    (let ((face (get-text-property (match-beginning 0) 'face)))
+                      (if (listp face) face (list face))))))))
+
+(ert-deftest claude-code-test-table-parse-cells ()
+  "Cells are correctly parsed from a pipe-delimited line."
+  (should (equal (claude-code--table-parse-cells "| a | b | c |")
+                 '("a" "b" "c")))
+  (should (equal (claude-code--table-parse-cells "|  foo  |  bar  |")
+                 '("foo" "bar")))
+  (should (equal (claude-code--table-parse-cells "| single |")
+                 '("single"))))
+
+(ert-deftest claude-code-test-table-compute-widths ()
+  "Column widths are the max display width across all rows."
+  (should (equal (claude-code--table-compute-widths
+                  '(("a" "bb") ("ccc" "d")))
+                 '(3 2)))
+  (should (equal (claude-code--table-compute-widths
+                  '(("x")))
+                 '(1))))
+
+(ert-deftest claude-code-test-render-table-fancy-no-separator ()
+  "Fancy table without separator treats all rows as data (no header face)."
+  (let ((claude-code-table-style 'fancy))
+    (with-temp-buffer
+      (claude-code--render-table "| a | b |\n| c | d |")
+      (let ((content (buffer-string)))
+        ;; No horizontal rule since no separator
+        (should-not (string-match-p "─" content)))
+      ;; First row should NOT have header face (it's data)
+      (goto-char (point-min))
+      (should (re-search-forward "a" nil t))
+      (should-not (memq 'claude-code-markdown-table-header
+                        (let ((face (get-text-property (match-beginning 0) 'face)))
+                          (if (listp face) face (list face))))))))
+
+(ert-deftest claude-code-test-image-file-p ()
+  "Image extensions are recognized."
+  (should (claude-code--image-file-p "photo.png"))
+  (should (claude-code--image-file-p "photo.JPG"))
+  (should (claude-code--image-file-p "anim.gif"))
+  (should (claude-code--image-file-p "modern.webp"))
+  (should-not (claude-code--image-file-p "readme.txt"))
+  (should-not (claude-code--image-file-p "code.el"))
+  (should-not (claude-code--image-file-p "noext")))
+
+(ert-deftest claude-code-test-yank-or-paste-image-no-clipboard ()
+  "When clipboard has no image, yank-or-paste-image falls through to yank."
+  ;; Should not error even with no clipboard image
+  (with-temp-buffer
+    (insert "hello")
+    (kill-new "world")
+    ;; Not in a claude-code buffer so input-area-p is nil → should just yank
+    (claude-code-yank-or-paste-image)
+    (should (string-match-p "world" (buffer-string)))))
+
 (provide 'claude-code-test)
 ;;; claude-code-test.el ends here

@@ -81,6 +81,17 @@ Possible values:
                  (const :tag "None (buffer default / monospace)" nil))
   :group 'claude-code)
 
+(defcustom claude-code-table-style 'fancy
+  "Style for rendering markdown tables in Claude conversation buffers.
+
+Possible values:
+  `fancy' — Emacs text-property styled table with coloured backgrounds,
+            zebra-striped rows, and invisible delimiters (default).
+  `plain' — original markdown pipe-and-dash format."
+  :type '(choice (const :tag "Fancy (text-property styled)" fancy)
+                 (const :tag "Plain markdown pipes" plain))
+  :group 'claude-code)
+
 (defcustom claude-code-show-thinking nil
   "Whether thinking blocks are expanded by default."
   :type 'boolean
@@ -262,6 +273,21 @@ from regular built-in tools (Read, Write, Bash, …)."
   "Status messages."
   :group 'claude-code)
 
+(defface claude-code-eval-result
+  '((t :inherit font-lock-constant-face))
+  "Inline eval result from executing an Emacs Lisp code block."
+  :group 'claude-code)
+
+(defface claude-code-eval-error
+  '((t :inherit error))
+  "Error from inline eval of an Emacs Lisp code block."
+  :group 'claude-code)
+
+(defface claude-code-eval-button
+  '((t :inherit shadow))
+  "The [eval] button on Emacs Lisp code blocks."
+  :group 'claude-code)
+
 (defface claude-code-file-link
   '((t :inherit link))
   "Clickable file paths."
@@ -332,6 +358,109 @@ from regular built-in tools (Read, Write, Bash, …)."
 (defface claude-code-confirm-separator
   '((t :inherit claude-code-separator))
   "Separator lines around the confirmation widget."
+  :group 'claude-code)
+
+(defface claude-code-markdown-bold
+  '((t :weight bold))
+  "Face for **bold** markdown text in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-italic
+  '((t :slant italic))
+  "Face for *italic* markdown text in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-bold-italic
+  '((t :weight bold :slant italic))
+  "Face for ***bold italic*** markdown text in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-code
+  '((((class color) (background dark))  :background "#2a2a3a" :inherit fixed-pitch)
+    (((class color) (background light)) :background "#f0f0f0" :inherit fixed-pitch))
+  "Face for inline `code` markdown text in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-strikethrough
+  '((t :strike-through t))
+  "Face for ~~strikethrough~~ markdown text in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading
+  '((t :weight bold :height 1.1))
+  "Default face for heading lines in Claude responses.
+Used as a fallback; level-specific faces are preferred."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-1
+  '((t :weight bold :height 1.5))
+  "Face for # (h1) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-2
+  '((t :weight bold :height 1.35))
+  "Face for ## (h2) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-3
+  '((t :weight bold :height 1.2))
+  "Face for ### (h3) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-4
+  '((t :weight bold :height 1.1))
+  "Face for #### (h4) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-5
+  '((t :weight bold))
+  "Face for ##### (h5) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-heading-6
+  '((t :weight bold :slant italic))
+  "Face for ###### (h6) heading lines in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table-header
+  '((((class color) (background dark))
+     :weight bold :background "#2a2a40" :extend t :inherit fixed-pitch)
+    (((class color) (background light))
+     :weight bold :background "#dde4f0" :extend t :inherit fixed-pitch))
+  "Face for the header row of markdown tables in Claude responses."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table-row-even
+  '((((class color) (background dark))
+     :background "#1e1e2e" :extend t :inherit fixed-pitch)
+    (((class color) (background light))
+     :background "#f4f4f8" :extend t :inherit fixed-pitch))
+  "Face for even data rows in fancy markdown tables."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table-row-odd
+  '((((class color) (background dark))
+     :background "#242438" :extend t :inherit fixed-pitch)
+    (((class color) (background light))
+     :background "#eaeaf2" :extend t :inherit fixed-pitch))
+  "Face for odd data rows in fancy markdown tables."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table-separator
+  '((((class color) (background dark))  :foreground "#555555" :inherit fixed-pitch)
+    (((class color) (background light)) :foreground "#bbbbbb" :inherit fixed-pitch))
+  "Face for the separator row (|---|---|) of markdown tables in plain mode."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table-chrome
+  '((((class color) (background dark))  :foreground "#444466")
+    (((class color) (background light)) :foreground "#bbbbcc"))
+  "Face for pipe delimiters in fancy tables (made nearly invisible)."
+  :group 'claude-code)
+
+(defface claude-code-markdown-table
+  '((t :inherit fixed-pitch))
+  "Base face for markdown table content in Claude responses."
   :group 'claude-code)
 
 ;;;; Internal State

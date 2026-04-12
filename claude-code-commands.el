@@ -38,6 +38,7 @@
 (declare-function org-roam-node-file "org-roam-node")
 (declare-function org-roam-node-visit "org-roam")
 (declare-function org-roam-db-update-file "org-roam-db")
+(declare-function claude-code-fork-tree-toggle "claude-code-fork-tree")
 
 ;;;; Interactive Commands
 
@@ -1393,7 +1394,8 @@ persists the change via `customize-save-variable'."
    ("t" "Toggle thinking" claude-code-toggle-thinking)
    ("T" "Toggle tool details" claude-code-toggle-tool-details)
    ("n" "Open notes file" claude-code-open-notes)
-   ("a" "Agent sidebar" claude-code-agents-toggle)]
+   ("a" "Agent sidebar" claude-code-agents-toggle)
+   ("F" "Fork tree" claude-code-fork-tree-toggle)]
   ["Notes & Skills (org-roam)"
    ("d" "Project notes" claude-code-open-dir-notes)
    ("o" "Project TODOs" claude-code-open-dir-todos)
@@ -1425,6 +1427,8 @@ persists the change via `customize-save-variable'."
   #'claude-code-open-dir-todos "Open dir todos or self-insert.")
 (claude-code--def-key-command claude-code-key-agents-toggle
   #'claude-code-agents-toggle "Toggle agents or self-insert.")
+(claude-code--def-key-command claude-code-key-fork-tree-toggle
+  #'claude-code-fork-tree-toggle "Toggle fork tree or self-insert.")
 (claude-code--def-key-command claude-code-key-sync
   #'claude-code-sync "Sync or self-insert.")
 (claude-code--def-key-command claude-code-key-menu
@@ -1481,6 +1485,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "d"   #'claude-code-key-open-dir-notes
   "o"   #'claude-code-key-open-dir-todos
   "a"   #'claude-code-key-agents-toggle
+  "F"   #'claude-code-key-fork-tree-toggle
   "S"   #'claude-code-key-sync
   "?"   #'claude-code-key-menu
   "q"   #'claude-code-key-quit

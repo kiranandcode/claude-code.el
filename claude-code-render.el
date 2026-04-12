@@ -31,6 +31,8 @@
 (declare-function claude-code-toggle-ask-permission "claude-code-commands")
 (declare-function claude-code--ask-permission-active-p "claude-code-commands")
 (declare-function claude-code-edit-permission-rules "claude-code-commands")
+(declare-function claude-code-eval-code-block "claude-code-commands")
+(declare-function claude-code-lsp-link--linkify-region "claude-code-lsp-link")
 
 ;;;; Image Rendering Helpers
 
@@ -380,7 +382,8 @@ Always visible at the top of the window regardless of scroll position."
       ("assistant" (claude-code--render-assistant-msg msg))
       ("result"    (claude-code--render-result-msg msg))
       ("error"     (claude-code--render-error-msg msg))
-      ("info"      (claude-code--render-info-msg msg)))))
+      ("info"        (claude-code--render-info-msg msg))
+      ("eval-result" (claude-code--render-eval-result msg)))))
 
 (defun claude-code--splice-heading-button (text face help-echo action)
   "Splice a button with TEXT into the current magit section heading.
@@ -496,13 +499,38 @@ If MODE-FN is nil or not a function, CODE is returned unchanged."
         (buffer-string))
     code))
 
+(defun claude-code--table-line-p (line)
+  "Return non-nil if LINE looks like a markdown table row.
+Matches lines like `| col | col |` or `|---|---|`."
+  (string-match-p "^[ \t]*|.*|[ \t]*$" line))
+
+(defun claude-code--flush-prose (prose-lines segments)
+  "Push accumulated PROSE-LINES onto SEGMENTS as a text segment.
+Returns the updated segments list.  PROSE-LINES is consumed in reverse."
+  (if prose-lines
+      (cons (cons 'text (mapconcat #'identity (nreverse prose-lines) "\n"))
+            segments)
+    segments))
+
+(defun claude-code--flush-table (table-lines segments)
+  "Push accumulated TABLE-LINES onto SEGMENTS as a table segment.
+Returns the updated segments list.  TABLE-LINES is consumed in reverse."
+  (if table-lines
+      (cons (cons 'table (mapconcat #'identity (nreverse table-lines) "\n"))
+            segments)
+    segments))
+
 (defun claude-code--parse-text-blocks (text)
   "Parse TEXT into a list of segments.
-Each segment is either (text . PROSE-STRING) or (code . (LANG . CODE-STRING)).
+Each segment is one of:
+  (text  . PROSE-STRING)
+  (code  . (LANG . CODE-STRING))
+  (table . TABLE-STRING)
 Fenced code blocks delimited by lines matching \\=`^```[lang]\\=' and \\=`^```\\='
-are extracted as code segments; everything else is prose."
+are extracted as code segments; consecutive lines matching `| ... |` are
+extracted as table segments; everything else is prose."
   (let ((lines (split-string text "\n" nil))
-        segments prose-lines code-lines in-code code-lang)
+        segments prose-lines table-lines code-lines in-code code-lang)
     (dolist (line lines)
       (cond
        ;; Closing fence (only when inside a code block)
@@ -514,6 +542,8 @@ are extracted as code segments; everything else is prose."
         (setq in-code nil code-lang nil code-lines nil))
        ;; Opening fence (only outside a code block)
        ((and (not in-code) (string-match "^```\\(.*\\)$" line))
+        (setq segments (claude-code--flush-table table-lines segments)
+              table-lines nil)
         (when prose-lines
           (push (cons 'text (mapconcat #'identity
                                        (nreverse prose-lines) "\n"))
@@ -525,25 +555,40 @@ are extracted as code segments; everything else is prose."
        ;; Inside a code block
        (in-code
         (push line code-lines))
+       ;; Table line (consecutive | ... | rows)
+       ((claude-code--table-line-p line)
+        ;; Flush any pending prose before starting a table
+        (when prose-lines
+          (setq segments (claude-code--flush-prose prose-lines segments)
+                prose-lines nil))
+        (push line table-lines))
        ;; Prose line
        (t
+        ;; Flush any pending table before starting prose
+        (when table-lines
+          (setq segments (claude-code--flush-table table-lines segments)
+                table-lines nil))
         (push line prose-lines))))
     ;; Flush remaining content
-    (if in-code
-        ;; Unclosed fence → treat everything from the fence as prose
-        (let ((dangling (concat "```" code-lang "\n"
-                                (mapconcat #'identity
-                                           (nreverse code-lines) "\n"))))
-          (push (cons 'text (concat
-                              (when prose-lines
-                                (concat (mapconcat #'identity
-                                                   (nreverse prose-lines) "\n")
-                                        "\n"))
-                              dangling))
-                segments))
+    (cond
+     (in-code
+      ;; Unclosed fence → treat everything from the fence as prose
+      (setq segments (claude-code--flush-table table-lines segments))
+      (let ((dangling (concat "```" code-lang "\n"
+                              (mapconcat #'identity
+                                         (nreverse code-lines) "\n"))))
+        (push (cons 'text (concat
+                            (when prose-lines
+                              (concat (mapconcat #'identity
+                                                 (nreverse prose-lines) "\n")
+                                      "\n"))
+                            dangling))
+              segments)))
+     (t
+      (setq segments (claude-code--flush-table table-lines segments))
       (when prose-lines
         (push (cons 'text (mapconcat #'identity (nreverse prose-lines) "\n"))
-              segments)))
+              segments))))
     (nreverse segments)))
 
 (defun claude-code--insert-code-block (lang code)
@@ -557,7 +602,7 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
                       "```"))
          (fontified (claude-code--fontify-code code mode-fn))
          body-beg)
-    ;; Opening fence with inline [copy] button
+    ;; Opening fence with inline [copy] button (and [eval] for Emacs Lisp)
     (insert (propertize (concat "  " label "  ") 'face 'shadow))
     (insert-button "[copy]"
                    'action (let ((c code))
@@ -567,6 +612,16 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
                    'help-echo "Copy this code block (key: w)"
                    'face 'shadow
                    'follow-link t)
+    ;; [eval] button for Emacs Lisp code blocks
+    (when (memq mode-fn '(emacs-lisp-mode lisp-interaction-mode))
+      (insert " ")
+      (insert-button "[eval]"
+                     'action (let ((c code))
+                               (lambda (_btn)
+                                 (claude-code-eval-code-block c)))
+                     'help-echo "Evaluate this Emacs Lisp block (key: e)"
+                     'face 'claude-code-eval-button
+                     'follow-link t))
     (insert "\n")
     ;; Record start of code body for text-property annotation
     (setq body-beg (point))
@@ -575,6 +630,8 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
       (insert "  " line "\n"))
     ;; Annotate body with the raw code string so `w' can find it at point
     (put-text-property body-beg (point) 'claude-code-code-content code)
+    ;; Store the language so `e' can check for evaluable blocks
+    (put-text-property body-beg (point) 'claude-code-code-lang (or lang ""))
     ;; Fixed-pitch: keep code blocks monospace even when surrounding prose uses
     ;; variable-pitch (controlled by `claude-code-prose-font').
     ;; add-face-text-property appends without clobbering existing font-lock faces.
@@ -582,9 +639,179 @@ text property so `claude-code-copy-code-block' (key: w) can find it."
     ;; Closing fence
     (insert (propertize "  ```\n" 'face 'shadow))))
 
+(defun claude-code--table-separator-line-p (line)
+  "Return non-nil if LINE is a markdown table separator like |---|---|."
+  (string-match-p "^[ \t]*|[ \t]*[-:]+[-| \t:]*|[ \t]*$" line))
+
+(defun claude-code--table-parse-cells (line)
+  "Parse a markdown table LINE into a list of trimmed cell strings.
+Leading/trailing pipes are stripped; e.g. `| a | b |` → (\"a\" \"b\")."
+  (let ((stripped (string-trim line)))
+    ;; Remove leading and trailing pipe
+    (when (string-prefix-p "|" stripped)
+      (setq stripped (substring stripped 1)))
+    (when (string-suffix-p "|" stripped)
+      (setq stripped (substring stripped 0 -1)))
+    (mapcar #'string-trim (split-string stripped "|"))))
+
+(defun claude-code--table-compute-widths (rows)
+  "Compute column widths from ROWS (list of lists of cell strings).
+Returns a list of integers, one per column, each being the max
+display width across all rows for that column."
+  (let* ((ncols (apply #'max (mapcar #'length rows)))
+         (widths (make-list ncols 0)))
+    (dolist (row rows)
+      (cl-loop for cell in row
+               for i from 0
+               do (setf (nth i widths)
+                        (max (nth i widths) (string-width cell)))))
+    widths))
+
+(defun claude-code--table-insert-fancy-row (cells widths row-face)
+  "Insert a padded table row with CELLS at WIDTHS, applying ROW-FACE.
+Pipe delimiters are rendered nearly invisible via `claude-code-markdown-table-chrome'.
+ROW-FACE is applied across the entire line (including padding) for the
+background colour effect."
+  (let ((line-beg (point))
+        (ncols (length widths)))
+    (insert "  ")
+    ;; Opening pipe — hidden via chrome face
+    (let ((p (point)))
+      (insert " ")
+      (add-face-text-property p (point) 'claude-code-markdown-table-chrome))
+    ;; Cells
+    (cl-loop for i from 0 below ncols
+             for cell = (or (nth i cells) "")
+             for w = (nth i widths)
+             do (progn
+                  ;; left pad
+                  (insert " ")
+                  ;; cell text
+                  (insert cell)
+                  ;; right pad to column width
+                  (insert (make-string (max 0 (- w (string-width cell))) ?\s))
+                  (insert " ")
+                  ;; column separator (thin dim pipe, or trailing)
+                  (when (< i (1- ncols))
+                    (let ((p (point)))
+                      (insert "│")
+                      (add-face-text-property
+                       p (point) 'claude-code-markdown-table-chrome)))))
+    ;; Trailing pad
+    (let ((p (point)))
+      (insert " ")
+      (add-face-text-property p (point) 'claude-code-markdown-table-chrome))
+    (insert "\n")
+    ;; Apply the row-level background face across the full line
+    (add-face-text-property line-beg (point) row-face)))
+
+(defun claude-code--table-insert-hr (widths)
+  "Insert a thin horizontal rule spanning WIDTHS.
+Uses a display property to show a single-pixel-height line that acts as a
+visual separator between the header and body."
+  (let ((total-width (+ (apply #'+ widths)
+                        (* 3 (length widths))  ; padding per col
+                        (1- (length widths))   ; separators
+                        2))                     ; outer pads
+        (line-beg (point)))
+    (insert "  "
+            (propertize (make-string total-width ?─)
+                        'face 'claude-code-markdown-table-chrome)
+            "\n")))
+
+(defun claude-code--render-table-fancy (table-text)
+  "Render TABLE-TEXT as a styled table using Emacs text properties.
+Header rows get a distinct background; data rows are zebra-striped
+with alternating faces; pipe delimiters are dimmed to near-invisible;
+a thin rule separates header from body."
+  (let* ((raw-lines (split-string table-text "\n" t))
+         (sep-idx nil)
+         (header-rows '())
+         (data-rows '()))
+    ;; Classify rows
+    (cl-loop for line in raw-lines
+             for i from 0
+             do (cond
+                 ((claude-code--table-separator-line-p line)
+                  (unless sep-idx (setq sep-idx i)))
+                 ((not sep-idx)
+                  (push (claude-code--table-parse-cells line) header-rows))
+                 (t
+                  (push (claude-code--table-parse-cells line) data-rows))))
+    (setq header-rows (nreverse header-rows))
+    (setq data-rows   (nreverse data-rows))
+    ;; No separator → all rows are data
+    (unless sep-idx
+      (setq data-rows (append header-rows data-rows))
+      (setq header-rows nil))
+    (let* ((all-rows (append header-rows data-rows))
+           (widths   (claude-code--table-compute-widths all-rows))
+           (beg      (point))
+           (row-idx  0))
+      ;; Header rows
+      (dolist (row header-rows)
+        (claude-code--table-insert-fancy-row
+         row widths 'claude-code-markdown-table-header))
+      ;; Thin rule after header
+      (when header-rows
+        (claude-code--table-insert-hr widths))
+      ;; Data rows — zebra-striped
+      (dolist (row data-rows)
+        (claude-code--table-insert-fancy-row
+         row widths
+         (if (cl-evenp row-idx)
+             'claude-code-markdown-table-row-even
+           'claude-code-markdown-table-row-odd))
+        (cl-incf row-idx))
+      ;; Base face for fixed-pitch
+      (add-face-text-property beg (point) 'claude-code-markdown-table))))
+
+(defun claude-code--render-table-plain (table-text)
+  "Render TABLE-TEXT as a plain markdown table with pipe formatting.
+When `markdown-mode' is available, uses `markdown-table-align' to normalize
+column widths.  The header row is bolded and the separator row is dimmed."
+  (let* ((aligned (if (fboundp 'markdown-table-align)
+                      (with-temp-buffer
+                        (insert table-text)
+                        (when (fboundp 'markdown-mode)
+                          (delay-mode-hooks (markdown-mode)))
+                        (goto-char (point-min))
+                        (condition-case nil
+                            (markdown-table-align)
+                          (error nil))
+                        (buffer-string))
+                    table-text))
+         (lines (split-string aligned "\n" t))
+         (beg (point))
+         (found-separator nil))
+    (dolist (line lines)
+      (let ((line-beg (point)))
+        (insert "  " line "\n")
+        (cond
+         ((claude-code--table-separator-line-p line)
+          (setq found-separator t)
+          (add-face-text-property line-beg (point)
+                                  'claude-code-markdown-table-separator))
+         ((not found-separator)
+          (add-face-text-property line-beg (point)
+                                  'claude-code-markdown-table-header))
+         (t nil))))
+    (add-face-text-property beg (point) 'claude-code-markdown-table)
+    (when (facep 'markdown-table-face)
+      (add-face-text-property beg (point) 'markdown-table-face))))
+
+(defun claude-code--render-table (table-text)
+  "Render TABLE-TEXT as a formatted table.
+Dispatches to fancy text-property styling or plain pipe format based on
+`claude-code-table-style'."
+  (pcase claude-code-table-style
+    ('fancy (claude-code--render-table-fancy table-text))
+    (_      (claude-code--render-table-plain table-text))))
+
 (defun claude-code--render-text (text)
   "Render a TEXT content block.
 Fenced code blocks are syntax-highlighted using the language's major mode;
+markdown tables are aligned using `markdown-table-align' when available;
 prose lines are linkified.  The font style for prose is controlled by
 `claude-code-prose-font'."
   (when (and text (not (string-empty-p text)))
@@ -596,9 +823,13 @@ prose lines are linkified.  The font style for prose is controlled by
              (insert "  ")
              (claude-code--insert-linkified line)
              (insert "\n"))
+           ;; Heading decoration (line-level, operates on full prose segment)
+           (claude-code--decorate-markdown-heading seg-beg (point))
            ;; Apply the user-configured prose face, if any.
            (when claude-code-prose-font
              (add-face-text-property seg-beg (point) claude-code-prose-font))))
+        (`(table . ,tbl)
+         (claude-code--render-table tbl))
         (`(code . (,lang . ,code))
          (claude-code--insert-code-block lang code))))))
 
@@ -771,6 +1002,38 @@ section is collapsed."
   "Render an informational MSG."
   (insert (propertize (format "  ℹ %s\n" (alist-get 'text msg))
                       'face 'claude-code-status)))
+
+(defun claude-code--render-eval-result (msg)
+  "Render an inline eval result MSG.
+MSG has keys: code, value, errorp.  Renders as a collapsible section
+showing the evaluated code and its result (or error)."
+  (let ((code   (alist-get 'code msg))
+        (value  (alist-get 'value msg))
+        (errorp (alist-get 'errorp msg)))
+    (magit-insert-section (claude-eval-result)
+      (magit-insert-heading
+        (propertize (format "  ⚡ Eval %s"
+                            (if errorp "✗ error" "✓ ok"))
+                    'face (if errorp 'claude-code-eval-error
+                             'claude-code-eval-result)))
+      ;; Show the code that was evaluated
+      (insert (propertize "    Code: " 'face 'shadow))
+      (let ((one-line (car (split-string code "\n"))))
+        (insert (propertize
+                 (if (> (length code) (length one-line))
+                     (concat (truncate-string-to-width one-line 60) "…")
+                   (truncate-string-to-width one-line 70))
+                 'face 'font-lock-comment-face)))
+      (insert "\n")
+      ;; Show the result
+      (insert (propertize (if errorp "    Error: " "    ⇒ ")
+                          'face (if errorp 'claude-code-eval-error 'shadow)))
+      (let* ((val-str (truncate-string-to-width value 500))
+             (fontified (claude-code--fontify-code val-str
+                                                   (when (not errorp)
+                                                     'emacs-lisp-mode))))
+        (insert (claude-code--indent fontified 6))
+        (insert "\n")))))
 
 (defun claude-code--render-streaming ()
   "Render in-progress streaming content inline."
@@ -968,10 +1231,86 @@ NAME may be a prefixed MCP name (\"mcp__emacs__EvalEmacs\") or bare."
          (format "line %d" line)))
       (_       nil))))
 
+(defun claude-code--decorate-markdown-inline (start end)
+  "Decorate inline markdown between START and END.
+Handles backtick `code`, ***bold italic***, **bold**, *italic*,
+and ~~strikethrough~~.  Delimiters are hidden via `display'
+properties and the content is propertized with the appropriate face.
+Must be called BEFORE linkification to avoid clobbering button faces."
+  (save-excursion
+    ;; Inline code: `...`  (do first to protect contents from other passes)
+    (goto-char start)
+    (while (re-search-forward "`\\([^`\n]+\\)`" end t)
+      (let ((code-beg (match-beginning 1))
+            (code-end (match-end 1)))
+        ;; Hide the backtick delimiters
+        (put-text-property (match-beginning 0) code-beg 'display "")
+        (put-text-property code-end (match-end 0) 'display "")
+        (add-face-text-property code-beg code-end 'claude-code-markdown-code)))
+    ;; Strikethrough: ~~...~~
+    (goto-char start)
+    (while (re-search-forward "~~\\([^~\n]+\\)~~" end t)
+      (let ((s (match-beginning 1)) (e (match-end 1)))
+        (put-text-property (match-beginning 0) s 'display "")
+        (put-text-property e (match-end 0) 'display "")
+        (add-face-text-property s e 'claude-code-markdown-strikethrough)))
+    ;; Bold italic: ***...***  (must come before bold and italic)
+    (goto-char start)
+    (while (re-search-forward "\\*\\*\\*\\([^*\n]+\\)\\*\\*\\*" end t)
+      (let ((s (match-beginning 1)) (e (match-end 1)))
+        (put-text-property (match-beginning 0) s 'display "")
+        (put-text-property e (match-end 0) 'display "")
+        (add-face-text-property s e 'claude-code-markdown-bold-italic)))
+    ;; Bold: **...**
+    (goto-char start)
+    (while (re-search-forward "\\*\\*\\([^*\n]+\\)\\*\\*" end t)
+      (let ((s (match-beginning 1)) (e (match-end 1)))
+        (put-text-property (match-beginning 0) s 'display "")
+        (put-text-property e (match-end 0) 'display "")
+        (add-face-text-property s e 'claude-code-markdown-bold)))
+    ;; Italic: *...*  (content must not start/end with space, no nested *)
+    (goto-char start)
+    (while (re-search-forward "\\(?:^\\|[^*\\\\]\\)\\(\\*\\([^ *\n][^*\n]*[^ *\n]\\|[^ *\n]\\)\\*\\)" end t)
+      (let ((outer-beg (match-beginning 1))
+            (s (match-beginning 2))
+            (e (match-end 2))
+            (outer-end (match-end 1)))
+        ;; Don't clobber already-decorated regions (e.g. bold)
+        (unless (get-text-property s 'display)
+          (put-text-property outer-beg s 'display "")
+          (put-text-property e outer-end 'display "")
+          (add-face-text-property s e 'claude-code-markdown-italic))))))
+
+(defun claude-code--heading-face-for-level (n)
+  "Return the heading face for heading level N (1-6)."
+  (pcase n
+    (1 'claude-code-markdown-heading-1)
+    (2 'claude-code-markdown-heading-2)
+    (3 'claude-code-markdown-heading-3)
+    (4 'claude-code-markdown-heading-4)
+    (5 'claude-code-markdown-heading-5)
+    (6 'claude-code-markdown-heading-6)
+    (_ 'claude-code-markdown-heading)))
+
+(defun claude-code--decorate-markdown-heading (start end)
+  "Apply heading face to markdown heading lines between START and END.
+Lines starting with `# ` through `###### ` get level-appropriate
+heading faces and the `#` prefix is hidden."
+  (save-excursion
+    (goto-char start)
+    (while (re-search-forward "^\\(  \\)\\(#\\{1,6\\} \\)\\(.*\\)$" end t)
+      (let* ((hashes (match-string 2))
+             (level (1- (length hashes))))  ; length includes trailing space
+        (put-text-property (match-beginning 2) (match-end 2) 'display "")
+        (add-face-text-property (match-beginning 3) (match-end 3)
+                                (claude-code--heading-face-for-level level))))))
+
 (defun claude-code--insert-linkified (text)
   "Insert TEXT with URLs and file paths made clickable."
   (let ((start (point)))
     (insert text)
+    ;; Decorate inline markdown first (before linkification adds buttons)
+    (claude-code--decorate-markdown-inline start (point))
     ;; Linkify URLs
     (save-excursion
       (goto-char start)
@@ -990,7 +1329,12 @@ NAME may be a prefixed MCP name (\"mcp__emacs__EvalEmacs\") or bare."
             (make-text-button (match-beginning 0) (match-end 0)
                               'action (lambda (_) (find-file path))
                               'face 'claude-code-file-link
-                              'help-echo (format "Open %s" path))))))))
+                              'help-echo (format "Open %s" path))))))
+    ;; Linkify inline code identifiers that match LSP workspace symbols
+    (when (and (bound-and-true-p claude-code-enable-lsp-links)
+               (fboundp 'claude-code-lsp-link--linkify-region)
+               (bound-and-true-p claude-code--cwd))
+      (claude-code-lsp-link--linkify-region start (point) claude-code--cwd))))
 
 ;;;; Thinking Animation
 
