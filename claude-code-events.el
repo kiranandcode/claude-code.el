@@ -19,6 +19,13 @@
 (declare-function claude-code--dispatch-input "claude-code-commands")
 (declare-function claude-code--send-json "claude-code-process")
 
+;;;; Hooks
+
+(defvar claude-code-result-hook nil
+  "Hook run after a result event is processed (turn completed).
+Functions are called with no arguments in the session buffer.
+Use buffer-local hooks (add-hook with LOCAL t) for per-session behaviour.")
+
 ;;;; Event Handling
 
 (defun claude-code--handle-event (event)
@@ -349,6 +356,7 @@ Also pulses any open Emacs buffers whose files were touched by tool calls."
   (when (and claude-code--subagent-task-id
              claude-code--subagent-has-worked)
     (claude-code--subagent-notify-parent))
+  (run-hooks 'claude-code-result-hook)
   (claude-code--schedule-render))
 
 (defun claude-code--subagent-notify-parent ()

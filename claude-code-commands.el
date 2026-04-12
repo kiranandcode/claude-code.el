@@ -1628,7 +1628,9 @@ Outside the input area, toggle the magit section at point."
   ;; the hook locally; normal Emacs region highlighting still works fine.
   (remove-hook 'redisplay--update-region-highlight-functions
                #'magit-section--highlight-region t)
-)
+  ;; Project-notes auto-update — hooks into result events.
+  (when (fboundp 'claude-code-project-notes-setup)
+    (claude-code-project-notes-setup)))
 
 ;;;; Emacs-Native Subagent Spawning
 
