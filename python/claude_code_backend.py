@@ -789,6 +789,9 @@ EMACS_TOOL_NAMES: list[str] = [
     "EmacsGotoLine",
     "ClaudeCodeReload",
     "RestartBackend",
+    "CreateDynamicTool",
+    "CallDynamicTool",
+    "ListDynamicTools",
 ]
 
 
@@ -1621,6 +1624,187 @@ async def _emacs_restart_backend(_args: dict[str, Any]) -> dict[str, Any]:
         return _tool_result(f"error: {e}", is_error=True)
 
 
+# ── Dynamic tool bootstrapping ─────────────────────────────────────────────
+#
+# The agent can create new tools mid-session by defining an Emacs Lisp
+# function and registering it here.  Dynamic tools are invoked via the
+# ``CallDynamicTool`` meta-tool which dispatches to the registered elisp
+# function through emacsclient.
+
+_dynamic_tools: dict[str, dict[str, Any]] = {}
+"""Registry of agent-created tools.  Maps tool name → definition dict:
+  {"description": str, "input_schema": dict, "elisp_function": str}
+"""
+
+
+@tool(
+    "CreateDynamicTool",
+    description=(
+        "Create a new tool that the agent can call in subsequent turns.  "
+        "First define the Emacs Lisp implementation via EvalEmacs (a function "
+        "that accepts a single alist argument and returns a string), then "
+        "register it here with its name, description, schema, and the elisp "
+        "function symbol.  The tool becomes available via CallDynamicTool."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": (
+                    "Tool name (alphanumeric + hyphens, e.g. 'query-org-agenda')."
+                ),
+            },
+            "description": {
+                "type": "string",
+                "description": "Human-readable description of what the tool does.",
+            },
+            "input_schema": {
+                "type": "object",
+                "description": (
+                    "JSON Schema for the tool's input parameters.  "
+                    "Omit for tools that take no arguments."
+                ),
+            },
+            "elisp_function": {
+                "type": "string",
+                "description": (
+                    "The Emacs Lisp function symbol name to funcall "
+                    "(e.g. 'claude-code-dyn--query-org-agenda').  The function "
+                    "must already be defined in the running Emacs (via EvalEmacs)."
+                ),
+            },
+        },
+        "required": ["name", "description", "elisp_function"],
+    },
+)
+async def _create_dynamic_tool(args: dict[str, Any]) -> dict[str, Any]:
+    name = args["name"]
+    description = args["description"]
+    elisp_fn = args["elisp_function"]
+    schema = args.get("input_schema", {"type": "object", "properties": {}})
+
+    # Verify the function exists in Emacs.
+    try:
+        check = await _run_emacsclient(
+            f'(if (fboundp (quote {elisp_fn})) "ok" "undefined")'
+        )
+        if check.strip('"') != "ok":
+            return _tool_result(
+                f"error: elisp function '{elisp_fn}' is not defined in Emacs.  "
+                f"Define it first via EvalEmacs.",
+                is_error=True,
+            )
+    except EmacsclientNotFoundError:
+        raise
+    except Exception as e:
+        return _tool_result(f"error checking function: {e}", is_error=True)
+
+    _dynamic_tools[name] = {
+        "description": description,
+        "input_schema": schema,
+        "elisp_function": elisp_fn,
+    }
+
+    # Also notify Emacs so it can display the tool in the UI.
+    try:
+        await _run_emacsclient(
+            f'(claude-code-dynamic-tools--register "{name}" "{elisp_fn}")'
+        )
+    except Exception:
+        pass  # UI registration is best-effort
+
+    _log.info("CreateDynamicTool: registered %r → %s", name, elisp_fn)
+    return _tool_result(
+        f"Tool '{name}' registered successfully.  "
+        f"Call it via CallDynamicTool with name=\"{name}\"."
+    )
+
+
+@tool(
+    "CallDynamicTool",
+    description=(
+        "Invoke a dynamically created tool by name.  The tool must have been "
+        "previously registered via CreateDynamicTool.  Arguments are passed "
+        "as a JSON object to the tool's elisp function."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Name of the dynamic tool to call.",
+            },
+            "args": {
+                "type": "object",
+                "description": (
+                    "Arguments to pass to the tool (must match its input_schema)."
+                ),
+            },
+        },
+        "required": ["name"],
+    },
+)
+async def _call_dynamic_tool(args: dict[str, Any]) -> dict[str, Any]:
+    name = args["name"]
+    tool_args = args.get("args", {})
+
+    if name not in _dynamic_tools:
+        available = ", ".join(sorted(_dynamic_tools.keys())) or "(none)"
+        return _tool_result(
+            f"Unknown dynamic tool: '{name}'.  Available: {available}",
+            is_error=True,
+        )
+
+    defn = _dynamic_tools[name]
+    elisp_fn = defn["elisp_function"]
+
+    # Build elisp: (funcall 'fn (json-parse-string "..." :object-type 'alist))
+    args_json = json.dumps(tool_args).replace("\\", "\\\\").replace('"', '\\"')
+    elisp = (
+        f"(let ((result (funcall '{elisp_fn} "
+        f"(json-parse-string \"{args_json}\" :object-type 'alist))))"
+        f"  (if (stringp result) result (json-encode result)))"
+    )
+
+    try:
+        out = await _run_emacsclient(elisp, timeout=30)
+        _log.info("CallDynamicTool %r → %s chars", name, len(out))
+        return _tool_result(out)
+    except EmacsclientNotFoundError:
+        raise
+    except Exception as e:
+        _log.error("CallDynamicTool %r failed: %s", name, e)
+        return _tool_result(f"error: {e}", is_error=True)
+
+
+@tool(
+    "ListDynamicTools",
+    description=(
+        "List all dynamically created tools registered in this session.  "
+        "Returns each tool's name, description, and input schema."
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+)
+async def _list_dynamic_tools(_args: dict[str, Any]) -> dict[str, Any]:
+    if not _dynamic_tools:
+        return _tool_result("No dynamic tools registered yet.")
+
+    lines = []
+    for name, defn in sorted(_dynamic_tools.items()):
+        lines.append(f"• {name}: {defn['description']}")
+        lines.append(f"  elisp: {defn['elisp_function']}")
+        props = defn.get("input_schema", {}).get("properties", {})
+        if props:
+            params = ", ".join(f"{k}: {v.get('type', '?')}" for k, v in props.items())
+            lines.append(f"  params: {params}")
+    return _tool_result("\n".join(lines))
+
+
 # ── Assemble MCP server ────────────────────────────────────────────────────
 
 _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
@@ -1641,6 +1825,9 @@ _EMACS_MCP_SERVER: McpSdkServerConfig = create_sdk_mcp_server(
         _emacs_goto_line,
         _emacs_claude_code_reload,
         _emacs_restart_backend,
+        _create_dynamic_tool,
+        _call_dynamic_tool,
+        _list_dynamic_tools,
     ],
 )
 

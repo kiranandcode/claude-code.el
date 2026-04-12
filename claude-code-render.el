@@ -386,7 +386,9 @@ Always visible at the top of the window regardless of scroll position."
       ("result"    (claude-code--render-result-msg msg))
       ("error"     (claude-code--render-error-msg msg))
       ("info"        (claude-code--render-info-msg msg))
-      ("eval-result" (claude-code--render-eval-result msg)))))
+      ("eval-result" (claude-code--render-eval-result msg))
+      ("render-error" (claude-code--render-render-error-msg msg))
+      ("messages-error" (claude-code--render-messages-error-msg msg)))))
 
 (defun claude-code--splice-heading-button (text face help-echo action)
   "Splice a button with TEXT into the current magit section heading.
@@ -1031,6 +1033,38 @@ section is collapsed."
   "Render an informational MSG."
   (insert (propertize (format "  ℹ %s\n" (alist-get 'text msg))
                       'face 'claude-code-status)))
+
+(defun claude-code--render-render-error-msg (msg)
+  "Render a render-pipeline error diagnostic MSG.
+Injected by `claude-code-self-heal' when the render function throws."
+  (magit-insert-section (claude-render-error)
+    (magit-insert-heading
+      (propertize (format "⚠ Render error [%s]: %s"
+                          (alist-get 'timestamp msg)
+                          (alist-get 'message msg))
+                  'face 'claude-code-error))
+    (when-let ((bt (alist-get 'backtrace msg)))
+      (insert (propertize "  Backtrace:\n" 'face 'font-lock-comment-face))
+      (insert (propertize (concat "  " (replace-regexp-in-string
+                                        "\n" "\n  " bt))
+                          'face 'font-lock-comment-face))
+      (insert "\n"))
+    (insert "\n")))
+
+(defun claude-code--render-messages-error-msg (msg)
+  "Render errors detected in *Messages* buffer by the self-heal watcher."
+  (let ((errors (alist-get 'errors msg)))
+    (when (and errors (> (length errors) 0))
+      (insert (propertize
+               (format "  ⚠ Detected %d error(s) in *Messages* [%s]:\n"
+                       (length errors)
+                       (alist-get 'timestamp msg))
+               'face 'claude-code-error))
+      (seq-do (lambda (e)
+                (insert (propertize (format "    • %s\n" e)
+                                    'face 'font-lock-warning-face)))
+              errors)
+      (insert "\n"))))
 
 (defun claude-code--render-eval-result (msg)
   "Render an inline eval result MSG.
