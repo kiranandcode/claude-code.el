@@ -44,6 +44,7 @@
 (require 'claude-code-annotate)
 (require 'claude-code-dynamic-tools)
 (require 'claude-code-self-heal)
+(require 'claude-code-ambient)
 (require 'claude-code-export)
 (require 'claude-code-fork-tree)
 (require 'claude-code-commands)

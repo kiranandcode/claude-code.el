@@ -83,6 +83,12 @@ results are automatically prepended as context."
   ;; Prepend any inline eval results from code blocks the user evaluated.
   (when-let ((eval-ctx (claude-code--collect-eval-results)))
     (setq prompt (concat eval-ctx "\n\n" prompt)))
+  ;; Prepend ambient editor context (current file, cursor position, selection).
+  (when (and (fboundp 'claude-code-ambient--build-context)
+             (boundp 'claude-code-ambient-enabled)
+             claude-code-ambient-enabled)
+    (when-let ((ambient (claude-code-ambient--build-context)))
+      (setq prompt (concat ambient "\n\n" prompt))))
   (let* ((cwd    (or claude-code--cwd default-directory))
          (cfg    (claude-code--session-config))
          ;; Capture and clear pending images atomically before any async work.
