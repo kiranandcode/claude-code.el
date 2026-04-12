@@ -35,6 +35,7 @@
 (declare-function claude-code-lsp-link--linkify-region "claude-code-lsp-link")
 (declare-function claude-code-xwidget-maybe-add-render-button "claude-code-xwidget")
 (declare-function claude-code-edit-result-maybe-add-button "claude-code-edit-result")
+(declare-function claude-code--render-annotations "claude-code-annotate")
 
 ;;;; Image Rendering Helpers
 
@@ -422,11 +423,16 @@ section keymap that `magit-insert-heading' stamps onto heading text."
         (insert "  ")
         (claude-code--insert-image img)
         (insert "\n")))
-    (insert "  " (alist-get 'prompt msg) "\n\n")))
+    (insert "  " (alist-get 'prompt msg) "\n")
+    ;; Render annotations for this user message
+    (when (fboundp 'claude-code--render-annotations)
+      (claude-code--render-annotations msg))
+    (insert "\n")))
 
 (defun claude-code--render-assistant-group (msgs)
   "Render a list of consecutive assistant MSGS under a single ◀ Assistant heading."
-  (magit-insert-section (claude-assistant nil nil)
+  ;; Store first msg as section value so annotations and navigation work.
+  (magit-insert-section (claude-assistant (car msgs) nil)
     (magit-insert-heading
       (propertize "◀ Assistant" 'face 'claude-code-assistant-label))
     (dolist (msg msgs)
@@ -438,6 +444,9 @@ section keymap that `magit-insert-heading' stamps onto heading text."
         (when (listp content)
           (dolist (block content)
             (claude-code--render-content-block block)))))
+    ;; Render annotations for this assistant group
+    (when (fboundp 'claude-code--render-annotations)
+      (claude-code--render-annotations (car msgs)))
     (insert "\n")))
 
 (defun claude-code--render-assistant-msg (msg)

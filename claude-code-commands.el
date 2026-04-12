@@ -39,6 +39,8 @@
 (declare-function org-roam-node-visit "org-roam")
 (declare-function org-roam-db-update-file "org-roam-db")
 (declare-function claude-code-fork-tree-toggle "claude-code-fork-tree")
+(declare-function claude-code-annotate "claude-code-annotate")
+(declare-function claude-code-delete-annotation "claude-code-annotate")
 
 ;;;; Interactive Commands
 
@@ -1500,6 +1502,7 @@ Prevents S-SPC from triggering scroll-down while typing."
   "TAB" #'claude-code-key-tab
   "M-p" #'claude-code-previous-input
   "M-n" #'claude-code-next-input
+  "C-c n" #'claude-code-annotate
   "C-c i" #'claude-code-attach-image
   "C-y"   #'claude-code-yank-or-paste-image
   "C-w" #'claude-code-kill-region-or-copy

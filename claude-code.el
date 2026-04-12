@@ -41,6 +41,7 @@
 (require 'claude-code-lsp-link)
 (require 'claude-code-xwidget)
 (require 'claude-code-edit-result)
+(require 'claude-code-annotate)
 (require 'claude-code-export)
 (require 'claude-code-fork-tree)
 (require 'claude-code-commands)
